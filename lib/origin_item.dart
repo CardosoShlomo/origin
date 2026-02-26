@@ -2,7 +2,6 @@ import 'package:flutter/widgets.dart';
 import 'origin_context.dart';
 import 'origin_data.dart';
 import 'origin_ext_on_scale.dart';
-import 'origin_ext_on_rect.dart';
 import 'origin_scope.dart';
 import 'origin_triggers.dart';
 
