@@ -15,7 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dart-lang/setup-dart@v1
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
 
       - name: Check if version changed
         id: check
@@ -32,4 +34,4 @@ jobs:
         run: |
           git tag "v${{ steps.check.outputs.version }}"
           git push origin "v${{ steps.check.outputs.version }}"
-          dart pub publish --force
+          flutter pub publish --force
