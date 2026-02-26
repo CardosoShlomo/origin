@@ -1,0 +1,35 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dart-lang/setup-dart@v1
+
+      - name: Check if version changed
+        id: check
+        run: |
+          LOCAL=$(grep '^version:' pubspec.yaml | sed 's/version: //')
+          REMOTE=$(curl -s https://pub.dev/api/packages/origin | grep -o '"version":"[^"]*"' | head -1 | sed 's/"version":"//;s/"//') || true
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "publish=true" >> $GITHUB_OUTPUT
+            echo "version=$LOCAL" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Tag and publish
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          git tag "v${{ steps.check.outputs.version }}"
+          git push origin "v${{ steps.check.outputs.version }}"
+          dart pub publish --force

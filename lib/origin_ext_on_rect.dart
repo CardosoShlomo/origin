@@ -2,7 +2,7 @@ import 'dart:math';
 
 import 'package:flutter/widgets.dart';
 
-extension OriginRect on Rect {
+extension RectExt on Rect {
   Rect baseRect(double aspectRatio) {
     return Rect.fromCenter(
       center: center,
