@@ -68,12 +68,9 @@ class _OriginItemState extends State<OriginItem> {
 
   OriginStart? _activeStart;
   Rect _startRect = .zero;
-  Offset _focalStart = .zero;
   Offset _totalDelta = .zero;
 
-  void _onScaleStart(ScaleStartDetails details) {
-    _focalStart = details.focalPoint;
-  }
+  void _onScaleStart(ScaleStartDetails details) {}
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
     _totalDelta += details.focalPointDelta;
@@ -96,8 +93,8 @@ class _OriginItemState extends State<OriginItem> {
 
     if (two) {
       final scaleChange = details.scale - 1;
-      if (scaleChange > 0.05 && widget.gestures.containsKey(.pinchOut)) return .pinchOut;
-      if (scaleChange < -0.05 && widget.gestures.containsKey(.pinchIn)) return .pinchIn;
+      if (scaleChange > 0.05 && widget.gestures.containsKey(OriginStart.pinchOut)) return .pinchOut;
+      if (scaleChange < -0.05 && widget.gestures.containsKey(OriginStart.pinchIn)) return .pinchIn;
     }
 
     OriginStart? h;
