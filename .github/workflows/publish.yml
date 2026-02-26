@@ -2,33 +2,11 @@ name: Publish
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
-permissions:
-  id-token: write
-  contents: write
-
 jobs:
-  tag:
-    if: github.ref_type == 'branch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Tag if version changed
-        run: |
-          LOCAL=$(grep '^version:' pubspec.yaml | sed 's/version: //')
-          REMOTE=$(curl -s https://pub.dev/api/packages/origin | grep -o '"version":"[^"]*"' | head -1 | sed 's/"version":"//;s/"//') || true
-          if [ "$LOCAL" != "$REMOTE" ]; then
-            git tag "v$LOCAL"
-            git push origin "v$LOCAL"
-          fi
-
   publish:
-    if: github.ref_type == 'tag'
     permissions:
       id-token: write
     uses: dart-lang/setup-dart/.github/workflows/publish.yml@v1
