@@ -1,3 +1,7 @@
+## 0.0.3
+
+* Add stackBuilder for showing builder on top of child.
+
 ## 0.0.2
 
 * Add tag, visibility, dismiss, animateToBase.

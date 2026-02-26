@@ -20,6 +20,7 @@ class OriginItem extends StatefulWidget {
     this.constraints = const OriginConstraints(),
     this.aspectRatio,
     this.builder,
+    this.stackBuilder = false,
     required this.child,
   });
 
@@ -34,6 +35,7 @@ class OriginItem extends StatefulWidget {
   final OriginConstraints constraints;
   final double? aspectRatio;
   final WidgetBuilder? builder;
+  final bool stackBuilder;
   final Widget child;
 
   @override
@@ -143,7 +145,12 @@ class _OriginItemState extends State<OriginItem> {
     data.originContainer.value = widget.originContainer ?? _scope.measureContainer(widget.containerTag ?? widget.tag) ?? data.displayContainer.value;
     data.display.value = widget.display ?? data.displayContainer.value;
     data.aspectRatio.value = widget.aspectRatio ?? context.size!.aspectRatio;
-    data.widget.value = widget.builder?.call(context) ?? widget.child;
+    final built = widget.builder?.call(context);
+    data.widget.value = built == null
+        ? widget.child
+        : widget.stackBuilder
+            ? Stack(fit: .expand, children: [widget.child, built])
+            : built;
     data.setTag(widget.tag);
     data.setRect(origin.rect);
     return data;
