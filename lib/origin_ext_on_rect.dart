@@ -3,11 +3,14 @@ import 'dart:math';
 import 'package:flutter/widgets.dart';
 
 extension RectExt on Rect {
+  double baseWidth(double aspectRatio) => min(width, height * aspectRatio);
+  double baseHeight(double aspectRatio) => min(height, width / aspectRatio);
+
   Rect baseRect(double aspectRatio) {
     return Rect.fromCenter(
       center: center,
-      width: min(width, height * aspectRatio),
-      height: min(height, width / aspectRatio),
+      width: baseWidth(aspectRatio),
+      height: baseHeight(aspectRatio),
     );
   }
 

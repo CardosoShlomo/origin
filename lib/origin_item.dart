@@ -127,8 +127,7 @@ class _OriginItemState extends State<OriginItem> {
     if (details.pointerCount > 0) return;
     _activeStart = null;
     _totalDelta = .zero;
-    final data = OriginData.of(context);
-    data.animateRect(to: data.origin.value.rect, curve: Curves.easeOut);
+    OriginData.of(context).dismiss();
   }
 
   OriginRect _measureOrigin() {
@@ -146,13 +145,13 @@ class _OriginItemState extends State<OriginItem> {
     data.display.value = widget.display ?? data.displayContainer.value;
     data.aspectRatio.value = widget.aspectRatio ?? context.size!.aspectRatio;
     data.widget.value = widget.builder?.call(context) ?? widget.child;
+    data.setTag(widget.tag);
     data.setRect(origin.rect);
     return data;
   }
 
   void _trigger() {
-    final data = _setup();
-    data.animateRect(to: data.display.value.rect.baseRect(data.aspectRatio.value), curve: Curves.easeIn);
+    _setup().animateToBase();
   }
 
   @override
@@ -164,7 +163,13 @@ class _OriginItemState extends State<OriginItem> {
       onScaleStart: hasGestures ? _onScaleStart : null,
       onScaleUpdate: hasGestures ? _onScaleUpdate : null,
       onScaleEnd: hasGestures ? _onScaleEnd : null,
-      child: widget.child,
+      child: Visibility(
+        visible: Origin.tagOf(context) != widget.tag,
+        child: ClipRRect(
+          borderRadius: widget.borderRadius,
+          child: widget.child,
+        ),
+      ),
     );
   }
 }
