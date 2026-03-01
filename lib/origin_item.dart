@@ -1,7 +1,9 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'origin_context.dart';
 import 'origin_data.dart';
 import 'origin_ext_on_scale.dart';
+import 'origin_recognizer.dart';
 import 'origin_scope.dart';
 import 'origin_triggers.dart';
 
@@ -20,7 +22,6 @@ class OriginItem extends StatefulWidget {
     this.constraints = const OriginConstraints(),
     this.aspectRatio,
     this.builder,
-    this.stackBuilder = false,
     required this.child,
   });
 
@@ -35,7 +36,6 @@ class OriginItem extends StatefulWidget {
   final OriginConstraints constraints;
   final double? aspectRatio;
   final WidgetBuilder? builder;
-  final bool stackBuilder;
   final Widget child;
 
   @override
@@ -44,6 +44,7 @@ class OriginItem extends StatefulWidget {
 
 class _OriginItemState extends State<OriginItem> {
   late final OriginScope _scope;
+  final _childKey = GlobalKey();
 
   @override
   void initState() {
@@ -70,8 +71,11 @@ class _OriginItemState extends State<OriginItem> {
   OriginStart? _activeStart;
   Rect _startRect = .zero;
   Offset _totalDelta = .zero;
+  OriginScaleRecognizer? _recognizer;
 
-  void _onScaleStart(ScaleStartDetails details) {}
+  void _onScaleStart(ScaleStartDetails details) {
+    _startRect = Origin.of(context).rect.value;
+  }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
     _totalDelta += details.focalPointDelta;
@@ -79,11 +83,12 @@ class _OriginItemState extends State<OriginItem> {
     if (_activeStart == null) {
       _activeStart = _resolveStart(details);
       if (_activeStart == null) return;
-      _setup();
-      _startRect = OriginData.of(context).rect.value;
+      final data = _setup();
+      data.setItemGesturing(true);
+      _startRect = data.rect.value;
     }
 
-    final data = OriginData.of(context);
+    final data = Origin.of(context);
     data.rect.value = details.rect(startRect: _startRect, currentRect: data.rect.value);
   }
 
@@ -92,19 +97,22 @@ class _OriginItemState extends State<OriginItem> {
     final dy = _totalDelta.dy;
     final two = details.pointerCount > 1;
 
-    if (two) {
-      final scaleChange = details.scale - 1;
-      if (scaleChange > 0.05 && widget.gestures.containsKey(OriginStart.pinchOut)) return .pinchOut;
-      if (scaleChange < -0.05 && widget.gestures.containsKey(OriginStart.pinchIn)) return .pinchIn;
-    }
-
     OriginStart? h;
     OriginStart? v;
 
-    if (dx > 10) h = two ? .twoRight : .right;
-    if (dx < -10) h = two ? .twoLeft : .left;
-    if (dy > 10) v = two ? .twoDown : .down;
-    if (dy < -10) v = two ? .twoUp : .up;
+    if (two) {
+      if (details.scale > 1.01 && widget.gestures.containsKey(OriginStart.pinchOut)) return .pinchOut;
+      if (details.scale < 0.99 && widget.gestures.containsKey(OriginStart.pinchIn)) return .pinchIn;
+      if (dx > 10) h = .twoRight;
+      if (dx < -10) h = .twoLeft;
+      if (dy > 10) v = .twoDown;
+      if (dy < -10) v = .twoUp;
+    } else {
+      if (dx > 10) h = .right;
+      if (dx < -10) h = .left;
+      if (dy > 10) v = .down;
+      if (dy < -10) v = .up;
+    }
 
     // filter to mapped only
     if (h != null && !widget.gestures.containsKey(h)) h = null;
@@ -125,10 +133,21 @@ class _OriginItemState extends State<OriginItem> {
   }
 
   void _onScaleEnd(ScaleEndDetails details) {
-    if (details.pointerCount > 0) return;
+    if (details.pointerCount > 0) {
+      if (details.pointerCount == 1) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_recognizer?.trackedPointers.isEmpty ?? true) _finishGesture();
+        });
+      }
+      return;
+    }
+    _finishGesture();
+  }
+
+  void _finishGesture() {
     _activeStart = null;
     _totalDelta = .zero;
-    OriginData.of(context).dismiss();
+    Origin.of(context).dismiss();
   }
 
   OriginRect _measureOrigin() {
@@ -136,7 +155,7 @@ class _OriginItemState extends State<OriginItem> {
   }
 
   OriginData _setup() {
-    final data = OriginData.of(context);
+    final data = Origin.of(context);
     final origin = _measureOrigin();
     final screen = OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context));
 
@@ -145,12 +164,7 @@ class _OriginItemState extends State<OriginItem> {
     data.originContainer.value = widget.originContainer ?? _scope.measureContainer(widget.containerTag ?? widget.tag) ?? data.displayContainer.value;
     data.display.value = widget.display ?? data.displayContainer.value;
     data.aspectRatio.value = widget.aspectRatio ?? context.size!.aspectRatio;
-    final built = widget.builder?.call(context);
-    data.widget.value = built == null
-        ? widget.child
-        : widget.stackBuilder
-            ? Stack(fit: .expand, children: [widget.child, built])
-            : built;
+    data.widget.value = KeyedSubtree(key: _childKey, child: widget.builder?.call(context) ?? widget.child);
     data.setTag(widget.tag);
     data.setRect(origin.rect);
     return data;
@@ -164,18 +178,33 @@ class _OriginItemState extends State<OriginItem> {
   Widget build(BuildContext context) {
     final hasGestures = widget.gestures.isNotEmpty;
 
-    return GestureDetector(
-      onTap: widget.tap != null ? _trigger : null,
-      onScaleStart: hasGestures ? _onScaleStart : null,
-      onScaleUpdate: hasGestures ? _onScaleUpdate : null,
-      onScaleEnd: hasGestures ? _onScaleEnd : null,
-      child: Visibility(
-        visible: Origin.tagOf(context) != widget.tag,
-        child: ClipRRect(
-          borderRadius: widget.borderRadius,
-          child: widget.child,
-        ),
-      ),
+    return RawGestureDetector(
+      behavior: .translucent,
+      gestures: {
+        if (widget.tap != null)
+          TapGestureRecognizer: GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
+            () => TapGestureRecognizer(),
+            (r) => r.onTap = _trigger,
+          ),
+        if (hasGestures)
+          OriginScaleRecognizer: GestureRecognizerFactoryWithHandlers<OriginScaleRecognizer>(
+            () => OriginScaleRecognizer(),
+            (r) {
+              _recognizer = r;
+              r
+                ..gestures = widget.gestures
+                ..onStart = _onScaleStart
+                ..onUpdate = _onScaleUpdate
+                ..onEnd = _onScaleEnd;
+            },
+          ),
+      },
+      child: Origin.tagOf(context) == widget.tag
+          ? SizedBox.shrink()
+          : ClipRRect(
+              borderRadius: widget.borderRadius,
+              child: KeyedSubtree(key: _childKey, child: widget.child),
+            ),
     );
   }
 }

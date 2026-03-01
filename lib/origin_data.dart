@@ -26,7 +26,9 @@ class OriginData extends InheritedModel<String> {
     required this.rect,
     required this.widget,
     required this.tag,
+    required this.itemGesturing,
     required this.setTag,
+    required this.setItemGesturing,
     required this.setRect,
     required this.animateRect,
     required this.reset,
@@ -45,8 +47,10 @@ class OriginData extends InheritedModel<String> {
   final ValueNotifier<Widget?> widget;
 
   final Object? tag;
+  final bool itemGesturing;
 
   final ValueSetter<Object?> setTag;
+  final ValueSetter<bool> setItemGesturing;
   final ValueSetter<Rect> setRect;
   final AnimateRect animateRect;
   final VoidCallback reset;
@@ -60,21 +64,21 @@ class OriginData extends InheritedModel<String> {
     return BorderRadius.lerp(origin.value.borderRadius, display.value.borderRadius, t)!;
   }
 
-  static OriginData of(BuildContext context) {
-    return context.dependOnInheritedWidgetOfExactType<OriginData>()!;
-  }
-
   @override
   bool updateShouldNotify(OriginData oldWidget) => true;
 
   @override
   bool updateShouldNotifyDependent(OriginData oldWidget, Set<String> dependencies) {
-    return dependencies.contains('tag') && tag != oldWidget.tag;
+    if (dependencies.contains('tag') && tag != oldWidget.tag) return true;
+    if (dependencies.contains('itemGesturing') && itemGesturing != oldWidget.itemGesturing) return true;
+    return false;
   }
 }
 
 abstract final class Origin {
-  static OriginData of(BuildContext context) => OriginData.of(context);
+  static OriginData of(BuildContext context) {
+    return context.dependOnInheritedWidgetOfExactType<OriginData>()!;
+  }
 
   static Object? tagOf(BuildContext context) {
     return InheritedModel.inheritFrom<OriginData>(context, aspect: 'tag')!.tag;

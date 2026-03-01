@@ -1,6 +1,7 @@
 import 'package:flutter/widgets.dart';
 import 'origin_data.dart';
 import 'origin_ext_on_rect.dart';
+import 'origin_ext_on_scale.dart';
 import 'origin_overlay.dart';
 import 'origin_scope.dart';
 
@@ -30,6 +31,7 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
   final _aspectRatio = ValueNotifier(1.0);
   final _widget = ValueNotifier<Widget?>(null);
   Object? _tag;
+  bool _itemGesturing = false;
 
   static const _defaultDuration = Duration(milliseconds: 300);
 
@@ -49,29 +51,53 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
   final _centerYTween = Tween<double>(begin: 0, end: 0);
   final _widthTween = Tween<double>(begin: 0, end: 0);
 
-  Offset _dragStart = .zero;
-  Rect _dragStartRect = .zero;
+  Rect _startRect = .zero;
+  final _pointers = <int>[];
+
+  void _onPointerDown(PointerDownEvent event) {
+    _pointers.add(event.pointer);
+  }
+
+  void _onPointerUp(PointerUpEvent event) {
+    _pointers.remove(event.pointer);
+  }
 
   void _onScaleStart(ScaleStartDetails details) {
-    _dragStart = details.focalPoint;
-    _dragStartRect = _rect.value;
+    _startRect = _rect.value;
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
-    final delta = details.focalPoint - _dragStart;
-    final screenHeight = MediaQuery.sizeOf(context).height;
-    final scale = (1 - delta.dy.abs() / screenHeight).clamp(0.5, 1.0);
-    _rect.value = .fromCenter(
-      center: _dragStartRect.center + delta,
-      width: _dragStartRect.width * scale,
-      height: _dragStartRect.height * scale,
-    );
+    final baseRect = _display.value.rect.baseRect(_aspectRatio.value);
+    if (details.pointerCount == 1 && _startRect.width == baseRect.width) {
+      final center = _rect.value.center + details.focalPointDelta;
+      final dy = (center.dy - baseRect.center.dy).abs();
+      final screenHeight = MediaQuery.sizeOf(context).height;
+      final scale = (1 - dy / screenHeight).clamp(0.5, 1.0);
+      _rect.value = Rect.fromCenter(
+        center: center,
+        width: baseRect.width * scale,
+        height: baseRect.height * scale,
+      );
+    } else {
+      _rect.value = details.rect(startRect: _startRect, currentRect: _rect.value);
+    }
   }
 
   void _onScaleEnd(ScaleEndDetails details) {
-    final delta = _rect.value.center - _dragStartRect.center;
-    final screenHeight = MediaQuery.sizeOf(context).height;
-    if (delta.dy.abs() > screenHeight * 0.2) {
+    if (details.pointerCount > 0) {
+      if (details.pointerCount == 1) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_pointers.isEmpty) _finishGesture();
+        });
+      }
+      return;
+    }
+    _finishGesture();
+  }
+
+  void _finishGesture() {
+    final baseRect = _display.value.rect.baseRect(_aspectRatio.value);
+    if (_rect.value.width < baseRect.width * 0.85) {
       dismiss();
     } else {
       animateToBase();
@@ -79,11 +105,13 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
   }
 
   void _setTag(Object? tag) => setState(() => _tag = tag);
+  void _setItemGesturing(bool v) => setState(() => _itemGesturing = v);
 
   void reset() {
     setRect(Rect.zero);
     _widget.value = null;
     _setTag(null);
+    _setItemGesturing(false);
   }
 
   Future<void> dismiss() async {
@@ -172,7 +200,9 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
         rect: _rect,
         widget: _widget,
         tag: _tag,
+        itemGesturing: _itemGesturing,
         setTag: _setTag,
+        setItemGesturing: _setItemGesturing,
         setRect: setRect,
         animateRect: animateRect,
         reset: reset,
@@ -185,12 +215,19 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
             const OriginOverlay(),
             ValueListenableBuilder<Widget?>(
               valueListenable: _widget,
-              builder: (context, widget, _) => GestureDetector(
-                behavior: widget == null ? .translucent : .opaque,
-                onScaleStart: _onScaleStart,
-                onScaleUpdate: _onScaleUpdate,
-                onScaleEnd: _onScaleEnd,
-              ),
+              builder: (context, widget, _) {
+                final active = widget != null && !_itemGesturing;
+                return Listener(
+                  onPointerDown: active ? _onPointerDown : null,
+                  onPointerUp: active ? _onPointerUp : null,
+                  child: GestureDetector(
+                    behavior: active ? .opaque : .translucent,
+                    onScaleStart: active ? _onScaleStart : null,
+                    onScaleUpdate: active ? _onScaleUpdate : null,
+                    onScaleEnd: active ? _onScaleEnd : null,
+                  ),
+                );
+              },
             ),
           ],
         ),

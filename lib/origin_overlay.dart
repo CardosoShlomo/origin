@@ -7,7 +7,7 @@ class OriginOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final data = OriginData.of(context);
+    final data = Origin.of(context);
 
     return ValueListenableBuilder<Rect>(
       valueListenable: data.rect,

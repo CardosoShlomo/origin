@@ -15,6 +15,7 @@ extension ExtensionOnScaleUpdateDetails on ScaleUpdateDetails {
     /// { rectWidth / desiredWidth == (rectCenter - focalPoint) / (desiredCenter - focalPoint) }
     /// then { desiredCenter - focalPoint == (rectCenter - focalPoint) * desiredWidth / rectWidth }
     /// then we add the focalPointDelta because the user also drag sometimes when scaling
+    if (currentRect.width == 0) return currentRect;
     final center = (currentRect.center - focalPoint) * width / currentRect.width + focalPoint + focalPointDelta;
     return Rect.fromCenter(
       center: center,
