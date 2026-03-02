@@ -4,6 +4,7 @@ import 'origin_ext_on_rect.dart';
 import 'origin_ext_on_scale.dart';
 import 'origin_overlay.dart';
 import 'origin_scope.dart';
+import 'origin_triggers.dart';
 
 /// Wraps a screen to enable origin animations.
 /// Provides the overlay Stack where the animated item is rendered.
@@ -30,6 +31,11 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
   final _displayContainer = ValueNotifier(_defaultOriginRect);
   final _aspectRatio = ValueNotifier(1.0);
   final _widget = ValueNotifier<Widget?>(null);
+  final _containers = <Object, OriginRect Function()>{};
+  final _items = <Object, Future<void> Function([Rect Function(Rect)?])>{};
+  double? _perspective;
+  OriginBuilder? _gestureBuilder;
+  VoidCallback? _onEnd;
   Object? _tag;
   bool _itemGesturing = false;
 
@@ -38,6 +44,8 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
   late final AnimationController _centerX;
   late final AnimationController _centerY;
   late final AnimationController _width;
+  late final AnimationController _effect;
+  final _effectTransform = ValueNotifier<Matrix4?>(null);
 
   @override
   void initState() {
@@ -45,6 +53,7 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
     _centerX = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateRect);
     _centerY = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateRect);
     _width = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateRect);
+    _effect = AnimationController(vsync: this, duration: _defaultDuration);
   }
 
   final _centerXTween = Tween<double>(begin: 0, end: 0);
@@ -104,18 +113,55 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
     }
   }
 
+  void _setPerspective(double? v) => _perspective = v;
+  void _setGestureBuilder(OriginBuilder? v) => setState(() => _gestureBuilder = v);
+  void _setOnEnd(VoidCallback? v) => _onEnd = v;
   void _setTag(Object? tag) => setState(() => _tag = tag);
   void _setItemGesturing(bool v) => setState(() => _itemGesturing = v);
 
   void reset() {
     setRect(Rect.zero);
     _widget.value = null;
+    _setPerspective(null);
+    _setGestureBuilder(null);
+    _setOnEnd(null);
     _setTag(null);
     _setItemGesturing(false);
   }
 
+  Future<void> runEffect({
+    double? rotateX,
+    double? rotateY,
+    double? rotateZ,
+    double? perspective,
+    Duration duration = const Duration(milliseconds: 100),
+    Curve curve = Curves.easeOut,
+  }) async {
+    _effect.duration = duration;
+    final p = perspective ?? _perspective ?? 0;
+    final perspectiveValue = 0.001 + p * 0.004;
+    final curved = CurvedAnimation(parent: _effect, curve: curve);
+    void update() {
+      final t = curved.value;
+      final m = Matrix4.identity();
+      m.setEntry(3, 2, perspectiveValue);
+      if (rotateX != null) m.rotateX(t * rotateX);
+      if (rotateY != null) m.rotateY(t * rotateY);
+      if (rotateZ != null) m.rotateZ(t * rotateZ);
+      _effectTransform.value = m;
+    }
+    curved.addListener(update);
+    await _effect.forward();
+    await _effect.reverse();
+    curved.removeListener(update);
+    curved.dispose();
+    _effectTransform.value = null;
+    reset();
+  }
+
   Future<void> dismiss() async {
     await animateRect(to: _origin.value.rect, curve: Curves.easeOut);
+    _onEnd?.call();
     reset();
   }
 
@@ -185,12 +231,16 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
     _centerX.dispose();
     _centerY.dispose();
     _width.dispose();
+    _effect.dispose();
+    _effectTransform.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return OriginScope(
+      containers: _containers,
+      items: _items,
       child: OriginData(
         origin: _origin,
         originContainer: _originContainer,
@@ -198,9 +248,16 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
         displayContainer: _displayContainer,
         aspectRatio: _aspectRatio,
         rect: _rect,
+        effectTransform: _effectTransform,
         widget: _widget,
+        perspective: _perspective,
+        gestureBuilder: _gestureBuilder,
+        onEnd: _onEnd,
         tag: _tag,
         itemGesturing: _itemGesturing,
+        setPerspective: _setPerspective,
+        setGestureBuilder: _setGestureBuilder,
+        setOnEnd: _setOnEnd,
         setTag: _setTag,
         setItemGesturing: _setItemGesturing,
         setRect: setRect,
@@ -208,6 +265,7 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
         reset: reset,
         animateToBase: animateToBase,
         dismiss: dismiss,
+        runEffect: runEffect,
         child: Stack(
           fit: .expand,
           children: [

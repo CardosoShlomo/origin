@@ -1,5 +1,6 @@
 import 'package:flutter/widgets.dart';
 import 'origin_ext_on_rect.dart';
+import 'origin_triggers.dart';
 
 typedef AnimateRect = Future<void> Function({required Rect to, Duration? duration, Curve curve});
 
@@ -13,6 +14,18 @@ class OriginRect {
   final Rect rect;
   final BorderRadius borderRadius;
   final bool animate;
+
+  OriginRect copyWith({
+    Rect? rect,
+    BorderRadius? borderRadius,
+    bool? animate,
+  }) {
+    return OriginRect(
+      rect: rect ?? this.rect,
+      borderRadius: borderRadius ?? this.borderRadius,
+      animate: animate ?? this.animate,
+    );
+  }
 }
 
 class OriginData extends InheritedModel<String> {
@@ -24,9 +37,16 @@ class OriginData extends InheritedModel<String> {
     required this.displayContainer,
     required this.aspectRatio,
     required this.rect,
+    required this.effectTransform,
     required this.widget,
+    required this.perspective,
+    required this.gestureBuilder,
+    required this.onEnd,
     required this.tag,
     required this.itemGesturing,
+    required this.setPerspective,
+    required this.setGestureBuilder,
+    required this.setOnEnd,
     required this.setTag,
     required this.setItemGesturing,
     required this.setRect,
@@ -34,6 +54,7 @@ class OriginData extends InheritedModel<String> {
     required this.reset,
     required this.animateToBase,
     required this.dismiss,
+    required this.runEffect,
     required super.child,
   });
 
@@ -44,11 +65,18 @@ class OriginData extends InheritedModel<String> {
 
   final ValueNotifier<double> aspectRatio;
   final ValueNotifier<Rect> rect;
+  final ValueNotifier<Matrix4?> effectTransform;
   final ValueNotifier<Widget?> widget;
 
+  final double? perspective;
+  final OriginBuilder? gestureBuilder;
+  final VoidCallback? onEnd;
   final Object? tag;
   final bool itemGesturing;
 
+  final ValueSetter<double?> setPerspective;
+  final ValueSetter<OriginBuilder?> setGestureBuilder;
+  final ValueSetter<VoidCallback?> setOnEnd;
   final ValueSetter<Object?> setTag;
   final ValueSetter<bool> setItemGesturing;
   final ValueSetter<Rect> setRect;
@@ -56,6 +84,14 @@ class OriginData extends InheritedModel<String> {
   final VoidCallback reset;
   final Future<void> Function() animateToBase;
   final Future<void> Function() dismiss;
+  final Future<void> Function({
+    double? rotateX,
+    double? rotateY,
+    double? rotateZ,
+    double? perspective,
+    Duration duration,
+    Curve curve,
+  }) runEffect;
 
   BorderRadius get borderRadius {
     final originW = origin.value.rect.width;

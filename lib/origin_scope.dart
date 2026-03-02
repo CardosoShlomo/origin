@@ -2,41 +2,46 @@ import 'package:flutter/widgets.dart';
 import 'origin_data.dart';
 
 class OriginScope extends InheritedWidget {
-  OriginScope({super.key, required super.child});
+  OriginScope({
+    super.key,
+    required this.containers,
+    required this.items,
+    required super.child,
+  });
 
-  final _containers = <Object, OriginRect Function()>{};
-  final _items = <Object, VoidCallback>{};
+  final Map<Object, OriginRect Function()> containers;
+  final Map<Object, Future<void> Function([Rect Function(Rect)?])> items;
 
   void registerContainer(Object tag, OriginRect Function() measure) {
     assert(
-      !_containers.containsKey(tag),
+      !containers.containsKey(tag),
       'Duplicate OriginContainer tag "$tag". Each tag must be unique.',
     );
-    _containers[tag] = measure;
+    containers[tag] = measure;
   }
 
   void unregisterContainer(Object tag) {
-    _containers.remove(tag);
+    containers.remove(tag);
   }
 
   OriginRect? measureContainer(Object tag) {
-    return _containers[tag]?.call();
+    return containers[tag]?.call();
   }
 
-  void registerItem(Object tag, VoidCallback trigger) {
+  void registerItem(Object tag, Future<void> Function([Rect Function(Rect)?]) trigger) {
     assert(
-      !_items.containsKey(tag),
+      !items.containsKey(tag),
       'Duplicate OriginItem tag "$tag". Each tag must be unique.',
     );
-    _items[tag] = trigger;
+    items[tag] = trigger;
   }
 
   void unregisterItem(Object tag) {
-    _items.remove(tag);
+    items.remove(tag);
   }
 
-  void triggerItem(Object tag) {
-    _items[tag]?.call();
+  Future<void> triggerItem(Object tag, [Rect Function(Rect)? send]) {
+    return items[tag]?.call(send) ?? Future.value();
   }
 
   static OriginScope of(BuildContext context) {

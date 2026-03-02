@@ -16,7 +16,20 @@ class OriginOverlay extends StatelessWidget {
 
         return Positioned.fromRect(
           rect: rect,
-          child: ClipRRect(borderRadius: data.borderRadius, child: child!),
+          child: ValueListenableBuilder<Matrix4?>(
+            valueListenable: data.effectTransform,
+            builder: (context, transform, child) {
+              if (transform == null) return child!;
+              return Transform(
+                transform: transform,
+                alignment: .center,
+                child: child,
+              );
+            },
+            child: data.gestureBuilder != null
+                ? data.gestureBuilder!(context, ClipRRect(borderRadius: data.borderRadius, child: child))
+                : ClipRRect(borderRadius: data.borderRadius, child: child),
+          ),
         );
       },
       child: ValueListenableBuilder<Widget?>(
