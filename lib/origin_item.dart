@@ -39,7 +39,7 @@ class OriginItem extends StatefulWidget {
   final double? aspectRatio;
   final double? perspective;
   final ValueSetter<OriginData>? onEnd;
-  final WidgetBuilder? builder;
+  final Widget Function(BuildContext, Widget)? builder;
   final Widget child;
 
   @override
@@ -88,7 +88,8 @@ class _OriginItemState extends State<OriginItem> {
       _activeStart = _resolveStart(details);
       if (_activeStart == null) return;
       final data = _setup();
-      data.setGestureBuilder(_gestureFor(_activeStart!).builder);
+      final gestureBuilder = _gestureFor(_activeStart!).builder;
+      if (gestureBuilder != null) data.setGestureBuilder(gestureBuilder);
       data.setItemGesturing(true);
       _startRect = data.rect.value;
     }
@@ -174,7 +175,8 @@ class _OriginItemState extends State<OriginItem> {
     data.originContainer.value = widget.originContainer ?? _scope.measureContainer(widget.containerTag ?? widget.tag) ?? data.displayContainer.value;
     data.display.value = widget.display ?? data.displayContainer.value;
     data.aspectRatio.value = widget.aspectRatio ?? context.size!.aspectRatio;
-    data.widget.value = KeyedSubtree(key: _childKey, child: widget.builder?.call(context) ?? widget.child);
+    data.widget.value = KeyedSubtree(key: _childKey, child: widget.child);
+    if (widget.builder != null) data.setGestureBuilder(widget.builder);
     data.setPerspective(widget.perspective);
     data.setOnEnd(widget.onEnd != null ? () => widget.onEnd!(data) : null);
     data.setTag(widget.tag);

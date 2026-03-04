@@ -1,3 +1,10 @@
+## 0.3.0
+
+* **Breaking:** `OriginItem.builder` signature changed from `WidgetBuilder?` to `Widget Function(BuildContext, Widget)?` — receives the child widget as second parameter.
+* **Breaking:** `OriginItem.builder` now acts as the gesture builder in the overlay. If no `OriginGesture.builder` is provided, the item's builder is used instead.
+* `OriginItem.builder` no longer replaces the overlay widget — `widget.child` is always used. The builder wraps the clipped child in the overlay.
+* Overlay blocks gestures on content beneath when active (absorbs pointers between content and overlay layer).
+
 ## 0.2.0
 
 * **Breaking:** `OriginScope.registerItem` callback changed from `VoidCallback` to `Future<void> Function([Rect Function(Rect)?])`.

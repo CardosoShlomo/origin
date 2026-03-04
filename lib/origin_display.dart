@@ -270,6 +270,11 @@ class _OriginDisplayState extends State<OriginDisplay> with TickerProviderStateM
           fit: .expand,
           children: [
             widget.child,
+            ValueListenableBuilder<Widget?>(
+              valueListenable: _widget,
+              builder: (_, w, child) => IgnorePointer(ignoring: w == null, child: child),
+              child: const AbsorbPointer(),
+            ),
             const OriginOverlay(),
             ValueListenableBuilder<Widget?>(
               valueListenable: _widget,
