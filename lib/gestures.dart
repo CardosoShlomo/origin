@@ -1,11 +1,11 @@
 import 'package:flutter/widgets.dart';
 
-typedef OriginBuilder = Widget Function(BuildContext context, Widget child);
+typedef StageBuilder = Widget Function(BuildContext context, Widget child);
 
-typedef OriginTap = void Function(OriginTapEvent event);
+typedef StageTap = void Function(TapEvent event);
 
-class OriginTapEvent {
-  OriginTapEvent({
+class TapEvent {
+  TapEvent({
     required this.localPosition,
     required this.globalPosition,
     required this.animateToBase,
@@ -25,26 +25,26 @@ class OriginTapEvent {
   }) runEffect;
 }
 
-class OriginBounds {
-  const OriginBounds({
+class GestureBounds {
+  const GestureBounds({
     required this.bound,
     this.value = 0,
     this.perspective,
     this.builder,
   });
 
-  const OriginBounds.horizontal({this.value = 0, this.perspective, this.builder}) : bound = OriginBound.horizontal;
-  const OriginBounds.vertical({this.value = 0, this.perspective, this.builder}) : bound = OriginBound.vertical;
-  const OriginBounds.directional({this.value = 0, this.perspective, this.builder}) : bound = OriginBound.directional;
-  const OriginBounds.scale({this.value = 0, this.perspective, this.builder}) : bound = OriginBound.scale;
+  const GestureBounds.horizontal({this.value = 0, this.perspective, this.builder}) : bound = GestureBound.horizontal;
+  const GestureBounds.vertical({this.value = 0, this.perspective, this.builder}) : bound = GestureBound.vertical;
+  const GestureBounds.directional({this.value = 0, this.perspective, this.builder}) : bound = GestureBound.directional;
+  const GestureBounds.scale({this.value = 0, this.perspective, this.builder}) : bound = GestureBound.scale;
 
-  final Set<OriginBound> bound;
+  final Set<GestureBound> bound;
   final double value;
   final double? perspective;
-  final OriginBuilder? builder;
+  final StageBuilder? builder;
 }
 
-enum OriginStart {
+enum GestureStart {
   left, right, up, down,
   twoLeft, twoRight, twoUp, twoDown,
   pinchIn, pinchOut;
@@ -64,7 +64,7 @@ enum OriginStart {
   bool get isTwo => two.contains(this);
   bool get isScale => scale.contains(this);
 
-  OriginBound get bound => switch (this) {
+  GestureBound get bound => switch (this) {
     .left || .twoLeft => .left,
     .right || .twoRight => .right,
     .up || .twoUp => .up,
@@ -74,7 +74,7 @@ enum OriginStart {
   };
 }
 
-enum OriginBound {
+enum GestureBound {
   left, right, up, down,
   zoomIn, zoomOut;
 
@@ -90,30 +90,30 @@ enum OriginBound {
   bool get isScale => scale.contains(this);
 }
 
-class OriginGesture {
-  const OriginGesture({
+class Gesture {
+  const Gesture({
     required this.start,
     this.bounds = const [],
     this.builder,
   });
 
-  const OriginGesture.horizontal({this.bounds = const [], this.builder}) : start = OriginStart.horizontal;
-  const OriginGesture.vertical({this.bounds = const [], this.builder}) : start = OriginStart.vertical;
-  const OriginGesture.one({this.bounds = const [], this.builder}) : start = OriginStart.one;
-  const OriginGesture.twoHorizontal({this.bounds = const [], this.builder}) : start = OriginStart.twoHorizontal;
-  const OriginGesture.twoVertical({this.bounds = const [], this.builder}) : start = OriginStart.twoVertical;
-  const OriginGesture.two({this.bounds = const [], this.builder}) : start = OriginStart.two;
-  const OriginGesture.scale({this.bounds = const [], this.builder}) : start = OriginStart.scale;
-  const OriginGesture.pinchOut({this.bounds = const [], this.builder}) : start = const {.pinchOut};
-  const OriginGesture.pinchIn({this.bounds = const [], this.builder}) : start = const {.pinchIn};
+  const Gesture.horizontal({this.bounds = const [], this.builder}) : start = GestureStart.horizontal;
+  const Gesture.vertical({this.bounds = const [], this.builder}) : start = GestureStart.vertical;
+  const Gesture.one({this.bounds = const [], this.builder}) : start = GestureStart.one;
+  const Gesture.twoHorizontal({this.bounds = const [], this.builder}) : start = GestureStart.twoHorizontal;
+  const Gesture.twoVertical({this.bounds = const [], this.builder}) : start = GestureStart.twoVertical;
+  const Gesture.two({this.bounds = const [], this.builder}) : start = GestureStart.two;
+  const Gesture.scale({this.bounds = const [], this.builder}) : start = GestureStart.scale;
+  const Gesture.pinchOut({this.bounds = const [], this.builder}) : start = const {.pinchOut};
+  const Gesture.pinchIn({this.bounds = const [], this.builder}) : start = const {.pinchIn};
 
-  final Set<OriginStart> start;
-  final List<OriginBounds> bounds;
-  final OriginBuilder? builder;
+  final Set<GestureStart> start;
+  final List<GestureBounds> bounds;
+  final StageBuilder? builder;
 }
 
-class OriginConstraints {
-  const OriginConstraints({
+class GestureConstraints {
+  const GestureConstraints({
     this.decelerate = 0.03,
     this.frictionLeft = 0,
     this.frictionRight = 0,

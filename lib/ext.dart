@@ -1,20 +1,37 @@
 import 'dart:math';
 
 import 'package:flutter/widgets.dart';
-import 'origin_ext_on_rect.dart';
 
-extension ExtensionOnScaleUpdateDetails on ScaleUpdateDetails {
+extension RectExt on Rect {
+  double baseWidth(double aspectRatio) => min(width, height * aspectRatio);
+  double baseHeight(double aspectRatio) => min(height, width / aspectRatio);
+
+  Rect baseRect(double aspectRatio) {
+    return Rect.fromCenter(
+      center: center,
+      width: baseWidth(aspectRatio),
+      height: baseHeight(aspectRatio),
+    );
+  }
+
+  Rect shiftToFitInside(Rect container) {
+    final dx = width > container.width
+        ? center.dx + min(0, container.left - left) + max(0, container.right - right)
+        : container.center.dx;
+    final dy = height > container.height
+        ? center.dy + min(0, container.top - top) + max(0, container.bottom - bottom)
+        : container.center.dy;
+    return shift(Offset(dx, dy) - center);
+  }
+}
+
+extension ScaleExt on ScaleUpdateDetails {
   Rect rect({
     required Rect startRect,
     required Rect currentRect,
   }) {
     final width = startRect.width * scale;
     final height = startRect.height * scale;
-    /// we want that the user will see the same scene of the image in the focalPoint
-    /// the difference of width (scale) is the difference of the distance from the focalPoint to the center of the rect
-    /// { rectWidth / desiredWidth == (rectCenter - focalPoint) / (desiredCenter - focalPoint) }
-    /// then { desiredCenter - focalPoint == (rectCenter - focalPoint) * desiredWidth / rectWidth }
-    /// then we add the focalPointDelta because the user also drag sometimes when scaling
     if (currentRect.width == 0) return currentRect;
     final center = (currentRect.center - focalPoint) * width / currentRect.width + focalPoint + focalPointDelta;
     return Rect.fromCenter(
@@ -56,5 +73,12 @@ extension ExtensionOnScaleUpdateDetails on ScaleUpdateDetails {
     }
 
     return imageRect.translate(dx, dy).shiftToFitInside(container);
+  }
+}
+
+extension ContextExt on BuildContext {
+  Rect get rect {
+    final box = findRenderObject() as RenderBox;
+    return box.localToGlobal(Offset.zero) & box.size;
   }
 }

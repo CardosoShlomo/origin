@@ -1,6 +1,6 @@
 name: origin
-description: "Interactive hero animations."
-version: 0.3.0
+description: "Interactive hero animations for Flutter."
+version: 1.0.0
 repository: https://github.com/CardosoShlomo/origin
 
 environment:

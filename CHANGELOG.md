@@ -1,3 +1,15 @@
+## 1.0.0
+
+* **Breaking:** `OriginDisplay` + `OriginScope` merged into `Stage`.
+* **Breaking:** `OriginItem` replaced by `Origin`.
+* **Breaking:** `triggerEntry` split into `openEntry` and `sendEntry`.
+* **Breaking:** `effectTransform` replaced by `Rotation` class with `toMatrix4`.
+* `InheritedModel` aspects: `widgetOf`, `hasWidgetOf`, `tagOf`, `isTagOf`.
+* `originToBaseProgress` notifier for border radius and scrim interpolation.
+* Configurable `backgroundColor` scrim on Stage.
+* `onEnd` overridable via `setOnEnd` or `sendEntry` optional parameter.
+* `perspective` on `Rotation` class and `runEffect`.
+
 ## 0.3.0
 
 * **Breaking:** `OriginItem.builder` signature changed from `WidgetBuilder?` to `Widget Function(BuildContext, Widget)?` — receives the child widget as second parameter.
