@@ -56,6 +56,10 @@ class Stage extends StatefulWidget {
     return InheritedModel.inheritFrom<StageData>(context, aspect: _hasWidgetAspect)!.widget != null;
   }
 
+  static bool isLockedOf(BuildContext context) {
+    return context.getInheritedWidgetOfExactType<StageData>()!.locked;
+  }
+
   @override
   State<Stage> createState() => _StageState();
 }
@@ -65,11 +69,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
   static const _defaultOriginRect = OriginRect(rect: .zero);
 
-  final _origin = ValueNotifier(_defaultOriginRect);
-  final _originContainer = ValueNotifier(_defaultOriginRect);
-  final _display = ValueNotifier(_defaultOriginRect);
-  final _displayContainer = ValueNotifier(_defaultOriginRect);
-  final _aspectRatio = ValueNotifier(1.0);
+  OriginRect _origin = _defaultOriginRect;
+  OriginRect? _originContainer;
+  OriginRect _display = _defaultOriginRect;
+  OriginRect? _displayContainer;
+  double _aspectRatio = 1.0;
   Widget? _widget;
   final _originToBaseProgress = ValueNotifier(0.0);
   final _registry = <Object, OriginEntry>{};
@@ -78,7 +82,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   StageBuilder? _gestureBuilder;
   VoidCallback? _onEnd;
   Object? _tag;
-  bool _itemGesturing = false;
+  bool _locked = true;
 
   static const _defaultDuration = Duration(milliseconds: 300);
 
@@ -109,7 +113,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
-    final baseRect = _display.value.rect.baseRect(_aspectRatio.value);
+    final baseRect = _display.rect.baseRect(_aspectRatio);
     if (details.pointerCount == 1 && _startRect.width == baseRect.width) {
       final center = _rect.value.center + details.focalPointDelta;
       final dy = (center.dy - baseRect.center.dy).abs();
@@ -126,7 +130,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   void _onScaleEnd(ScaleEndDetails details) {
-    final baseRect = _display.value.rect.baseRect(_aspectRatio.value);
+    final baseRect = _display.rect.baseRect(_aspectRatio);
     if (_rect.value.width < baseRect.width * 0.85) {
       dismiss();
     } else {
@@ -134,13 +138,18 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     }
   }
 
+  void _setOrigin(OriginRect v) => _origin = v;
+  void _setOriginContainer(OriginRect? v) => _originContainer = v;
+  void _setDisplay(OriginRect v) => _display = v;
+  void _setDisplayContainer(OriginRect? v) => _displayContainer = v;
+  void _setAspectRatio(double v) => _aspectRatio = v;
   void _setPerspective(double? v) => _perspective = v;
   void _setBackgroundColor(Color? v) => _backgroundColor = v;
   void _setGestureBuilder(StageBuilder? v) => setState(() => _gestureBuilder = v);
   void _setOnEnd(VoidCallback? v) => _onEnd = v;
   void _setTag(Object? tag) => setState(() => _tag = tag);
   void _setWidget(Widget? v) => setState(() => _widget = v);
-  void _setItemGesturing(bool v) => setState(() => _itemGesturing = v);
+  void _setLocked(bool v) => setState(() => _locked = v);
 
   void reset() {
     setRect(.zero);
@@ -151,7 +160,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _setGestureBuilder(null);
     _setOnEnd(null);
     _setTag(null);
-    _setItemGesturing(false);
+    _setLocked(true);
   }
 
   Future<void> runEffect({
@@ -183,13 +192,14 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   Future<void> dismiss() async {
-    await animateRect(to: _origin.value.rect, curve: Curves.easeOut);
+    await animateRect(to: _origin.rect, curve: Curves.easeOut);
     _onEnd?.call();
     reset();
   }
 
-  Future<void> animateToBase() {
-    return animateRect(to: _display.value.rect.baseRect(_aspectRatio.value), curve: Curves.easeOut);
+  Future<void> animateToBase() async {
+    await animateRect(to: _display.rect.baseRect(_aspectRatio), curve: Curves.easeOut);
+    _setLocked(false);
   }
 
   void setRect(Rect rect) {
@@ -203,13 +213,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     final cx = _centerXTween.evaluate(_centerX);
     final cy = _centerYTween.evaluate(_centerY);
     final w = _widthTween.evaluate(_width);
-    _rect.value = Rect.fromCenter(center: Offset(cx, cy), width: w, height: w / _aspectRatio.value);
+    _rect.value = Rect.fromCenter(center: Offset(cx, cy), width: w, height: w / _aspectRatio);
   }
 
   void _updateProgress() {
     final w = _rect.value.width;
-    final originW = _origin.value.rect.width;
-    final baseW = _display.value.rect.baseWidth(_aspectRatio.value);
+    final originW = _origin.rect.width;
+    final baseW = _display.rect.baseWidth(_aspectRatio);
     _originToBaseProgress.value = (w.clamp(originW, baseW) - originW) / (baseW - originW);
   }
 
@@ -278,11 +288,6 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   @override
   void dispose() {
     _rect.dispose();
-    _origin.dispose();
-    _originContainer.dispose();
-    _display.dispose();
-    _displayContainer.dispose();
-    _aspectRatio.dispose();
     _originToBaseProgress.dispose();
     _centerX.dispose();
     _centerY.dispose();
@@ -310,13 +315,18 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       gestureBuilder: _gestureBuilder,
       onEnd: _onEnd,
       tag: _tag,
-      itemGesturing: _itemGesturing,
+      locked: _locked,
+      setOrigin: _setOrigin,
+      setOriginContainer: _setOriginContainer,
+      setDisplay: _setDisplay,
+      setDisplayContainer: _setDisplayContainer,
+      setAspectRatio: _setAspectRatio,
       setPerspective: _setPerspective,
       setBackgroundColor: _setBackgroundColor,
       setGestureBuilder: _setGestureBuilder,
       setOnEnd: _setOnEnd,
       setTag: _setTag,
-      setItemGesturing: _setItemGesturing,
+      setLocked: _setLocked,
       setRect: setRect,
       animateRect: animateRect,
       reset: reset,
@@ -335,7 +345,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
           const _AbsorbLayer(),
           const StageOverlay(),
           Builder(builder: (context) {
-            final active = Stage.hasWidgetOf(context) && !_itemGesturing;
+            final active = Stage.hasWidgetOf(context) && !_locked;
             return RawGestureDetector(
               behavior: active ? .opaque : .translucent,
               gestures: {
@@ -374,13 +384,18 @@ class StageData extends InheritedModel<Object> {
     required this.gestureBuilder,
     required this.onEnd,
     required this.tag,
-    required this.itemGesturing,
+    required this.locked,
+    required this.setOrigin,
+    required this.setOriginContainer,
+    required this.setDisplay,
+    required this.setDisplayContainer,
+    required this.setAspectRatio,
     required this.setPerspective,
     required this.setBackgroundColor,
     required this.setGestureBuilder,
     required this.setOnEnd,
     required this.setTag,
-    required this.setItemGesturing,
+    required this.setLocked,
     required this.setRect,
     required this.animateRect,
     required this.reset,
@@ -395,12 +410,12 @@ class StageData extends InheritedModel<Object> {
     required super.child,
   });
 
-  final ValueNotifier<OriginRect> origin;
-  final ValueNotifier<OriginRect> originContainer;
-  final ValueNotifier<OriginRect> display;
-  final ValueNotifier<OriginRect> displayContainer;
+  final OriginRect origin;
+  final OriginRect? originContainer;
+  final OriginRect display;
+  final OriginRect? displayContainer;
 
-  final ValueNotifier<double> aspectRatio;
+  final double aspectRatio;
   final ValueNotifier<Rect> rect;
   final ValueNotifier<Rotation?> rotation;
   final ValueNotifier<double> originToBaseProgress;
@@ -411,15 +426,20 @@ class StageData extends InheritedModel<Object> {
   final StageBuilder? gestureBuilder;
   final VoidCallback? onEnd;
   final Object? tag;
-  final bool itemGesturing;
+  final bool locked;
 
   final ValueSetter<Widget?> setWidget;
+  final ValueSetter<OriginRect> setOrigin;
+  final ValueSetter<OriginRect?> setOriginContainer;
+  final ValueSetter<OriginRect> setDisplay;
+  final ValueSetter<OriginRect?> setDisplayContainer;
+  final ValueSetter<double> setAspectRatio;
   final ValueSetter<double?> setPerspective;
   final ValueSetter<Color?> setBackgroundColor;
   final ValueSetter<StageBuilder?> setGestureBuilder;
   final ValueSetter<VoidCallback?> setOnEnd;
   final ValueSetter<Object?> setTag;
-  final ValueSetter<bool> setItemGesturing;
+  final ValueSetter<bool> setLocked;
   final ValueSetter<Rect> setRect;
   final AnimateRect animateRect;
   final VoidCallback reset;

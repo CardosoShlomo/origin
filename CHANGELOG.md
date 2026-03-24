@@ -1,3 +1,12 @@
+## 1.1.0
+
+* **Breaking:** `itemGesturing` / `setItemGesturing` replaced by `locked` / `setLocked`. Stage defaults to locked, unlocks after `animateToBase` completes, relocks on `reset`.
+* **Breaking:** `origin`, `originContainer`, `display`, `displayContainer`, `aspectRatio` on `StageData` changed from `ValueNotifier` to plain values with setters.
+* **Breaking:** `originContainer` and `displayContainer` are now nullable. `null` means full screen (no container clip).
+* Container clipping: overlay clips content to an animated container rect using `ClipPath`. Container expands from `originContainer` toward `displayContainer` as the item moves.
+* `Stage.isLockedOf(context)` static accessor.
+* `containerTag` no longer falls back to `widget.tag` — only explicit container tags are measured.
+
 ## 1.0.0
 
 * **Breaking:** `OriginDisplay` + `OriginScope` merged into `Stage`.

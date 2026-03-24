@@ -128,7 +128,6 @@ class _OriginState extends State<Origin> {
       final data = _setup();
       final gestureBuilder = _gestureFor(_activeStart!).builder;
       if (gestureBuilder != null) data.setGestureBuilder(gestureBuilder);
-      data.setItemGesturing(true);
       _startRect = data.rect.value;
     }
 
@@ -187,11 +186,11 @@ class _OriginState extends State<Origin> {
     final origin = _measureOrigin();
     final screen = OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context));
 
-    data.origin.value = origin;
-    data.displayContainer.value = widget.displayContainer ?? screen;
-    data.originContainer.value = widget.originContainer ?? data.measureEntry(widget.containerTag ?? widget.tag) ?? data.displayContainer.value;
-    data.display.value = widget.display ?? data.displayContainer.value;
-    data.aspectRatio.value = widget.aspectRatio ?? context.size!.aspectRatio;
+    data.setOrigin(origin);
+    data.setDisplayContainer(widget.displayContainer);
+    data.setOriginContainer(widget.originContainer ?? (widget.containerTag != null ? data.measureEntry(widget.containerTag!) : null));
+    data.setDisplay(widget.display ?? widget.displayContainer ?? screen);
+    data.setAspectRatio(widget.aspectRatio ?? context.size!.aspectRatio);
     data.setWidget(_OriginData(tag: widget.tag, child: KeyedSubtree(key: _childKey, child: widget.child)));
     if (widget.builder != null) data.setGestureBuilder(widget.builder);
     data.setPerspective(widget.perspective);
@@ -209,7 +208,7 @@ class _OriginState extends State<Origin> {
   Future<void> _send(Rect Function(Rect) send, {VoidCallback? onEnd}) {
     final data = _setup();
     if (onEnd != null) data.setOnEnd(onEnd);
-    data.origin.value = data.origin.value.copyWith(rect: send(data.origin.value.rect));
+    data.setOrigin(data.origin.copyWith(rect: send(data.origin.rect)));
     return data.dismiss();
   }
 
