@@ -1,3 +1,10 @@
+## 1.2.0
+
+* Container computed in `Stage` via `ValueNotifier<OriginRect?>`, expand-only during interaction, shrinks on dismiss.
+* `Stage.isDismissingOf(context)` aspect-based accessor.
+* `dismissing` field on `StageData`.
+* Dismiss drag anchors rect to pointer — content stays pinned under finger while scaling.
+
 ## 1.1.0
 
 * **Breaking:** `itemGesturing` / `setItemGesturing` replaced by `locked` / `setLocked`. Stage defaults to locked, unlocks after `animateToBase` completes, relocks on `reset`.

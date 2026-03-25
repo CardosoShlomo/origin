@@ -1,4 +1,3 @@
-import 'dart:ui';
 import 'package:flutter/widgets.dart';
 import 'origin_rect.dart';
 import 'stage.dart';
@@ -37,32 +36,17 @@ class StageOverlay extends StatelessWidget {
           ],
         );
 
-        final originC = data.originContainer;
-        if (originC != null) {
-          final screen = OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context));
-          final displayC = data.displayContainer ?? screen;
-          overlay = ValueListenableBuilder<double>(
-            valueListenable: data.originToBaseProgress,
-            builder: (context, p, child) {
-              final w = lerpDouble(originC.rect.width, displayC.rect.width, p)!;
-              final h = lerpDouble(originC.rect.height, displayC.rect.height, p)!;
-              final delta = rect.center - data.origin.rect.center;
-              final shifted = originC.rect.expandToInclude(originC.rect.shift(delta));
-              final containerRect = Rect.fromLTWH(
-                shifted.left.clamp(displayC.rect.left, displayC.rect.right - w),
-                shifted.top.clamp(displayC.rect.top, displayC.rect.bottom - h),
-                w,
-                h,
-              );
-              final containerBr = BorderRadius.lerp(originC.borderRadius, displayC.borderRadius, p)!;
-              return ClipPath(
-                clipper: _ContainerClipper(containerRect, containerBr),
-                child: child,
-              );
-            },
-            child: overlay,
-          );
-        }
+        overlay = ValueListenableBuilder<OriginRect?>(
+          valueListenable: data.container,
+          builder: (context, container, child) {
+            if (container == null) return child!;
+            return ClipPath(
+              clipper: _ContainerClipper(container.rect, container.borderRadius),
+              child: child,
+            );
+          },
+          child: overlay,
+        );
 
         return overlay;
       },
