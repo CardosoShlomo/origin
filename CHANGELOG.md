@@ -1,3 +1,7 @@
+## 1.2.1
+
+* Fix `sendEntry` using stale origin rect instead of measured position.
+
 ## 1.2.0
 
 * Container computed in `Stage` via `ValueNotifier<OriginRect?>`, expand-only during interaction, shrinks on dismiss.

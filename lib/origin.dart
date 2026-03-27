@@ -208,7 +208,8 @@ class _OriginState extends State<Origin> {
   Future<void> _send(Rect Function(Rect) send, {VoidCallback? onEnd}) {
     final data = _setup();
     if (onEnd != null) data.setOnEnd(onEnd);
-    data.setOrigin(data.origin.copyWith(rect: send(data.origin.rect)));
+    final origin = _measureOrigin();
+    data.setOrigin(origin.copyWith(rect: send(origin.rect)));
     return data.dismiss();
   }
 
