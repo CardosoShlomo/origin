@@ -1,3 +1,12 @@
+## 1.3.0
+
+* Swap support: `swapTags` and `onSwap` on `Origin` for drag-to-reorder between Origins.
+* `_SendLayer` animates displaced items to target and back.
+* `TagState` enum (`idle`, `sending`, `parked`, `returning`) tracks displacement state.
+* `Stage.stateOf(context, tag)` and `Stage.isActiveOf(context, tag)` accessors.
+* `displace`, `release`, `captureEntry` on `StageData`.
+* `isTagOf` now returns `true` for displaced tags (not just the active tag). Use `isActiveOf` for the previous behavior.
+
 ## 1.2.1
 
 * Fix `sendEntry` using stale origin rect instead of measured position.

@@ -29,6 +29,8 @@ class Origin extends StatefulWidget {
     this.perspective,
     this.backgroundColor,
     this.onEnd,
+    this.swapTags,
+    this.onSwap,
     this.builder,
     required this.child,
   });
@@ -46,6 +48,8 @@ class Origin extends StatefulWidget {
   final double? perspective;
   final Color? backgroundColor;
   final ValueSetter<StageData>? onEnd;
+  final Set<Object>? swapTags;
+  final ValueSetter<Object>? onSwap;
   final StageBuilder? builder;
   final Widget child;
 
@@ -57,7 +61,7 @@ class Origin extends StatefulWidget {
 
   static bool isActiveOf(BuildContext context) {
     final tag = context.dependOnInheritedWidgetOfExactType<_OriginData>()?.tag;
-    return tag != null && Stage.isTagOf(context, tag);
+    return tag != null && Stage.isActiveOf(context, tag);
   }
 
   static OriginRect? measureOf(BuildContext context) {
@@ -92,12 +96,15 @@ class _OriginState extends State<Origin> {
 
   @override
   void dispose() {
+    _stopSwapListening();
     _stage.unregister(widget.tag);
     super.dispose();
   }
 
   OriginEntry _buildEntry() {
-    final entry = OriginEntry()..measure = _measureOrigin;
+    final entry = OriginEntry()
+      ..measure = _measureOrigin
+      ..capture = _captureWidget;
     if (widget._isItem) {
       entry.open = _open;
       entry.send = _send;
@@ -107,6 +114,68 @@ class _OriginState extends State<Origin> {
 
   OriginRect _measureOrigin() {
     return OriginRect(rect: context.rect, borderRadius: widget.borderRadius);
+  }
+
+  Widget _captureWidget() {
+    return _OriginData(tag: widget.tag, child: widget.child);
+  }
+
+  // --- Swap logic ---
+
+  Object? _swapHover;
+  Object? _swapDisplaced;
+  bool _swapListening = false;
+
+  void _startSwapListening() {
+    if (_swapListening) return;
+    if (widget.swapTags?.isEmpty ?? true) return;
+    _stage.rect.addListener(_onSwapRect);
+    _swapListening = true;
+  }
+
+  void _stopSwapListening() {
+    if (!_swapListening) return;
+    _stage.rect.removeListener(_onSwapRect);
+    _swapListening = false;
+  }
+
+  void _onSwapRect() {
+    final center = _stage.rect.value.center;
+    Object? hover;
+    for (final tag in widget.swapTags!) {
+      if (tag == widget.tag) continue;
+      final rect = _stage.measureEntry(tag)?.rect;
+      if (rect != null && rect.contains(center)) {
+        hover = tag;
+        break;
+      }
+    }
+
+    if (hover != _swapHover) {
+      if (_swapDisplaced != null) {
+        _stage.dismiss(_swapDisplaced!);
+        _swapDisplaced = null;
+      }
+      if (hover != null) {
+        _stage.displace(hover, target: widget.tag);
+        _swapDisplaced = hover;
+      }
+      _swapHover = hover;
+    }
+
+    final measured = hover != null
+        ? _stage.measureEntry(hover)
+        : _measureOrigin();
+    if (measured != null) _stage.setOrigin(measured);
+  }
+
+  void _finishSwap() {
+    if (_swapDisplaced != null) {
+      _stage.release(_swapDisplaced!);
+      widget.onSwap?.call(_swapDisplaced!);
+      _swapDisplaced = null;
+    }
+    _swapHover = null;
   }
 
   // --- Item gesture logic ---
@@ -129,6 +198,7 @@ class _OriginState extends State<Origin> {
       final gestureBuilder = _gestureFor(_activeStart!).builder;
       if (gestureBuilder != null) data.setGestureBuilder(gestureBuilder);
       _startRect = data.rect.value;
+      _startSwapListening();
     }
 
     _stage.rect.value = details.rect(startRect: _startRect, currentRect: _stage.rect.value);
@@ -178,6 +248,7 @@ class _OriginState extends State<Origin> {
   void _onScaleEnd(ScaleEndDetails details) {
     _activeStart = null;
     _totalDelta = .zero;
+    _stopSwapListening();
     _stage.dismiss();
   }
 
@@ -195,7 +266,11 @@ class _OriginState extends State<Origin> {
     if (widget.builder != null) data.setGestureBuilder(widget.builder);
     data.setPerspective(widget.perspective);
     data.setBackgroundColor(widget.backgroundColor);
-    data.setOnEnd(widget.onEnd != null ? () => widget.onEnd!(data) : null);
+    final onEnd = widget.onEnd;
+    data.setOnEnd(widget.swapTags != null || onEnd != null ? () {
+      _finishSwap();
+      onEnd?.call(data);
+    } : null);
     data.setTag(widget.tag);
     data.setRect(origin.rect);
     return data;

@@ -8,9 +8,12 @@ import 'stage_overlay.dart';
 
 class OriginEntry {
   OriginRect Function()? measure;
+  Widget Function()? capture;
   Future<void> Function()? open;
   Future<void> Function(Rect Function(Rect), {VoidCallback? onEnd})? send;
 }
+
+enum TagState { idle, sending, parked, returning }
 
 class Rotation {
   const Rotation({this.x = 0, this.y = 0, this.z = 0, this.perspective});
@@ -46,9 +49,20 @@ class Stage extends StatefulWidget {
     return InheritedModel.inheritFrom<StageData>(context, aspect: _tagAspect)!.tag;
   }
 
-  static bool isTagOf(BuildContext context, Object tag) {
-    return InheritedModel.inheritFrom<StageData>(context, aspect: tag)?.tag == tag;
+  static TagState stateOf(BuildContext context, Object tag) {
+    return InheritedModel.inheritFrom<StageData>(context, aspect: (#state, tag))!.tagStates[tag] ?? .idle;
   }
+
+  static bool isTagOf(BuildContext context, Object tag) {
+    final data = InheritedModel.inheritFrom<StageData>(context, aspect: (#tag, tag))!;
+    return data.tag == tag || data.tagStates.containsKey(tag);
+  }
+
+  static bool isActiveOf(BuildContext context, Object tag) {
+    final data = InheritedModel.inheritFrom<StageData>(context, aspect: (#active, tag))!;
+    return data.tag == tag;
+  }
+
 
   static Widget? widgetOf(BuildContext context) {
     return InheritedModel.inheritFrom<StageData>(context, aspect: _widgetAspect)!.widget;
@@ -83,6 +97,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   Widget? _widget;
   final _originToBaseProgress = ValueNotifier(0.0);
   final _registry = <Object, OriginEntry>{};
+  final _tagStates = <Object, TagState>{};
   double? _perspective;
   Color? _backgroundColor;
   StageBuilder? _gestureBuilder;
@@ -163,6 +178,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   void _setWidget(Widget? v) => setState(() => _widget = v);
   void _setLocked(bool v) => setState(() => _locked = v);
   void _setDismissing(bool v) => setState(() => _dismissing = v);
+  void _setTagState(Object tag, TagState state) => setState(() => _tagStates[tag] = state);
+  void _clearTagState(Object tag) => setState(() => _tagStates.remove(tag));
 
   void _updateContainer() {
     if (_rect.value == .zero) {
@@ -242,7 +259,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     reset();
   }
 
-  Future<void> dismiss() async {
+  Future<void> dismiss([Object? tag]) async {
+    if (tag != null) {
+      _setTagState(tag, .returning);
+      return;
+    }
     _setDismissing(true);
     await animateRect(to: _origin.rect, curve: Curves.easeOut);
     _onEnd?.call();
@@ -329,12 +350,35 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     return _registry[tag]?.measure?.call();
   }
 
+  Widget? _captureEntry(Object tag) {
+    return _registry[tag]?.capture?.call();
+  }
+
   Future<void> _openEntry(Object tag) {
     return _registry[tag]?.open?.call() ?? Future.value();
   }
 
   Future<void> _sendEntry(Object tag, Rect Function(Rect) send, {VoidCallback? onEnd}) {
     return _registry[tag]?.send?.call(send, onEnd: onEnd) ?? Future.value();
+  }
+
+  // --- Sends ---
+
+  final _sends = <Object, ({Object target, bool park, Key key})>{};
+
+  void _displace(Object tag, {required Object target, bool park = true}) {
+    _sends[tag] = (target: target, park: park, key: UniqueKey());
+    _setTagState(tag, .sending);
+  }
+
+  void _release(Object tag) {
+    _sends.remove(tag);
+    _clearTagState(tag);
+  }
+
+  void _removeSend(Object tag) {
+    _sends.remove(tag);
+    _clearTagState(tag);
   }
 
   @override
@@ -370,6 +414,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       tag: _tag,
       locked: _locked,
       dismissing: _dismissing,
+      tagStates: {..._tagStates},
       container: _container,
       setOrigin: _setOrigin,
       setOriginContainer: _setOriginContainer,
@@ -387,10 +432,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       reset: reset,
       animateToBase: animateToBase,
       dismiss: dismiss,
+      displace: _displace,
+      release: _release,
       runEffect: runEffect,
       register: _register,
       unregister: _unregister,
       measureEntry: _measureEntry,
+      captureEntry: _captureEntry,
       openEntry: _openEntry,
       sendEntry: _sendEntry,
       child: Stack(
@@ -398,6 +446,15 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         children: [
           widget.child,
           const _AbsorbLayer(),
+          for (final MapEntry(key: tag, value: info) in _sends.entries)
+            _SendLayer(
+              key: info.key,
+              tag: tag,
+              target: info.target,
+              returning: _tagStates[tag] == .returning,
+              onArrived: info.park ? () => _setTagState(tag, .parked) : () => _removeSend(tag),
+              onDone: () => _removeSend(tag),
+            ),
           const StageOverlay(),
           Builder(builder: (context) {
             final active = Stage.hasWidgetOf(context) && !_locked;
@@ -441,6 +498,7 @@ class StageData extends InheritedModel<Object> {
     required this.tag,
     required this.locked,
     required this.dismissing,
+    required this.tagStates,
     required this.container,
     required this.setOrigin,
     required this.setOriginContainer,
@@ -458,10 +516,13 @@ class StageData extends InheritedModel<Object> {
     required this.reset,
     required this.animateToBase,
     required this.dismiss,
+    required this.displace,
+    required this.release,
     required this.runEffect,
     required this.register,
     required this.unregister,
     required this.measureEntry,
+    required this.captureEntry,
     required this.openEntry,
     required this.sendEntry,
     required super.child,
@@ -485,6 +546,7 @@ class StageData extends InheritedModel<Object> {
   final Object? tag;
   final bool locked;
   final bool dismissing;
+  final Map<Object, TagState> tagStates;
   final ValueNotifier<OriginRect?> container;
 
   final ValueSetter<Widget?> setWidget;
@@ -503,7 +565,9 @@ class StageData extends InheritedModel<Object> {
   final AnimateRect animateRect;
   final VoidCallback reset;
   final Future<void> Function() animateToBase;
-  final Future<void> Function() dismiss;
+  final Future<void> Function([Object? tag]) dismiss;
+  final void Function(Object tag, {required Object target, bool park}) displace;
+  final void Function(Object tag) release;
   final Future<void> Function({
     double? rotateX,
     double? rotateY,
@@ -516,6 +580,7 @@ class StageData extends InheritedModel<Object> {
   final void Function(Object tag, OriginEntry entry) register;
   final void Function(Object tag) unregister;
   final OriginRect? Function(Object tag) measureEntry;
+  final Widget? Function(Object tag) captureEntry;
   final Future<void> Function(Object tag) openEntry;
   final Future<void> Function(Object tag, Rect Function(Rect), {VoidCallback? onEnd}) sendEntry;
 
@@ -535,8 +600,14 @@ class StageData extends InheritedModel<Object> {
           if ((widget != null) != (oldWidget.widget != null)) return true;
         case _dismissingAspect:
           if (dismissing != oldWidget.dismissing) return true;
-        default:
-          if ((tag == dep) != (oldWidget.tag == dep)) return true;
+        case (#tag, final Object t):
+          final was = oldWidget.tag == t || oldWidget.tagStates.containsKey(t);
+          final now = tag == t || tagStates.containsKey(t);
+          if (was != now) return true;
+        case (#active, final Object t):
+          if ((tag == t) != (oldWidget.tag == t)) return true;
+        case (#state, final Object t):
+          if (tagStates[t] != oldWidget.tagStates[t]) return true;
       }
     }
     return false;
@@ -551,6 +622,121 @@ class _AbsorbLayer extends StatelessWidget {
     return IgnorePointer(
       ignoring: !Stage.hasWidgetOf(context),
       child: const AbsorbPointer(),
+    );
+  }
+}
+
+class _SendLayer extends StatefulWidget {
+  const _SendLayer({
+    super.key,
+    required this.tag,
+    required this.target,
+    required this.returning,
+    required this.onArrived,
+    required this.onDone,
+  });
+
+  final Object tag;
+  final Object target;
+  final bool returning;
+  final VoidCallback onArrived;
+  final VoidCallback onDone;
+
+  @override
+  State<_SendLayer> createState() => _SendLayerState();
+}
+
+class _SendLayerState extends State<_SendLayer> with SingleTickerProviderStateMixin {
+  late final StageData _data;
+  late final Widget _child;
+  late final Rect _homeRect;
+  late final BorderRadius _borderRadius;
+  late final AnimationController _controller;
+  late final ValueNotifier<Rect> _rect;
+  final _cxTween = Tween<double>(begin: 0, end: 0);
+  final _cyTween = Tween<double>(begin: 0, end: 0);
+  final _wTween = Tween<double>(begin: 0, end: 0);
+
+  double get _aspectRatio => _homeRect.width / _homeRect.height;
+
+  @override
+  void initState() {
+    super.initState();
+    _data = context.getInheritedWidgetOfExactType<StageData>()!;
+    _child = _data.captureEntry(widget.tag)!;
+    final origin = _data.measureEntry(widget.tag)!;
+    _homeRect = origin.rect;
+    _borderRadius = origin.borderRadius;
+    _rect = ValueNotifier(_homeRect);
+    _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 300))
+      ..addListener(_updateRect);
+    _sendToTarget();
+  }
+
+  @override
+  void didUpdateWidget(_SendLayer old) {
+    super.didUpdateWidget(old);
+    if (widget.returning && !old.returning) _animateHome();
+  }
+
+  Future<void> _sendToTarget() async {
+    final targetRect = _data.measureEntry(widget.target)!.rect;
+    await _animateTo(targetRect);
+    if (!mounted) return;
+    widget.onArrived();
+  }
+
+  Future<void> _animateHome() async {
+    final homeRect = _data.measureEntry(widget.tag)?.rect ?? _homeRect;
+    await _animateTo(homeRect);
+    if (!mounted) return;
+    widget.onDone();
+  }
+
+  Future<void> _animateTo(Rect to) {
+    _cxTween
+      ..begin = _rect.value.center.dx
+      ..end = to.center.dx;
+    _cyTween
+      ..begin = _rect.value.center.dy
+      ..end = to.center.dy;
+    _wTween
+      ..begin = _rect.value.width
+      ..end = to.width;
+    _controller.reset();
+    return _controller.animateTo(1, curve: Curves.easeOut);
+  }
+
+  void _updateRect() {
+    final cx = _cxTween.evaluate(_controller);
+    final cy = _cyTween.evaluate(_controller);
+    final w = _wTween.evaluate(_controller);
+    _rect.value = Rect.fromCenter(center: Offset(cx, cy), width: w, height: w / _aspectRatio);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _rect.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<Rect>(
+      valueListenable: _rect,
+      builder: (context, rect, child) {
+        return Stack(
+          fit: .expand,
+          children: [
+            Positioned.fromRect(
+              rect: rect,
+              child: ClipRRect(borderRadius: _borderRadius, child: child),
+            ),
+          ],
+        );
+      },
+      child: _child,
     );
   }
 }
