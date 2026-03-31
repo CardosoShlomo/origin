@@ -261,7 +261,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
   Future<void> dismiss([Object? tag]) async {
     if (tag != null) {
-      _setTagState(tag, .returning);
+      if (_sends.containsKey(tag)) _setTagState(tag, .returning);
       return;
     }
     _setDismissing(true);

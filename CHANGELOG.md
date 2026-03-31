@@ -1,3 +1,7 @@
+## 1.3.1
+
+* Guard `dismiss(tag)` to prevent stale tag states when tag has no active send.
+
 ## 1.3.0
 
 * Swap support: `swapTags` and `onSwap` on `Origin` for drag-to-reorder between Origins.
