@@ -1,10 +1,11 @@
+import 'dart:async';
+
 export 'origin_rect.dart';
 export 'stage.dart';
 export 'stage_overlay.dart';
 export 'gestures.dart';
 export 'recognizer.dart';
 export 'ext.dart';
-
 import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'ext.dart';
@@ -47,7 +48,7 @@ class Origin extends StatefulWidget {
   final double? aspectRatio;
   final double? perspective;
   final Color? backgroundColor;
-  final ValueSetter<StageData>? onEnd;
+  final FutureOr<void> Function(StageData)? onEnd;
   final Set<Object>? swapTags;
   final ValueSetter<Object>? onSwap;
   final StageBuilder? builder;
@@ -267,9 +268,9 @@ class _OriginState extends State<Origin> {
     data.setPerspective(widget.perspective);
     data.setBackgroundColor(widget.backgroundColor);
     final onEnd = widget.onEnd;
-    data.setOnEnd(widget.swapTags != null || onEnd != null ? () {
+    data.setOnEnd(widget.swapTags != null || onEnd != null ? () async {
       _finishSwap();
-      onEnd?.call(data);
+      await onEnd?.call(data);
     } : null);
     data.setTag(widget.tag);
     data.setRect(origin.rect);

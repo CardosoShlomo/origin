@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui';
 import 'package:flutter/widgets.dart';
 import 'ext.dart';
@@ -101,7 +102,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   double? _perspective;
   Color? _backgroundColor;
   StageBuilder? _gestureBuilder;
-  VoidCallback? _onEnd;
+  FutureOr<void> Function()? _onEnd;
   Object? _tag;
   bool _locked = true;
   bool _dismissing = false;
@@ -173,7 +174,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   void _setPerspective(double? v) => _perspective = v;
   void _setBackgroundColor(Color? v) => _backgroundColor = v;
   void _setGestureBuilder(StageBuilder? v) => setState(() => _gestureBuilder = v);
-  void _setOnEnd(VoidCallback? v) => _onEnd = v;
+  void _setOnEnd(FutureOr<void> Function()? v) => _onEnd = v;
   void _setTag(Object? tag) => setState(() => _tag = tag);
   void _setWidget(Widget? v) => setState(() => _widget = v);
   void _setLocked(bool v) => setState(() => _locked = v);
@@ -264,9 +265,12 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       if (_sends.containsKey(tag)) _setTagState(tag, .returning);
       return;
     }
+    for (final tag in _sends.keys) {
+      _setTagState(tag, .returning);
+    }
     _setDismissing(true);
     await animateRect(to: _origin.rect, curve: Curves.easeOut);
-    _onEnd?.call();
+    await _onEnd?.call();
     reset();
   }
 
@@ -542,7 +546,7 @@ class StageData extends InheritedModel<Object> {
   final double? perspective;
   final Color? backgroundColor;
   final StageBuilder? gestureBuilder;
-  final VoidCallback? onEnd;
+  final FutureOr<void> Function()? onEnd;
   final Object? tag;
   final bool locked;
   final bool dismissing;
@@ -558,7 +562,7 @@ class StageData extends InheritedModel<Object> {
   final ValueSetter<double?> setPerspective;
   final ValueSetter<Color?> setBackgroundColor;
   final ValueSetter<StageBuilder?> setGestureBuilder;
-  final ValueSetter<VoidCallback?> setOnEnd;
+  final ValueSetter<FutureOr<void> Function()?> setOnEnd;
   final ValueSetter<Object?> setTag;
   final ValueSetter<bool> setLocked;
   final ValueSetter<Rect> setRect;

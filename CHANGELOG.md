@@ -1,3 +1,8 @@
+## 1.4.0
+
+* `onEnd` accepts `FutureOr<void>` and is awaited before `reset()`.
+* `dismiss()` returns all active sends to `.returning` state.
+
 ## 1.3.1
 
 * Guard `dismiss(tag)` to prevent stale tag states when tag has no active send.
