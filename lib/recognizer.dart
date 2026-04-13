@@ -30,6 +30,10 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
     }
     trackedPointers.add(event.pointer);
     super.addAllowedPointer(event);
+    if (trackedPointers.length > 1 && !_hasMultiPointerGestures) {
+      _resolved = true;
+      resolve(.rejected);
+    }
   }
 
   bool _resolved = false;

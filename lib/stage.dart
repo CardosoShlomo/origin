@@ -260,12 +260,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     reset();
   }
 
-  Future<void> dismiss([Object? tag]) async {
+  Future<void> dismiss({Object? tag, Object? except}) async {
     if (tag != null) {
       if (_sends.containsKey(tag)) _setTagState(tag, .returning);
       return;
     }
     for (final tag in _sends.keys) {
+      if (tag == except) continue;
       _setTagState(tag, .returning);
     }
     _setDismissing(true);
@@ -339,15 +340,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   // --- Registry ---
 
   void _register(Object tag, OriginEntry entry) {
-    assert(
-      !_registry.containsKey(tag),
-      'Duplicate Origin tag "$tag". Each tag must be unique.',
-    );
     _registry[tag] = entry;
   }
 
-  void _unregister(Object tag) {
-    _registry.remove(tag);
+  void _unregister(Object tag, OriginEntry entry) {
+    if (_registry[tag] == entry) {
+      _registry.remove(tag);
+    }
   }
 
   OriginRect? _measureEntry(Object tag) {
@@ -371,6 +370,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   final _sends = <Object, ({Object target, bool park, Key key})>{};
 
   void _displace(Object tag, {required Object target, bool park = true}) {
+    for (final t in _sends.keys) {
+      if (t == tag) continue;
+      final state = _tagStates[t];
+      if (state == .sending || state == .parked) {
+        _setTagState(t, .returning);
+      }
+    }
     _sends[tag] = (target: target, park: park, key: UniqueKey());
     _setTagState(tag, .sending);
   }
@@ -569,7 +575,7 @@ class StageData extends InheritedModel<Object> {
   final AnimateRect animateRect;
   final VoidCallback reset;
   final Future<void> Function() animateToBase;
-  final Future<void> Function([Object? tag]) dismiss;
+  final Future<void> Function({Object? tag, Object? except}) dismiss;
   final void Function(Object tag, {required Object target, bool park}) displace;
   final void Function(Object tag) release;
   final Future<void> Function({
@@ -582,7 +588,7 @@ class StageData extends InheritedModel<Object> {
   }) runEffect;
 
   final void Function(Object tag, OriginEntry entry) register;
-  final void Function(Object tag) unregister;
+  final void Function(Object tag, OriginEntry entry) unregister;
   final OriginRect? Function(Object tag) measureEntry;
   final Widget? Function(Object tag) captureEntry;
   final Future<void> Function(Object tag) openEntry;

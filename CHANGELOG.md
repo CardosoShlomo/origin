@@ -1,3 +1,11 @@
+## 1.5.0
+
+* **Breaking:** `dismiss` signature changed from `dismiss([Object? tag])` to `dismiss({Object? tag, Object? except})`. `except` skips the given tag from the return-all loop (for preserving swap targets).
+* **Breaking:** `unregister` now requires the `OriginEntry` instance. Identity-aware unregister only removes the tag from the registry if the stored entry matches, preventing transient duplicates during keyed-children reorders.
+* `register` no longer asserts on duplicate tags — transient duplicates are tolerated and later resolved via identity-aware unregister.
+* `_displace` now returns other parked/sending items to home on hover change, cleaning up stale displacements proactively.
+* `StageScaleRecognizer` rejects the arena when a second pointer joins a single-pointer-only recognizer — releases pointers so nested Origins with multi-pointer gestures can claim them.
+
 ## 1.4.0
 
 * `onEnd` accepts `FutureOr<void>` and is awaited before `reset()`.

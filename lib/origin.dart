@@ -77,28 +77,31 @@ class Origin extends StatefulWidget {
 
 class _OriginState extends State<Origin> {
   late final StageData _stage;
+  late OriginEntry _entry;
   final _childKey = GlobalKey();
 
   @override
   void initState() {
     super.initState();
     _stage = context.getInheritedWidgetOfExactType<StageData>()!;
-    _stage.register(widget.tag, _buildEntry());
+    _entry = _buildEntry();
+    _stage.register(widget.tag, _entry);
   }
 
   @override
   void didUpdateWidget(Origin oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.tag != widget.tag) {
-      _stage.unregister(oldWidget.tag);
-      _stage.register(widget.tag, _buildEntry());
+      _stage.unregister(oldWidget.tag, _entry);
+      _entry = _buildEntry();
+      _stage.register(widget.tag, _entry);
     }
   }
 
   @override
   void dispose() {
     _stopSwapListening();
-    _stage.unregister(widget.tag);
+    _stage.unregister(widget.tag, _entry);
     super.dispose();
   }
 
@@ -154,7 +157,7 @@ class _OriginState extends State<Origin> {
 
     if (hover != _swapHover) {
       if (_swapDisplaced != null) {
-        _stage.dismiss(_swapDisplaced!);
+        _stage.dismiss(tag: _swapDisplaced!);
         _swapDisplaced = null;
       }
       if (hover != null) {
@@ -250,7 +253,7 @@ class _OriginState extends State<Origin> {
     _activeStart = null;
     _totalDelta = .zero;
     _stopSwapListening();
-    _stage.dismiss();
+    _stage.dismiss(except: _swapDisplaced);
   }
 
   StageData _setup() {
