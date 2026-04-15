@@ -1,3 +1,7 @@
+## 1.5.1
+
+* Only reject multi-pointer when the recognizer has explicit gestures. Keeps pinch working on Stage's root recognizer.
+
 ## 1.5.0
 
 * **Breaking:** `dismiss` signature changed from `dismiss([Object? tag])` to `dismiss({Object? tag, Object? except})`. `except` skips the given tag from the return-all loop (for preserving swap targets).
