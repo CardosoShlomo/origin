@@ -97,6 +97,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   double _aspectRatio = 1.0;
   Widget? _widget;
   final _originToBaseProgress = ValueNotifier(0.0);
+  Offset? _lastRectCenter;
+  Rect? _dismissStartContainer;
   final _registry = <Object, OriginEntry>{};
   final _tagStates = <Object, TagState>{};
   double? _perspective;
@@ -178,13 +180,21 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   void _setTag(Object? tag) => setState(() => _tag = tag);
   void _setWidget(Widget? v) => setState(() => _widget = v);
   void _setLocked(bool v) => setState(() => _locked = v);
-  void _setDismissing(bool v) => setState(() => _dismissing = v);
+  void _setDismissing(bool v) {
+    if (v && !_dismissing) {
+      _dismissStartContainer = _container.value?.rect;
+    } else if (!v) {
+      _dismissStartContainer = null;
+    }
+    setState(() => _dismissing = v);
+  }
   void _setTagState(Object tag, TagState state) => setState(() => _tagStates[tag] = state);
   void _clearTagState(Object tag) => setState(() => _tagStates.remove(tag));
 
   void _updateContainer() {
     if (_rect.value == .zero) {
       _container.value = null;
+      _lastRectCenter = null;
       return;
     }
     final originC = _originContainer;
@@ -196,24 +206,51 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     final p = _originToBaseProgress.value;
     final rect = _rect.value;
-    final w = lerpDouble(originC.rect.width, displayC.rect.width, p)!;
-    final h = lerpDouble(originC.rect.height, displayC.rect.height, p)!;
-    final delta = rect.center - _origin.rect.center;
-    final shifted = originC.rect.expandToInclude(originC.rect.shift(delta));
-    final computed = Rect.fromLTWH(
-      shifted.left.clamp(displayC.rect.left, displayC.rect.right - w),
-      shifted.top.clamp(displayC.rect.top, displayC.rect.bottom - h),
-      w,
-      h,
+    final prev = _container.value?.rect ?? originC.rect;
+
+    // Per-frame delta: each incremental movement extends the container in that direction.
+    final lastCenter = _lastRectCenter ?? _origin.rect.center;
+    _lastRectCenter = rect.center;
+    final d = rect.center - lastCenter;
+    final grown = Rect.fromLTRB(
+      prev.left + (d.dx < 0 ? d.dx : 0),
+      prev.top + (d.dy < 0 ? d.dy : 0),
+      prev.right + (d.dx > 0 ? d.dx : 0),
+      prev.bottom + (d.dy > 0 ? d.dy : 0),
+    );
+
+    // Also include origin shifted by total delta — covers scale cases where the active item
+    // extends beyond the grown rect even though frame-to-frame delta is small.
+    final totalDelta = rect.center - _origin.rect.center;
+    final shifted = originC.rect.expandToInclude(originC.rect.shift(totalDelta));
+
+    // On dismiss, animate from the captured start container back to the origin container using
+    // the same controller as the rect dismiss, so container and item converge together.
+    final Rect baseline;
+    if (_dismissing && _dismissStartContainer != null) {
+      baseline = Rect.lerp(_dismissStartContainer!, originC.rect, _width.value)!;
+    } else {
+      baseline = grown.expandToInclude(shifted);
+    }
+
+    // Clamp within display container.
+    final clamped = Rect.fromLTRB(
+      baseline.left.clamp(displayC.rect.left, displayC.rect.right),
+      baseline.top.clamp(displayC.rect.top, displayC.rect.bottom),
+      baseline.right.clamp(displayC.rect.left, displayC.rect.right),
+      baseline.bottom.clamp(displayC.rect.top, displayC.rect.bottom),
+    );
+
+    // Lerp edges toward display as progress grows.
+    final computed = Rect.fromLTRB(
+      lerpDouble(clamped.left, displayC.rect.left, p)!,
+      lerpDouble(clamped.top, displayC.rect.top, p)!,
+      lerpDouble(clamped.right, displayC.rect.right, p)!,
+      lerpDouble(clamped.bottom, displayC.rect.bottom, p)!,
     );
     final containerBr = BorderRadius.lerp(originC.borderRadius, displayC.borderRadius, p)!;
 
-    final prev = _container.value;
-    final expandedRect = (prev != null && !_dismissing)
-        ? prev.rect.expandToInclude(computed)
-        : computed;
-
-    _container.value = OriginRect(rect: expandedRect, borderRadius: containerBr);
+    _container.value = OriginRect(rect: computed, borderRadius: containerBr);
   }
 
   void reset() {
@@ -221,6 +258,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _startRect = .zero;
     _startFocalPoint = .zero;
     _container.value = null;
+    _lastRectCenter = null;
     _setWidget(null);
     _rotation.value = null;
     _setPerspective(null);
@@ -733,7 +771,7 @@ class _SendLayerState extends State<_SendLayer> with SingleTickerProviderStateMi
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<Rect>(
+    Widget child = ValueListenableBuilder<Rect>(
       valueListenable: _rect,
       builder: (context, rect, child) {
         return Stack(
@@ -748,5 +786,26 @@ class _SendLayerState extends State<_SendLayer> with SingleTickerProviderStateMi
       },
       child: _child,
     );
+    final container = _data.originContainer ?? _data.displayContainer;
+    if (container != null) {
+      child = ClipPath(
+        clipper: _ContainerClipper(container.rect, container.borderRadius),
+        child: child,
+      );
+    }
+    return child;
   }
+}
+
+class _ContainerClipper extends CustomClipper<Path> {
+  _ContainerClipper(this.rect, this.borderRadius);
+
+  final Rect rect;
+  final BorderRadius borderRadius;
+
+  @override
+  Path getClip(Size size) => Path()..addRRect(borderRadius.toRRect(rect));
+
+  @override
+  bool shouldReclip(_ContainerClipper old) => old.rect != rect || old.borderRadius != borderRadius;
 }

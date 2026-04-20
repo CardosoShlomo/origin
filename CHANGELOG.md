@@ -1,3 +1,8 @@
+## 1.5.2
+
+* Send overlays now clip against the origin container, matching the main overlay's clipping during reorder.
+* Container expansion tracks per-frame drag deltas (monotonic — only grows during drag). Animated shrink back to origin container on dismiss, synced with the rect animation.
+
 ## 1.5.1
 
 * Only reject multi-pointer when the recognizer has explicit gestures. Keeps pinch working on Stage's root recognizer.
