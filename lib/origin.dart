@@ -1,16 +1,23 @@
 import 'dart:async';
 
+export 'corner.dart';
+export 'physics.dart';
+export 'rect_ext.dart';
+export 'ext.dart';
+export 'gestures.dart';
 export 'origin_rect.dart';
+export 'ratio.dart';
+export 'recognizer.dart';
+export 'resolution.dart';
+export 'side.dart';
 export 'stage.dart';
 export 'stage_overlay.dart';
-export 'gestures.dart';
-export 'recognizer.dart';
-export 'ext.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'ext.dart';
 import 'gestures.dart';
 import 'origin_rect.dart';
+import 'physics.dart';
 import 'recognizer.dart';
 import 'stage.dart';
 
@@ -19,15 +26,16 @@ class Origin extends StatefulWidget {
     super.key,
     required this.tag,
     this.onTap,
-    this.borderRadius = BorderRadius.zero,
+    this.borderRadius = .zero,
     this.containerTag,
     this.originContainer,
     this.display,
     this.displayContainer,
-    this.gestures = const [],
-    this.constraints = const GestureConstraints(),
+    this.drag,
+    this.scale,
+    this.constraints,
+    this.displayConfig,
     this.aspectRatio,
-    this.perspective,
     this.backgroundColor,
     this.onEnd,
     this.swapTags,
@@ -43,10 +51,11 @@ class Origin extends StatefulWidget {
   final OriginRect? originContainer;
   final OriginRect? display;
   final OriginRect? displayContainer;
-  final List<Gesture> gestures;
-  final GestureConstraints constraints;
+  final Map<DragStart, DragGesture>? drag;
+  final Map<ScaleStart, ScaleGesture>? scale;
+  final GestureConstraints? constraints;
+  final DisplayConfig? displayConfig;
   final double? aspectRatio;
-  final double? perspective;
   final Color? backgroundColor;
   final FutureOr<void> Function(StageData)? onEnd;
   final Set<Object>? swapTags;
@@ -54,7 +63,10 @@ class Origin extends StatefulWidget {
   final StageBuilder? builder;
   final Widget child;
 
-  bool get _isItem => onTap != null || gestures.isNotEmpty;
+  bool get _isItem =>
+      onTap != null ||
+      (drag?.isNotEmpty ?? false) ||
+      (scale?.isNotEmpty ?? false);
 
   static Object? tagOf(BuildContext context) {
     return context.dependOnInheritedWidgetOfExactType<_OriginData>()?.tag;
@@ -184,7 +196,8 @@ class _OriginState extends State<Origin> {
 
   // --- Item gesture logic ---
 
-  GestureStart? _activeStart;
+  /// Single active-gesture slot. Null = uncommitted.
+  ActiveGesture? _active;
   Rect _startRect = .zero;
   Offset _totalDelta = .zero;
 
@@ -195,64 +208,179 @@ class _OriginState extends State<Origin> {
   void _onScaleUpdate(ScaleUpdateDetails details) {
     _totalDelta += details.focalPointDelta;
 
-    if (_activeStart == null) {
-      _activeStart = _resolveStart(details);
-      if (_activeStart == null) return;
-      final data = _setup();
-      final gestureBuilder = _gestureFor(_activeStart!).builder;
-      if (gestureBuilder != null) data.setGestureBuilder(gestureBuilder);
-      _startRect = data.rect.value;
-      _startSwapListening();
-    }
+    switch (_active?.gesture) {
+      case null: {
+        // Resolver: try to commit a gesture based on pointer count.
+        ActiveGesture? active;
+        if (details.pointerCount > 1 && widget.scale != null) {
+          active = _resolveScaleArena(details);
+        } else if (details.pointerCount == 1 && widget.drag != null) {
+          active = _resolveDragArena();
+        }
+        if (active == null) return; // not committed yet
+        _active = active;
 
-    _stage.rect.value = details.rect(startRect: _startRect, currentRect: _stage.rect.value);
+        final data = _setup();
+        final builder = active.gesture.builder;
+        if (builder != null) data.setGestureBuilder(builder);
+        _startRect = data.rect.value;
+        _startSwapListening();
+        return;
+      }
+
+      case DragGesture drag: {
+        final delta = details.focalPointDelta;
+        final currentRect = _stage.rect.value;
+        final originRect = _stage.origin.rect;
+        final displayRect = _stage.display.rect;
+        final dx = _frictionScaledX(
+          delta: delta.dx, bounds: drag.bounds,
+          currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+        );
+        final dy = _frictionScaledY(
+          delta: delta.dy, bounds: drag.bounds,
+          currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+        );
+        _stage.rect.value = currentRect.translate(dx, dy);
+      }
+
+      case ScaleGesture scale: {
+        // Scale to dimensions from _startRect; directional friction on focalPointDelta;
+        // combine with scale-around-focalPoint transformation.
+        // TODO: scale-axis friction at shrink/expand bounds (minScale/maxScale).
+        final delta = details.focalPointDelta;
+        final currentRect = _stage.rect.value;
+        final originRect = _stage.origin.rect;
+        final displayRect = _stage.display.rect;
+        final dx = _frictionScaledX(
+          delta: delta.dx, bounds: scale.bounds,
+          currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+        );
+        final dy = _frictionScaledY(
+          delta: delta.dy, bounds: scale.bounds,
+          currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+        );
+
+        final newWidth = _startRect.width * details.scale;
+        final newHeight = _startRect.height * details.scale;
+        if (currentRect.width == 0) return;
+        final center = (currentRect.center - details.focalPoint) * newWidth / currentRect.width
+            + details.focalPoint
+            + Offset(dx, dy);
+        _stage.rect.value = Rect.fromCenter(center: center, width: newWidth, height: newHeight);
+      }
+    }
   }
 
-  bool _hasStart(GestureStart s) => widget.gestures.any((g) => g.start.contains(s));
+  // Per-axis convenience wrappers used by call sites.
+  // Compose the state computer + resolution helper from physics.dart.
 
-  Gesture _gestureFor(GestureStart s) => widget.gestures.firstWhere((g) => g.start.contains(s));
+  double _frictionScaledX({
+    required double delta,
+    required Map<DragBound, DragBounds> bounds,
+    required Rect currentRect,
+    required Rect originRect,
+    required Rect displayRect,
+  }) =>
+      frictionFromState(
+        state: axisStateX(delta, currentRect, originRect, displayRect),
+        bounds: bounds,
+        delta: delta,
+      );
 
-  GestureStart? _resolveStart(ScaleUpdateDetails details) {
-    final dx = _totalDelta.dx;
-    final dy = _totalDelta.dy;
-    final two = details.pointerCount > 1;
+  double _frictionScaledY({
+    required double delta,
+    required Map<DragBound, DragBounds> bounds,
+    required Rect currentRect,
+    required Rect originRect,
+    required Rect displayRect,
+  }) =>
+      frictionFromState(
+        state: axisStateY(delta, currentRect, originRect, displayRect),
+        bounds: bounds,
+        delta: delta,
+      );
 
-    GestureStart? h;
-    GestureStart? v;
+  AxisFling? _flingX({
+    required double velocity,
+    required Map<DragBound, DragBounds> bounds,
+    required Rect currentRect,
+    required Rect originRect,
+    required Rect displayRect,
+  }) =>
+      flingFromState(
+        state: axisStateX(velocity, currentRect, originRect, displayRect),
+        bounds: bounds,
+        startPos: currentRect.center.dx,
+        velocity: velocity,
+      );
 
-    if (two) {
-      if (details.scale > 1.01 && _hasStart(.pinchOut)) return .pinchOut;
-      if (details.scale < 0.99 && _hasStart(.pinchIn)) return .pinchIn;
-      if (dx > 10) h = .twoRight;
-      if (dx < -10) h = .twoLeft;
-      if (dy > 10) v = .twoDown;
-      if (dy < -10) v = .twoUp;
-    } else {
-      if (dx > 10) h = .right;
-      if (dx < -10) h = .left;
-      if (dy > 10) v = .down;
-      if (dy < -10) v = .up;
-    }
+  AxisFling? _flingY({
+    required double velocity,
+    required Map<DragBound, DragBounds> bounds,
+    required Rect currentRect,
+    required Rect originRect,
+    required Rect displayRect,
+  }) =>
+      flingFromState(
+        state: axisStateY(velocity, currentRect, originRect, displayRect),
+        bounds: bounds,
+        startPos: currentRect.center.dy,
+        velocity: velocity,
+      );
 
-    if (h != null && !_hasStart(h)) h = null;
-    if (v != null && !_hasStart(v)) v = null;
-
-    if (h == null) return v;
-    if (v == null) return h;
-
-    final hCoverV = _gestureFor(h).bounds.any((b) => b.bound.contains(v!.bound));
-    final vCoverH = _gestureFor(v).bounds.any((b) => b.bound.contains(h!.bound));
-
-    if (hCoverV && !vCoverH) return h;
-    if (vCoverH && !hCoverV) return v;
-
-    return dx.abs() >= dy.abs() ? h : v;
+  /// Resolves the active scale gesture from [Origin.scale] (no cascade —
+  /// Origin handles idle-state gestures only).
+  ActiveGesture? _resolveScaleArena(ScaleUpdateDetails details) {
+    final map = widget.scale;
+    if (map == null) return null;
+    return resolveScaleArena(scale: details.scale, registered: map);
   }
 
-  void _onScaleEnd(ScaleEndDetails details) {
-    _activeStart = null;
+  /// Resolves the active drag gesture from [Origin.drag].
+  ActiveGesture? _resolveDragArena() {
+    final map = widget.drag;
+    if (map == null) return null;
+    return resolveDragArena(totalDelta: _totalDelta, registered: map);
+  }
+
+  Future<void> _onScaleEnd(ScaleEndDetails details) async {
+    final active = _active;
+    if (active == null) return;
+
+    // Compute fling plans per axis (pure — no animation started).
+    // TODO: scale-axis fling (width/height decelerate via shrink/expand).
+    final g = active.gesture;
+    final velocity = details.velocity.pixelsPerSecond;
+    final currentRect = _stage.rect.value;
+    final originRect = _stage.origin.rect;
+    final displayRect = _stage.display.rect;
+    final flingX = _flingX(
+      velocity: velocity.dx, bounds: g.bounds,
+      currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+    );
+    final flingY = _flingY(
+      velocity: velocity.dy, bounds: g.bounds,
+      currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+    );
+
+    _active = null;
     _totalDelta = .zero;
     _stopSwapListening();
+
+    if (g.onRelease != null) {
+      g.onRelease!(context, flingX, flingY);
+      return;
+    }
+
+    // Default: run flings, await completion, then dismiss.
+    await Future.wait([
+      if (flingX != null)
+        _stage.animateCenterX(to: flingX.to, duration: flingX.duration, curve: flingX.curve),
+      if (flingY != null)
+        _stage.animateCenterY(to: flingY.to, duration: flingY.duration, curve: flingY.curve),
+    ]);
+    if (!mounted) return;
     _stage.dismiss(except: _swapDisplaced);
   }
 
@@ -268,7 +396,8 @@ class _OriginState extends State<Origin> {
     data.setAspectRatio(widget.aspectRatio ?? context.size!.aspectRatio);
     data.setWidget(_OriginData(tag: widget.tag, child: KeyedSubtree(key: _childKey, child: widget.child)));
     if (widget.builder != null) data.setGestureBuilder(widget.builder);
-    data.setPerspective(widget.perspective);
+    data.setDisplayConfig(widget.displayConfig);
+    data.setPerspective(widget.constraints?.perspective);
     data.setBackgroundColor(widget.backgroundColor);
     final onEnd = widget.onEnd;
     data.setOnEnd(widget.swapTags != null || onEnd != null ? () async {
@@ -323,7 +452,8 @@ class _OriginState extends State<Origin> {
       return _OriginData(tag: widget.tag, child: widget.child);
     }
 
-    final hasGestures = widget.gestures.isNotEmpty;
+    final hasGestures =
+        (widget.drag?.isNotEmpty ?? false) || (widget.scale?.isNotEmpty ?? false);
 
     return _OriginData(
       tag: widget.tag,
@@ -339,7 +469,8 @@ class _OriginState extends State<Origin> {
             StageScaleRecognizer: GestureRecognizerFactoryWithHandlers<StageScaleRecognizer>(
               StageScaleRecognizer.new,
               (r) => r
-                ..gestures = widget.gestures
+                ..drag = widget.drag
+                ..scale = widget.scale
                 ..onStart = _onScaleStart
                 ..onUpdate = _onScaleUpdate
                 ..onEnd = _onScaleEnd,

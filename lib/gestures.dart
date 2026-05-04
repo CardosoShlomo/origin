@@ -25,111 +25,209 @@ class TapEvent {
   }) runEffect;
 }
 
-class GestureBounds {
-  const GestureBounds({
-    required this.bound,
-    this.value = 0,
-    this.perspective,
+/// Sealed parent for gesture-start enums. Pattern-match exhaustiveness on
+/// [DragStart] vs [ScaleStart] is guaranteed.
+sealed class GestureStart {}
+
+/// A committed gesture: the matched key (start) and value (gesture).
+typedef ActiveGesture = ({GestureStart start, Gesture gesture});
+
+/// A computed per-axis fling plan.
+///
+/// `to`, `duration`, `curve` all derive from the same FrictionSimulation —
+/// `curve` is the physics-exact mapping of normalized animation time to
+/// normalized position, not an approximation.
+typedef AxisFling = ({double to, Duration duration, Curve curve});
+
+enum DragStart implements GestureStart {
+  left, right, up, down,
+  upLeft, upRight, downLeft, downRight,
+  leftDominant, rightDominant, upDominant, downDominant,
+  horizontal, vertical, any,
+}
+
+enum DragBound { left, right, top, bottom }
+
+enum ScaleStart implements GestureStart {
+  shrink, expand, any,
+}
+
+/// Resistance to motion as a function of progress through a bound state.
+///
+/// Conventional range: [0, 1]. 0 = no resistance, 1 = block.
+/// Values outside this range are mathematically valid but produce
+/// non-standard physics (e.g., negative accelerates motion, > 1 reverses it).
+class Friction {
+  const Friction(double value, {double? end, this.curve = Curves.linear})
+      : start = value,
+        end = end ?? value;
+
+  final double start;
+  final double end;
+  final Curve curve;
+
+  double evaluate(double progress) =>
+      start + (end - start) * curve.transform(progress.clamp(0.0, 1.0));
+}
+
+/// Per-state friction during an active gesture.
+///
+/// Progress dimension: depth into the bound state (0 = entering, 1 = at the state's far edge).
+/// `extending`/`retracting`: motion deeper into the bound vs back toward origin.
+/// `*PastDisplay`: while the rect is outside the display area.
+class FrictionConfig {
+  const FrictionConfig({
+    this.extending,
+    this.extendingPastDisplay,
+    this.retracting,
+    this.retractingPastDisplay,
+  });
+
+  final Friction? extending;
+  final Friction? extendingPastDisplay;
+  final Friction? retracting;
+  final Friction? retractingPastDisplay;
+}
+
+/// Per-state velocity decay during a fling animation.
+///
+/// Progress dimension: fraction of velocity decayed (0 = fling start, 1 = at rest).
+/// State semantics match [FrictionConfig] — applied based on rect position/direction during the fling.
+class DecelerateConfig {
+  const DecelerateConfig({
+    this.extending,
+    this.extendingPastDisplay,
+    this.retracting,
+    this.retractingPastDisplay,
+  });
+
+  final Friction? extending;
+  final Friction? extendingPastDisplay;
+  final Friction? retracting;
+  final Friction? retractingPastDisplay;
+}
+
+/// Shared base for bound configurations.
+///
+/// Carries the cross-cutting per-bound fields ([friction], [decelerate], [builder]).
+/// Subclasses add bound-type-specific fields (e.g., [ShrinkBounds.minScale]).
+sealed class Bounds {
+  const Bounds({
+    this.friction,
+    this.decelerate,
     this.builder,
   });
 
-  const GestureBounds.horizontal({this.value = 0, this.perspective, this.builder}) : bound = GestureBound.horizontal;
-  const GestureBounds.vertical({this.value = 0, this.perspective, this.builder}) : bound = GestureBound.vertical;
-  const GestureBounds.directional({this.value = 0, this.perspective, this.builder}) : bound = GestureBound.directional;
-  const GestureBounds.scale({this.value = 0, this.perspective, this.builder}) : bound = GestureBound.scale;
-
-  final Set<GestureBound> bound;
-  final double value;
-  final double? perspective;
+  final FrictionConfig? friction;
+  final DecelerateConfig? decelerate;
   final StageBuilder? builder;
 }
 
-enum GestureStart {
-  left, right, up, down,
-  twoLeft, twoRight, twoUp, twoDown,
-  pinchIn, pinchOut;
-
-  static const horizontal = {left, right};
-  static const vertical = {up, down};
-  static const one = {left, right, up, down};
-  static const twoHorizontal = {twoLeft, twoRight};
-  static const twoVertical = {twoUp, twoDown};
-  static const two = {twoLeft, twoRight, twoUp, twoDown};
-  static const scale = {pinchIn, pinchOut};
-  static final all = {...values};
-
-  bool get isHorizontal => horizontal.contains(this);
-  bool get isVertical => vertical.contains(this);
-  bool get isOne => one.contains(this);
-  bool get isTwo => two.contains(this);
-  bool get isScale => scale.contains(this);
-
-  GestureBound get bound => switch (this) {
-    .left || .twoLeft => .left,
-    .right || .twoRight => .right,
-    .up || .twoUp => .up,
-    .down || .twoDown => .down,
-    .pinchIn => .zoomIn,
-    .pinchOut => .zoomOut,
-  };
+class DragBounds extends Bounds {
+  const DragBounds({
+    super.friction,
+    super.decelerate,
+    super.builder,
+  });
 }
 
-enum GestureBound {
-  left, right, up, down,
-  zoomIn, zoomOut;
+class ShrinkBounds extends Bounds {
+  const ShrinkBounds({
+    super.friction,
+    super.decelerate,
+    super.builder,
+    this.minScale,
+  });
 
-  static const horizontal = {left, right};
-  static const vertical = {up, down};
-  static const directional = {left, right, up, down};
-  static const scale = {zoomIn, zoomOut};
-  static final all = {...values};
-
-  bool get isHorizontal => horizontal.contains(this);
-  bool get isVertical => vertical.contains(this);
-  bool get isDirectional => directional.contains(this);
-  bool get isScale => scale.contains(this);
+  /// Scale below which the rect is "past display." Null = no minimum (rect can
+  /// shrink without ever entering the past-display state).
+  final double? minScale;
 }
 
-class Gesture {
+class ExpandBounds extends Bounds {
+  const ExpandBounds({
+    super.friction,
+    super.decelerate,
+    super.builder,
+    this.maxScale,
+  });
+
+  /// Scale above which the rect is "past display." Null = no maximum.
+  final double? maxScale;
+}
+
+/// Sealed parent for gesture kinds.
+sealed class Gesture {
   const Gesture({
-    required this.start,
-    this.bounds = const [],
+    this.bounds = const {},
+    this.constraints,
     this.builder,
+    this.onRelease,
   });
 
-  const Gesture.horizontal({this.bounds = const [], this.builder}) : start = GestureStart.horizontal;
-  const Gesture.vertical({this.bounds = const [], this.builder}) : start = GestureStart.vertical;
-  const Gesture.one({this.bounds = const [], this.builder}) : start = GestureStart.one;
-  const Gesture.twoHorizontal({this.bounds = const [], this.builder}) : start = GestureStart.twoHorizontal;
-  const Gesture.twoVertical({this.bounds = const [], this.builder}) : start = GestureStart.twoVertical;
-  const Gesture.two({this.bounds = const [], this.builder}) : start = GestureStart.two;
-  const Gesture.scale({this.bounds = const [], this.builder}) : start = GestureStart.scale;
-  const Gesture.pinchOut({this.bounds = const [], this.builder}) : start = const {.pinchOut};
-  const Gesture.pinchIn({this.bounds = const [], this.builder}) : start = const {.pinchIn};
+  /// Directional bounds active during this gesture (drag) or directional
+  /// overflow during scale (rect edges past container edges).
+  final Map<DragBound, DragBounds> bounds;
 
-  final Set<GestureStart> start;
-  final List<GestureBounds> bounds;
+  final GestureConstraints? constraints;
   final StageBuilder? builder;
+
+  /// Called when the gesture ends, with the package's computed per-axis fling
+  /// plans. Consumer receives the plans (or null if no fling computed) and
+  /// decides what to run. When null, the package executes the plans, falling
+  /// back to dismiss when neither axis flings.
+  final void Function(BuildContext context, AxisFling? flingX, AxisFling? flingY)? onRelease;
+}
+
+class DragGesture extends Gesture {
+  const DragGesture({
+    super.bounds,
+    super.constraints,
+    super.builder,
+  });
+}
+
+class ScaleGesture extends Gesture {
+  const ScaleGesture({
+    super.bounds,
+    super.constraints,
+    super.builder,
+    this.shrink,
+    this.expand,
+  });
+
+  /// Shrink-axis bound config (with optional minScale threshold).
+  final ShrinkBounds? shrink;
+
+  /// Expand-axis bound config (with optional maxScale threshold).
+  final ExpandBounds? expand;
 }
 
 class GestureConstraints {
   const GestureConstraints({
-    this.decelerate = 0.03,
-    this.frictionLeft = 0,
-    this.frictionRight = 0,
-    this.frictionUp = 0,
-    this.frictionDown = 0,
-    this.minScale,
-    this.maxScale,
-    this.scaleFriction = 0,
+    this.friction,
+    this.decelerate,
+    this.perspective,
   });
 
-  final double decelerate;
-  final double frictionLeft;
-  final double frictionRight;
-  final double frictionUp;
-  final double frictionDown;
-  final double? minScale;
-  final double? maxScale;
-  final double scaleFriction;
+  final FrictionConfig? friction;
+  final DecelerateConfig? decelerate;
+  final double? perspective;
+}
+
+/// Override config applied while an Origin is displayed (active on stage).
+///
+/// All fields nullable. When unset, the runtime cascade falls back to the
+/// Origin's own configuration, then to the enclosing Stage's defaults, then to
+/// hardcoded library defaults. Per-key cascade for maps; per-field for [constraints].
+class DisplayConfig {
+  const DisplayConfig({
+    this.drag,
+    this.scale,
+    this.constraints,
+  });
+
+  final Map<DragStart, DragGesture>? drag;
+  final Map<ScaleStart, ScaleGesture>? scale;
+  final GestureConstraints? constraints;
 }

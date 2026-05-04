@@ -1,9 +1,10 @@
 import 'dart:async';
 import 'dart:ui';
 import 'package:flutter/widgets.dart';
-import 'ext.dart';
+import 'rect_ext.dart';
 import 'gestures.dart';
 import 'origin_rect.dart';
+import 'physics.dart';
 import 'recognizer.dart';
 import 'stage_overlay.dart';
 
@@ -38,9 +39,25 @@ const _hasWidgetAspect = #_stageHasWidget;
 const _dismissingAspect = #_stageDismissing;
 
 class Stage extends StatefulWidget {
-  const Stage({super.key, required this.child});
+  const Stage({
+    super.key,
+    required this.child,
+    this.drag,
+    this.scale,
+    this.constraints,
+  });
 
   final Widget child;
+
+  /// Stage-level fallback drag gestures. Origins under this Stage cascade
+  /// through their own [Origin.drag] first, then this map for any unhandled keys.
+  final Map<DragStart, DragGesture>? drag;
+
+  /// Stage-level fallback scale gestures.
+  final Map<ScaleStart, ScaleGesture>? scale;
+
+  /// Stage-level fallback constraints (per-field cascade).
+  final GestureConstraints? constraints;
 
   static StageData of(BuildContext context) {
     return context.dependOnInheritedWidgetOfExactType<StageData>()!;
@@ -133,39 +150,144 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   final _centerYTween = Tween<double>(begin: 0, end: 0);
   final _widthTween = Tween<double>(begin: 0, end: 0);
 
+  // --- Gesture state for displayed-rect interaction ---
   Rect _startRect = .zero;
-  Offset _startFocalPoint = .zero;
+  Offset _totalDelta = .zero;
+  ActiveGesture? _active;
+  DisplayConfig? _displayConfig;
+
+  /// Effective drag map: Stage.drag overlaid by active Origin's displayConfig.drag.
+  Map<DragStart, DragGesture> get _effectiveDrag => {
+        ...?widget.drag,
+        ...?_displayConfig?.drag,
+      };
+
+  /// Effective scale map: Stage.scale overlaid by active Origin's displayConfig.scale.
+  Map<ScaleStart, ScaleGesture> get _effectiveScale => {
+        ...?widget.scale,
+        ...?_displayConfig?.scale,
+      };
+
+  void _setDisplayConfig(DisplayConfig? v) => _displayConfig = v;
 
   void _onScaleStart(ScaleStartDetails details) {
     _startRect = _rect.value;
-    _startFocalPoint = details.focalPoint;
+    _totalDelta = .zero;
+    _active = null;
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
-    final baseRect = _display.rect.baseRect(_aspectRatio);
-    if (details.pointerCount == 1 && _startRect.width == baseRect.width) {
-      final anchor = _startFocalPoint - _startRect.center;
-      final rawCenter = details.focalPoint - anchor;
-      final dy = (rawCenter.dy - baseRect.center.dy).abs();
-      final screenHeight = MediaQuery.sizeOf(context).height;
-      final scale = (1 - dy / screenHeight).clamp(0.3, 1.0);
-      _rect.value = Rect.fromCenter(
-        center: details.focalPoint - anchor * scale,
-        width: baseRect.width * scale,
-        height: baseRect.height * scale,
-      );
-    } else {
-      _rect.value = details.rect(startRect: _startRect, currentRect: _rect.value);
+    _totalDelta += details.focalPointDelta;
+
+    switch (_active?.gesture) {
+      case null: {
+        // Resolver: cascade through displayConfig → Stage.
+        if (details.pointerCount > 1) {
+          final scaleMap = _effectiveScale;
+          if (scaleMap.isNotEmpty) {
+            _active = resolveScaleArena(scale: details.scale, registered: scaleMap);
+          }
+        } else if (details.pointerCount == 1) {
+          final dragMap = _effectiveDrag;
+          if (dragMap.isNotEmpty) {
+            _active = resolveDragArena(totalDelta: _totalDelta, registered: dragMap);
+          }
+        }
+        if (_active == null) return;
+
+        final builder = _active!.gesture.builder;
+        if (builder != null) _setGestureBuilder(builder);
+        _startRect = _rect.value;
+        return;
+      }
+
+      case DragGesture drag: {
+        final delta = details.focalPointDelta;
+        final currentRect = _rect.value;
+        final originRect = _origin.rect;
+        final displayRect = _display.rect;
+        final dx = frictionFromState(
+          state: axisStateX(delta.dx, currentRect, originRect, displayRect),
+          bounds: drag.bounds,
+          delta: delta.dx,
+        );
+        final dy = frictionFromState(
+          state: axisStateY(delta.dy, currentRect, originRect, displayRect),
+          bounds: drag.bounds,
+          delta: delta.dy,
+        );
+        _rect.value = currentRect.translate(dx, dy);
+      }
+
+      case ScaleGesture scale: {
+        // Scale to dimensions from _startRect; directional friction on focalPointDelta.
+        // TODO: scale-axis friction at shrink/expand bounds.
+        final delta = details.focalPointDelta;
+        final currentRect = _rect.value;
+        final originRect = _origin.rect;
+        final displayRect = _display.rect;
+        final dx = frictionFromState(
+          state: axisStateX(delta.dx, currentRect, originRect, displayRect),
+          bounds: scale.bounds,
+          delta: delta.dx,
+        );
+        final dy = frictionFromState(
+          state: axisStateY(delta.dy, currentRect, originRect, displayRect),
+          bounds: scale.bounds,
+          delta: delta.dy,
+        );
+
+        final newWidth = _startRect.width * details.scale;
+        final newHeight = _startRect.height * details.scale;
+        if (currentRect.width == 0) return;
+        final center = (currentRect.center - details.focalPoint) * newWidth / currentRect.width
+            + details.focalPoint
+            + Offset(dx, dy);
+        _rect.value = Rect.fromCenter(center: center, width: newWidth, height: newHeight);
+      }
     }
   }
 
-  void _onScaleEnd(ScaleEndDetails details) {
-    final baseRect = _display.rect.baseRect(_aspectRatio);
-    if (_rect.value.width < baseRect.width * 0.85) {
-      dismiss();
-    } else {
-      animateToBase();
+  Future<void> _onScaleEnd(ScaleEndDetails details) async {
+    final active = _active;
+    if (active == null) return;
+
+    final g = active.gesture;
+    final velocity = details.velocity.pixelsPerSecond;
+    final currentRect = _rect.value;
+    final originRect = _origin.rect;
+    final displayRect = _display.rect;
+
+    final flingX = flingFromState(
+      state: axisStateX(velocity.dx, currentRect, originRect, displayRect),
+      bounds: g.bounds,
+      startPos: currentRect.center.dx,
+      velocity: velocity.dx,
+    );
+    final flingY = flingFromState(
+      state: axisStateY(velocity.dy, currentRect, originRect, displayRect),
+      bounds: g.bounds,
+      startPos: currentRect.center.dy,
+      velocity: velocity.dy,
+    );
+
+    _active = null;
+    _totalDelta = .zero;
+
+    if (g.onRelease != null) {
+      g.onRelease!(context, flingX, flingY);
+      return;
     }
+
+    // Default: run flings, await, then dismiss.
+    await Future.wait([
+      if (flingX != null)
+        animateCenterX(to: flingX.to, duration: flingX.duration, curve: flingX.curve),
+      if (flingY != null)
+        animateCenterY(to: flingY.to, duration: flingY.duration, curve: flingY.curve),
+    ]);
+    if (!mounted) return;
+    dismiss();
   }
 
   void _setOrigin(OriginRect v) => _origin = v;
@@ -256,7 +378,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   void reset() {
     setRect(.zero);
     _startRect = .zero;
-    _startFocalPoint = .zero;
+    _totalDelta = .zero;
+    _active = null;
     _container.value = null;
     _lastRectCenter = null;
     _setWidget(null);
@@ -264,6 +387,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _setPerspective(null);
     _setBackgroundColor(null);
     _setGestureBuilder(null);
+    _setDisplayConfig(null);
     _setOnEnd(null);
     _setTag(null);
     _setLocked(true);
@@ -472,11 +596,15 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       setPerspective: _setPerspective,
       setBackgroundColor: _setBackgroundColor,
       setGestureBuilder: _setGestureBuilder,
+      setDisplayConfig: _setDisplayConfig,
       setOnEnd: _setOnEnd,
       setTag: _setTag,
       setLocked: _setLocked,
       setRect: setRect,
       animateRect: animateRect,
+      animateCenterX: animateCenterX,
+      animateCenterY: animateCenterY,
+      animateWidth: animateWidth,
       reset: reset,
       animateToBase: animateToBase,
       dismiss: dismiss,
@@ -513,6 +641,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                   StageScaleRecognizer: GestureRecognizerFactoryWithHandlers<StageScaleRecognizer>(
                     StageScaleRecognizer.new,
                     (r) => r
+                      ..drag = _effectiveDrag
+                      ..scale = _effectiveScale
                       ..onStart = _onScaleStart
                       ..onUpdate = _onScaleUpdate
                       ..onEnd = _onScaleEnd,
@@ -556,11 +686,15 @@ class StageData extends InheritedModel<Object> {
     required this.setPerspective,
     required this.setBackgroundColor,
     required this.setGestureBuilder,
+    required this.setDisplayConfig,
     required this.setOnEnd,
     required this.setTag,
     required this.setLocked,
     required this.setRect,
     required this.animateRect,
+    required this.animateCenterX,
+    required this.animateCenterY,
+    required this.animateWidth,
     required this.reset,
     required this.animateToBase,
     required this.dismiss,
@@ -606,11 +740,15 @@ class StageData extends InheritedModel<Object> {
   final ValueSetter<double?> setPerspective;
   final ValueSetter<Color?> setBackgroundColor;
   final ValueSetter<StageBuilder?> setGestureBuilder;
+  final ValueSetter<DisplayConfig?> setDisplayConfig;
   final ValueSetter<FutureOr<void> Function()?> setOnEnd;
   final ValueSetter<Object?> setTag;
   final ValueSetter<bool> setLocked;
   final ValueSetter<Rect> setRect;
   final AnimateRect animateRect;
+  final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterX;
+  final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterY;
+  final Future<void> Function({required double to, Duration? duration, Curve curve}) animateWidth;
   final VoidCallback reset;
   final Future<void> Function() animateToBase;
   final Future<void> Function({Object? tag, Object? except}) dismiss;

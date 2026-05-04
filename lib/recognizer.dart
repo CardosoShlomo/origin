@@ -4,7 +4,8 @@ import 'gestures.dart';
 class StageScaleRecognizer extends ScaleGestureRecognizer {
   StageScaleRecognizer({super.supportedDevices, super.dragStartBehavior = DragStartBehavior.down});
 
-  List<Gesture> gestures = [];
+  Map<DragStart, DragGesture>? drag;
+  Map<ScaleStart, ScaleGesture>? scale;
 
   GestureScaleEndCallback? _onEnd;
 
@@ -17,9 +18,9 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
   final trackedPointers = <int>{};
   Offset _totalDelta = .zero;
 
-  bool get _hasSinglePointerGestures => gestures.any((g) => g.start.any((s) => s.isOne));
-
-  bool get _hasMultiPointerGestures => gestures.any((g) => g.start.any((s) => s.isTwo || s.isScale));
+  bool get _hasSingle => drag?.isNotEmpty ?? false;
+  bool get _hasMulti => scale?.isNotEmpty ?? false;
+  bool get _hasAny => _hasSingle || _hasMulti;
 
   @override
   void addAllowedPointer(PointerDownEvent event) {
@@ -30,7 +31,7 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
     }
     trackedPointers.add(event.pointer);
     super.addAllowedPointer(event);
-    if (gestures.isNotEmpty && trackedPointers.length > 1 && !_hasMultiPointerGestures) {
+    if (_hasAny && trackedPointers.length > 1 && !_hasMulti) {
       _resolved = true;
       resolve(.rejected);
     }
@@ -52,7 +53,7 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
       trackedPointers.remove(event.pointer);
     }
     super.handleEvent(event);
-    if (!_resolved && (gestures.isEmpty || trackedPointers.length > 1 || _totalDelta.distance > 4)) {
+    if (!_resolved && (!_hasAny || trackedPointers.length > 1 || _totalDelta.distance > 4)) {
       _resolved = true;
       resolve(.accepted);
     }
@@ -63,33 +64,20 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
 
   @override
   void resolve(GestureDisposition disposition) {
-    if (disposition == .accepted && gestures.isNotEmpty) {
+    if (disposition == .accepted && _hasAny) {
       if (trackedPointers.length <= 1) {
-        if (!_hasSinglePointerGestures) return;
-        if (!_matchesSinglePointer()) {
+        if (!_hasSingle) {
           super.resolve(.rejected);
           return;
         }
       } else {
-        if (!_hasMultiPointerGestures) {
+        if (!_hasMulti) {
           super.resolve(.rejected);
           return;
         }
       }
     }
     super.resolve(disposition);
-  }
-
-  bool _hasStart(GestureStart s) => gestures.any((g) => g.start.contains(s));
-
-  bool _matchesSinglePointer() {
-    final dx = _totalDelta.dx;
-    final dy = _totalDelta.dy;
-    if (dx > 2 && _hasStart(.right)) return true;
-    if (dx < -2 && _hasStart(.left)) return true;
-    if (dy > 2 && _hasStart(.down)) return true;
-    if (dy < -2 && _hasStart(.up)) return true;
-    return false;
   }
 
   @override
