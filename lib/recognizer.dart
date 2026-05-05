@@ -8,15 +8,43 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
   Map<ScaleStart, ScaleGesture>? scale;
 
   GestureScaleEndCallback? _onEnd;
+  GestureScaleUpdateCallback? _onUpdate;
 
   @override
   set onEnd(GestureScaleEndCallback? callback) => _onEnd = callback;
 
+  // Override to suppress parent's per-pointer-count-change end firing —
+  // [StageScaleRecognizer] fires once when all pointers are up.
   @override
   GestureScaleEndCallback? get onEnd => _onEnd == null ? null : (_) {};
 
+  // Override to wrap the user callback with sample tracking.
+  @override
+  set onUpdate(GestureScaleUpdateCallback? callback) {
+    _onUpdate = callback;
+    super.onUpdate = callback == null ? null : _trackingUpdate;
+  }
+
+  void _trackingUpdate(ScaleUpdateDetails details) {
+    _prevScale = _lastScale;
+    _prevFocal = _lastFocal;
+    _prevTime = _lastTime;
+    _lastScale = details.scale;
+    _lastFocal = details.focalPoint;
+    _lastTime = details.sourceTimeStamp;
+    _onUpdate?.call(details);
+  }
+
   final trackedPointers = <int>{};
   Offset _totalDelta = .zero;
+
+  // Sample pairs for end-velocity computation (linear focal-point + scale rate).
+  double _prevScale = 1.0;
+  double _lastScale = 1.0;
+  Offset _prevFocal = .zero;
+  Offset _lastFocal = .zero;
+  Duration? _prevTime;
+  Duration? _lastTime;
 
   bool get _hasSingle => drag?.isNotEmpty ?? false;
   bool get _hasMulti => scale?.isNotEmpty ?? false;
@@ -28,6 +56,9 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
       _totalDelta = .zero;
       _resolved = false;
       _accepted = false;
+      _prevScale = _lastScale = 1.0;
+      _prevFocal = _lastFocal = .zero;
+      _prevTime = _lastTime = null;
     }
     trackedPointers.add(event.pointer);
     super.addAllowedPointer(event);
@@ -58,8 +89,20 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
       resolve(.accepted);
     }
     if (trackedPointers.isEmpty && _accepted) {
-      _onEnd?.call(ScaleEndDetails());
+      _onEnd?.call(_buildEndDetails());
     }
+  }
+
+  ScaleEndDetails _buildEndDetails() {
+    final pt = _prevTime;
+    final lt = _lastTime;
+    if (pt == null || lt == null) return ScaleEndDetails();
+    final dt = (lt - pt).inMicroseconds / 1e6;
+    if (dt <= 0) return ScaleEndDetails();
+    return ScaleEndDetails(
+      velocity: Velocity(pixelsPerSecond: (_lastFocal - _prevFocal) / dt),
+      scaleVelocity: (_lastScale - _prevScale) / dt,
+    );
   }
 
   @override

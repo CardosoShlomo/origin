@@ -1,5 +1,7 @@
 import 'package:flutter/widgets.dart';
 
+import 'release.dart';
+
 typedef StageBuilder = Widget Function(BuildContext context, Widget child);
 
 typedef StageTap = void Function(TapEvent event);
@@ -31,13 +33,6 @@ sealed class GestureStart {}
 
 /// A committed gesture: the matched key (start) and value (gesture).
 typedef ActiveGesture = ({GestureStart start, Gesture gesture});
-
-/// A computed per-axis fling plan.
-///
-/// `to`, `duration`, `curve` all derive from the same FrictionSimulation —
-/// `curve` is the physics-exact mapping of normalized animation time to
-/// normalized position, not an approximation.
-typedef AxisFling = ({double to, Duration duration, Curve curve});
 
 enum DragStart implements GestureStart {
   left, right, up, down,
@@ -92,7 +87,11 @@ class FrictionConfig {
 /// Per-state velocity decay during a fling animation.
 ///
 /// Progress dimension: fraction of velocity decayed (0 = fling start, 1 = at rest).
-/// State semantics match [FrictionConfig] — applied based on rect position/direction during the fling.
+/// State semantics match [FrictionConfig] — applied based on rect position/direction
+/// during the fling.
+///
+/// The release trajectory consults this 4-state map per phase, picking the
+/// state-friction whose zone the segment occupies.
 class DecelerateConfig {
   const DecelerateConfig({
     this.extending,
@@ -172,11 +171,12 @@ sealed class Gesture {
   final GestureConstraints? constraints;
   final StageBuilder? builder;
 
-  /// Called when the gesture ends, with the package's computed per-axis fling
-  /// plans. Consumer receives the plans (or null if no fling computed) and
-  /// decides what to run. When null, the package executes the plans, falling
-  /// back to dismiss when neither axis flings.
-  final void Function(BuildContext context, AxisFling? flingX, AxisFling? flingY)? onRelease;
+  /// Called when the gesture ends with the package's computed [Release] —
+  /// per-axis trajectory plans plus helpers ([Release.backToDisplay],
+  /// [Release.backToOrigin], [Release.simpleDismiss], etc.).
+  ///
+  /// When null, the package runs [Release.backToDisplay] by default.
+  final void Function(BuildContext context, Release release)? onRelease;
 }
 
 class DragGesture extends Gesture {

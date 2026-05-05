@@ -6,6 +6,7 @@ import 'gestures.dart';
 import 'origin_rect.dart';
 import 'physics.dart';
 import 'recognizer.dart';
+import 'release.dart';
 import 'stage_overlay.dart';
 
 class OriginEntry {
@@ -220,12 +221,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       }
 
       case ScaleGesture scale: {
-        // Scale to dimensions from _startRect; directional friction on focalPointDelta.
-        // TODO: scale-axis friction at shrink/expand bounds.
         final delta = details.focalPointDelta;
         final currentRect = _rect.value;
         final originRect = _origin.rect;
         final displayRect = _display.rect;
+        if (currentRect.width == 0) return;
         final dx = frictionFromState(
           state: axisStateX(delta.dx, currentRect, originRect, displayRect),
           bounds: scale.bounds,
@@ -237,9 +237,18 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
           delta: delta.dy,
         );
 
-        final newWidth = _startRect.width * details.scale;
-        final newHeight = _startRect.height * details.scale;
-        if (currentRect.width == 0) return;
+        // Scale-axis friction: apply to the width delta from intended scale.
+        final baseWidth = displayRect.baseWidth(_aspectRatio);
+        final intendedWidth = _startRect.width * details.scale;
+        final dw = intendedWidth - currentRect.width;
+        final scaledDw = frictionFromScaleState(
+          state: axisStateScale(dw, currentRect.width, baseWidth, scale.shrink, scale.expand),
+          shrink: scale.shrink,
+          expand: scale.expand,
+          delta: dw,
+        );
+        final newWidth = currentRect.width + scaledDw;
+        final newHeight = newWidth / _aspectRatio;
         final center = (currentRect.center - details.focalPoint) * newWidth / currentRect.width
             + details.focalPoint
             + Offset(dx, dy);
@@ -255,39 +264,43 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     final g = active.gesture;
     final velocity = details.velocity.pixelsPerSecond;
     final currentRect = _rect.value;
-    final originRect = _origin.rect;
     final displayRect = _display.rect;
 
-    final flingX = flingFromState(
-      state: axisStateX(velocity.dx, currentRect, originRect, displayRect),
+    final xRelease = releaseFromStateX(
+      currentRect: currentRect,
+      displayRect: displayRect,
       bounds: g.bounds,
-      startPos: currentRect.center.dx,
       velocity: velocity.dx,
     );
-    final flingY = flingFromState(
-      state: axisStateY(velocity.dy, currentRect, originRect, displayRect),
+    final yRelease = releaseFromStateY(
+      currentRect: currentRect,
+      displayRect: displayRect,
       bounds: g.bounds,
-      startPos: currentRect.center.dy,
       velocity: velocity.dy,
     );
+    final baseWidth = displayRect.baseWidth(_aspectRatio);
+    final scaleRelease = switch (g) {
+      DragGesture _ => const IdleInDisplay(),
+      ScaleGesture s => releaseFromStateScale(
+          width: currentRect.width,
+          baseWidth: baseWidth,
+          shrink: s.shrink,
+          expand: s.expand,
+          velocity: details.scaleVelocity * baseWidth,
+        ),
+    };
 
     _active = null;
     _totalDelta = .zero;
 
+    final release = Release(x: xRelease, y: yRelease, scale: scaleRelease);
+
     if (g.onRelease != null) {
-      g.onRelease!(context, flingX, flingY);
+      g.onRelease!(context, release);
       return;
     }
-
-    // Default: run flings, await, then dismiss.
-    await Future.wait([
-      if (flingX != null)
-        animateCenterX(to: flingX.to, duration: flingX.duration, curve: flingX.curve),
-      if (flingY != null)
-        animateCenterY(to: flingY.to, duration: flingY.duration, curve: flingY.curve),
-    ]);
     if (!mounted) return;
-    dismiss();
+    await Stage.of(context).backToDisplay(release);
   }
 
   void _setOrigin(OriginRect v) => _origin = v;
@@ -770,6 +783,44 @@ class StageData extends InheritedModel<Object> {
   final Future<void> Function(Object tag) openEntry;
   final Future<void> Function(Object tag, Rect Function(Rect), {VoidCallback? onEnd}) sendEntry;
 
+  // ─── Release helpers ──────────────────────────────────────────────────────
+  // Default reactions to a [Release]. Consumers call these from [Gesture.onRelease].
+
+  /// Runs the full per-axis trajectory (decay + rubber) back to the displayed
+  /// (base) rect. Stage's default when [Gesture.onRelease] is null.
+  Future<void> backToDisplay(Release plan) => Future.wait([
+        runHorizontalRelease(plan.x, animateCenterX),
+        runVerticalRelease(plan.y, animateCenterY),
+        runScaleRelease(plan.scale, animateWidth),
+      ]);
+
+  /// Snaps directly to the base rect (no physics).
+  Future<void> backToBase() =>
+      animateRect(to: display.rect.baseRect(aspectRatio), curve: Curves.easeOut);
+
+  /// Runs the decay phases (without rubber), then dismisses to origin —
+  /// fling-aware dismiss. Origin's default when [Gesture.onRelease] is null.
+  Future<void> backToOrigin(Release plan, {Object? except}) async {
+    await Future.wait([
+      runHorizontalRelease(plan.x, animateCenterX, includeRubber: false),
+      runVerticalRelease(plan.y, animateCenterY, includeRubber: false),
+      runScaleRelease(plan.scale, animateWidth, includeRubber: false),
+    ]);
+    await dismiss(except: except);
+  }
+
+  /// Runs a custom mix. Each non-null axis runs the provided plan; null axes
+  /// are skipped. Pass [Release.x] / [y] / [scale] to use the package's plan.
+  Future<void> run({
+    HorizontalRelease? x,
+    VerticalRelease? y,
+    ScaleRelease? scale,
+  }) =>
+      Future.wait([
+        if (x != null) runHorizontalRelease(x, animateCenterX),
+        if (y != null) runVerticalRelease(y, animateCenterY),
+        if (scale != null) runScaleRelease(scale, animateWidth),
+      ]);
 
   @override
   bool updateShouldNotify(StageData oldWidget) => true;

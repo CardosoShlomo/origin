@@ -19,6 +19,8 @@ import 'gestures.dart';
 import 'origin_rect.dart';
 import 'physics.dart';
 import 'recognizer.dart';
+import 'rect_ext.dart';
+import 'release.dart';
 import 'stage.dart';
 
 class Origin extends StatefulWidget {
@@ -245,13 +247,11 @@ class _OriginState extends State<Origin> {
       }
 
       case ScaleGesture scale: {
-        // Scale to dimensions from _startRect; directional friction on focalPointDelta;
-        // combine with scale-around-focalPoint transformation.
-        // TODO: scale-axis friction at shrink/expand bounds (minScale/maxScale).
         final delta = details.focalPointDelta;
         final currentRect = _stage.rect.value;
         final originRect = _stage.origin.rect;
         final displayRect = _stage.display.rect;
+        if (currentRect.width == 0) return;
         final dx = _frictionScaledX(
           delta: delta.dx, bounds: scale.bounds,
           currentRect: currentRect, originRect: originRect, displayRect: displayRect,
@@ -261,9 +261,18 @@ class _OriginState extends State<Origin> {
           currentRect: currentRect, originRect: originRect, displayRect: displayRect,
         );
 
-        final newWidth = _startRect.width * details.scale;
-        final newHeight = _startRect.height * details.scale;
-        if (currentRect.width == 0) return;
+        // Scale-axis friction: apply to the width delta from intended scale.
+        final baseWidth = displayRect.baseWidth(_stage.aspectRatio);
+        final intendedWidth = _startRect.width * details.scale;
+        final dw = intendedWidth - currentRect.width;
+        final scaledDw = frictionFromScaleState(
+          state: axisStateScale(dw, currentRect.width, baseWidth, scale.shrink, scale.expand),
+          shrink: scale.shrink,
+          expand: scale.expand,
+          delta: dw,
+        );
+        final newWidth = currentRect.width + scaledDw;
+        final newHeight = newWidth / _stage.aspectRatio;
         final center = (currentRect.center - details.focalPoint) * newWidth / currentRect.width
             + details.focalPoint
             + Offset(dx, dy);
@@ -301,34 +310,6 @@ class _OriginState extends State<Origin> {
         delta: delta,
       );
 
-  AxisFling? _flingX({
-    required double velocity,
-    required Map<DragBound, DragBounds> bounds,
-    required Rect currentRect,
-    required Rect originRect,
-    required Rect displayRect,
-  }) =>
-      flingFromState(
-        state: axisStateX(velocity, currentRect, originRect, displayRect),
-        bounds: bounds,
-        startPos: currentRect.center.dx,
-        velocity: velocity,
-      );
-
-  AxisFling? _flingY({
-    required double velocity,
-    required Map<DragBound, DragBounds> bounds,
-    required Rect currentRect,
-    required Rect originRect,
-    required Rect displayRect,
-  }) =>
-      flingFromState(
-        state: axisStateY(velocity, currentRect, originRect, displayRect),
-        bounds: bounds,
-        startPos: currentRect.center.dy,
-        velocity: velocity,
-      );
-
   /// Resolves the active scale gesture from [Origin.scale] (no cascade —
   /// Origin handles idle-state gestures only).
   ActiveGesture? _resolveScaleArena(ScaleUpdateDetails details) {
@@ -348,40 +329,47 @@ class _OriginState extends State<Origin> {
     final active = _active;
     if (active == null) return;
 
-    // Compute fling plans per axis (pure — no animation started).
-    // TODO: scale-axis fling (width/height decelerate via shrink/expand).
     final g = active.gesture;
     final velocity = details.velocity.pixelsPerSecond;
     final currentRect = _stage.rect.value;
-    final originRect = _stage.origin.rect;
     final displayRect = _stage.display.rect;
-    final flingX = _flingX(
-      velocity: velocity.dx, bounds: g.bounds,
-      currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+
+    final xRelease = releaseFromStateX(
+      currentRect: currentRect,
+      displayRect: displayRect,
+      bounds: g.bounds,
+      velocity: velocity.dx,
     );
-    final flingY = _flingY(
-      velocity: velocity.dy, bounds: g.bounds,
-      currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+    final yRelease = releaseFromStateY(
+      currentRect: currentRect,
+      displayRect: displayRect,
+      bounds: g.bounds,
+      velocity: velocity.dy,
     );
+    final baseWidth = displayRect.baseWidth(_stage.aspectRatio);
+    final scaleRelease = switch (g) {
+      DragGesture _ => const IdleInDisplay(),
+      ScaleGesture s => releaseFromStateScale(
+          width: currentRect.width,
+          baseWidth: baseWidth,
+          shrink: s.shrink,
+          expand: s.expand,
+          velocity: details.scaleVelocity * baseWidth,
+        ),
+    };
 
     _active = null;
     _totalDelta = .zero;
     _stopSwapListening();
 
+    final release = Release(x: xRelease, y: yRelease, scale: scaleRelease);
+
     if (g.onRelease != null) {
-      g.onRelease!(context, flingX, flingY);
+      g.onRelease!(context, release);
       return;
     }
-
-    // Default: run flings, await completion, then dismiss.
-    await Future.wait([
-      if (flingX != null)
-        _stage.animateCenterX(to: flingX.to, duration: flingX.duration, curve: flingX.curve),
-      if (flingY != null)
-        _stage.animateCenterY(to: flingY.to, duration: flingY.duration, curve: flingY.curve),
-    ]);
     if (!mounted) return;
-    _stage.dismiss(except: _swapDisplaced);
+    await _stage.backToOrigin(release, except: _swapDisplaced);
   }
 
   StageData _setup() {
