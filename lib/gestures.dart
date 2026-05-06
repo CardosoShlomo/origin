@@ -127,7 +127,51 @@ class DragBounds extends Bounds {
     super.friction,
     super.decelerate,
     super.builder,
+    this.scaleResponse,
   });
+
+  /// Per-bound override of [DragGesture.scaleResponse]. Couples rect width to
+  /// drag-progress through this bound. Native physics (rect.width changes),
+  /// not a visual transform. When configured, the drag uses focal-point-
+  /// preserving anchor math instead of plain translation.
+  final ScaleResponse? scaleResponse;
+}
+
+/// Scale-as-function-of-drag-progress.
+///
+/// `inDisplay` ramp covers progress 0..1 from base to display edge.
+/// `pastDisplay` ramp covers progress 0..1 from display edge into past zone.
+/// Each [Friction] ramp's `start`/`end` are scale multipliers on baseWidth
+/// (e.g., `Friction(1.0, end: 0.6)` shrinks from full to 60%).
+class ScaleResponse {
+  const ScaleResponse({this.inDisplay, this.pastDisplay});
+
+  /// Smooth continuous shrink from 1.0 at base to [end] at full past.
+  /// Splits at the display edge so the in-display and past zones meet
+  /// at `(1.0 + end) / 2`.
+  factory ScaleResponse.smooth({
+    double end = 0.5,
+    Curve curve = Curves.linear,
+  }) {
+    final mid = (1.0 + end) / 2;
+    return ScaleResponse(
+      inDisplay: Friction(1.0, end: mid, curve: curve),
+      pastDisplay: Friction(mid, end: end, curve: curve),
+    );
+  }
+
+  /// Shrink only inside display. Past-display zone holds at `ramp.end`.
+  const ScaleResponse.inDisplayOnly(Friction ramp)
+      : inDisplay = ramp,
+        pastDisplay = null;
+
+  /// Hold flat in display. Shrink only when past edge.
+  const ScaleResponse.pastDisplayOnly(Friction ramp)
+      : inDisplay = null,
+        pastDisplay = ramp;
+
+  final Friction? inDisplay;
+  final Friction? pastDisplay;
 }
 
 class ShrinkBounds extends Bounds {
@@ -172,11 +216,12 @@ sealed class Gesture {
   final StageBuilder? builder;
 
   /// Called when the gesture ends with the package's computed [Release] —
-  /// per-axis trajectory plans plus helpers ([Release.backToDisplay],
-  /// [Release.backToOrigin], [Release.simpleDismiss], etc.).
+  /// per-axis trajectory plans. Consumer calls [StageData.backToDisplay] /
+  /// [StageData.backToOrigin] / etc. via `Stage.of(context)` to react.
   ///
-  /// When null, the package runs [Release.backToDisplay] by default.
-  final void Function(BuildContext context, Release release)? onRelease;
+  /// Cascade fallback when null: [DisplayConfig.onRelease] →
+  /// [Origin.onRelease] / [Stage.onRelease] → package default.
+  final OnRelease? onRelease;
 }
 
 class DragGesture extends Gesture {
@@ -184,7 +229,15 @@ class DragGesture extends Gesture {
     super.bounds,
     super.constraints,
     super.builder,
+    super.onRelease,
+    this.scaleResponse,
   });
+
+  /// Gesture-level scale-coupling fallback. Applied to any active bound that
+  /// doesn't define its own [DragBounds.scaleResponse]. When set (here or on
+  /// any active bound), the drag switches to focal-point-preserving anchor
+  /// math instead of plain translation.
+  final ScaleResponse? scaleResponse;
 }
 
 class ScaleGesture extends Gesture {
@@ -192,6 +245,7 @@ class ScaleGesture extends Gesture {
     super.bounds,
     super.constraints,
     super.builder,
+    super.onRelease,
     this.shrink,
     this.expand,
   });
@@ -225,9 +279,53 @@ class DisplayConfig {
     this.drag,
     this.scale,
     this.constraints,
+    this.onRelease,
+    this.overrides,
   });
 
   final Map<DragStart, DragGesture>? drag;
   final Map<ScaleStart, ScaleGesture>? scale;
   final GestureConstraints? constraints;
+
+  /// Cascade fallback for [Gesture.onRelease] while the origin is displayed.
+  /// Resolved as: gesture > displayConfig > stage > package default.
+  final OnRelease? onRelease;
+
+  /// Cascade fallback for [Stage.overrides]/[Origin.overrides] while the
+  /// origin is displayed.
+  final Overrides? overrides;
+}
+
+/// Inputs supplied to [Overrides.anchor] when computing the rect's center
+/// during a drag with [DragGesture.scaleResponse].
+class AnchorContext {
+  const AnchorContext({
+    required this.startFocalPoint,
+    required this.currentFocalPoint,
+    required this.startRect,
+    required this.currentRect,
+    required this.scale,
+  });
+
+  final Offset startFocalPoint;
+  final Offset currentFocalPoint;
+  final Rect startRect;
+  final Rect currentRect;
+
+  /// `newWidth / startRect.width` — the scale ratio that should drive anchor
+  /// adjustment.
+  final double scale;
+}
+
+/// Stage/Origin-level escape hatches for advanced behavioral overrides.
+/// Fields are reserved for power-user customizations; defaults are correct
+/// for typical use.
+class Overrides {
+  const Overrides({this.anchor});
+
+  /// Custom anchor for drag-with-[ScaleResponse]. Receives gesture-time
+  /// inputs and returns the rect's new center. Null = package default
+  /// (focal-point-preserving:
+  /// `currentFocalPoint - (startFocalPoint - startRect.center) * scale`).
+  final Offset Function(AnchorContext ctx)? anchor;
 }

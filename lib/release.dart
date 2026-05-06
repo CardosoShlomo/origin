@@ -1,4 +1,4 @@
-import 'package:flutter/animation.dart';
+import 'package:flutter/widgets.dart';
 
 /// A computed per-axis fling segment.
 ///
@@ -404,3 +404,7 @@ class Release {
   final VerticalRelease y;
   final ScaleRelease scale;
 }
+
+/// Signature for a gesture-end handler. Used by [Gesture.onRelease] and the
+/// cascade fallbacks on [Origin], [Stage], and [DisplayConfig].
+typedef OnRelease = void Function(BuildContext context, Release release);

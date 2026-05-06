@@ -46,6 +46,8 @@ class Stage extends StatefulWidget {
     this.drag,
     this.scale,
     this.constraints,
+    this.onRelease,
+    this.overrides,
   });
 
   final Widget child;
@@ -59,6 +61,15 @@ class Stage extends StatefulWidget {
 
   /// Stage-level fallback constraints (per-field cascade).
   final GestureConstraints? constraints;
+
+  /// Top-level onRelease fallback. Resolved last in both Stage and Origin
+  /// gesture-end cascades.
+  final OnRelease? onRelease;
+
+  /// Top-level escape hatches for advanced behavioral customization.
+  /// Resolved last in the per-field overrides cascade (gesture-context-
+  /// specific levels first, Stage as final fallback).
+  final Overrides? overrides;
 
   static StageData of(BuildContext context) {
     return context.dependOnInheritedWidgetOfExactType<StageData>()!;
@@ -153,6 +164,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
   // --- Gesture state for displayed-rect interaction ---
   Rect _startRect = .zero;
+  Offset _startFocalPoint = .zero;
   Offset _totalDelta = .zero;
   ActiveGesture? _active;
   DisplayConfig? _displayConfig;
@@ -173,6 +185,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
   void _onScaleStart(ScaleStartDetails details) {
     _startRect = _rect.value;
+    _startFocalPoint = details.focalPoint;
     _totalDelta = .zero;
     _active = null;
   }
@@ -199,25 +212,62 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         final builder = _active!.gesture.builder;
         if (builder != null) _setGestureBuilder(builder);
         _startRect = _rect.value;
+        _startFocalPoint = details.focalPoint;
         return;
       }
 
       case DragGesture drag: {
-        final delta = details.focalPointDelta;
+        final hasScaleResponse = drag.scaleResponse != null ||
+            drag.bounds.values.any((b) => b.scaleResponse != null);
         final currentRect = _rect.value;
         final originRect = _origin.rect;
         final displayRect = _display.rect;
-        final dx = frictionFromState(
-          state: axisStateX(delta.dx, currentRect, originRect, displayRect),
-          bounds: drag.bounds,
-          delta: delta.dx,
-        );
-        final dy = frictionFromState(
-          state: axisStateY(delta.dy, currentRect, originRect, displayRect),
-          bounds: drag.bounds,
-          delta: delta.dy,
-        );
-        _rect.value = currentRect.translate(dx, dy);
+
+        if (hasScaleResponse) {
+          // Scale-coupled drag: rect width follows scaleResponse, center is
+          // anchor-corrected so the finger stays at the same relative point.
+          final baseRect = displayRect.baseRect(_aspectRatio);
+          final anchor = _startFocalPoint - _startRect.center;
+          final rawCenter = details.focalPoint - anchor;
+          final factor = dragScaleFactor(
+            rawCenter: rawCenter,
+            baseRect: baseRect,
+            displayRect: displayRect,
+            bounds: drag.bounds,
+            gestureResponse: drag.scaleResponse,
+          );
+          final newWidth = baseRect.width * factor;
+          final newHeight = newWidth / _aspectRatio;
+          final ctx = AnchorContext(
+            startFocalPoint: _startFocalPoint,
+            currentFocalPoint: details.focalPoint,
+            startRect: _startRect,
+            currentRect: currentRect,
+            scale: _startRect.width == 0 ? 1.0 : newWidth / _startRect.width,
+          );
+          final anchorFn = _displayConfig?.overrides?.anchor
+              ?? widget.overrides?.anchor
+              ?? defaultDragAnchor;
+          final newCenter = anchorFn(ctx);
+          _rect.value = Rect.fromCenter(
+            center: newCenter,
+            width: newWidth,
+            height: newHeight,
+          );
+        } else {
+          final delta = details.focalPointDelta;
+          final dx = frictionFromState(
+            state: axisStateX(delta.dx, currentRect, originRect, displayRect),
+            bounds: drag.bounds,
+            delta: delta.dx,
+          );
+          final dy = frictionFromState(
+            state: axisStateY(delta.dy, currentRect, originRect, displayRect),
+            bounds: drag.bounds,
+            delta: delta.dy,
+          );
+          _rect.value = currentRect.translate(dx, dy);
+        }
       }
 
       case ScaleGesture scale: {
@@ -295,11 +345,12 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     final release = Release(x: xRelease, y: yRelease, scale: scaleRelease);
 
-    if (g.onRelease != null) {
-      g.onRelease!(context, release);
+    // Cascade: gesture > displayConfig > stage > package default.
+    final handler = g.onRelease ?? _displayConfig?.onRelease ?? widget.onRelease;
+    if (handler != null) {
+      handler(context, release);
       return;
     }
-    if (!mounted) return;
     await Stage.of(context).backToDisplay(release);
   }
 
@@ -595,6 +646,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       perspective: _perspective,
       backgroundColor: _backgroundColor,
       gestureBuilder: _gestureBuilder,
+      onRelease: widget.onRelease,
+      overrides: widget.overrides,
       onEnd: _onEnd,
       tag: _tag,
       locked: _locked,
@@ -685,6 +738,8 @@ class StageData extends InheritedModel<Object> {
     required this.perspective,
     required this.backgroundColor,
     required this.gestureBuilder,
+    required this.onRelease,
+    required this.overrides,
     required this.onEnd,
     required this.tag,
     required this.locked,
@@ -737,6 +792,8 @@ class StageData extends InheritedModel<Object> {
   final double? perspective;
   final Color? backgroundColor;
   final StageBuilder? gestureBuilder;
+  final OnRelease? onRelease;
+  final Overrides? overrides;
   final FutureOr<void> Function()? onEnd;
   final Object? tag;
   final bool locked;

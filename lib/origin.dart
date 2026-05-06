@@ -39,6 +39,8 @@ class Origin extends StatefulWidget {
     this.displayConfig,
     this.aspectRatio,
     this.backgroundColor,
+    this.onRelease,
+    this.overrides,
     this.onEnd,
     this.swapTags,
     this.onSwap,
@@ -59,6 +61,8 @@ class Origin extends StatefulWidget {
   final DisplayConfig? displayConfig;
   final double? aspectRatio;
   final Color? backgroundColor;
+  final OnRelease? onRelease;
+  final Overrides? overrides;
   final FutureOr<void> Function(StageData)? onEnd;
   final Set<Object>? swapTags;
   final ValueSetter<Object>? onSwap;
@@ -201,10 +205,12 @@ class _OriginState extends State<Origin> {
   /// Single active-gesture slot. Null = uncommitted.
   ActiveGesture? _active;
   Rect _startRect = .zero;
+  Offset _startFocalPoint = .zero;
   Offset _totalDelta = .zero;
 
   void _onScaleStart(ScaleStartDetails details) {
     _startRect = _stage.rect.value;
+    _startFocalPoint = details.focalPoint;
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
@@ -226,24 +232,59 @@ class _OriginState extends State<Origin> {
         final builder = active.gesture.builder;
         if (builder != null) data.setGestureBuilder(builder);
         _startRect = data.rect.value;
+        _startFocalPoint = details.focalPoint;
         _startSwapListening();
         return;
       }
 
       case DragGesture drag: {
-        final delta = details.focalPointDelta;
+        final hasScaleResponse = drag.scaleResponse != null ||
+            drag.bounds.values.any((b) => b.scaleResponse != null);
         final currentRect = _stage.rect.value;
         final originRect = _stage.origin.rect;
         final displayRect = _stage.display.rect;
-        final dx = _frictionScaledX(
-          delta: delta.dx, bounds: drag.bounds,
-          currentRect: currentRect, originRect: originRect, displayRect: displayRect,
-        );
-        final dy = _frictionScaledY(
-          delta: delta.dy, bounds: drag.bounds,
-          currentRect: currentRect, originRect: originRect, displayRect: displayRect,
-        );
-        _stage.rect.value = currentRect.translate(dx, dy);
+
+        if (hasScaleResponse) {
+          final baseRect = displayRect.baseRect(_stage.aspectRatio);
+          final anchor = _startFocalPoint - _startRect.center;
+          final rawCenter = details.focalPoint - anchor;
+          final factor = dragScaleFactor(
+            rawCenter: rawCenter,
+            baseRect: baseRect,
+            displayRect: displayRect,
+            bounds: drag.bounds,
+            gestureResponse: drag.scaleResponse,
+          );
+          final newWidth = baseRect.width * factor;
+          final newHeight = newWidth / _stage.aspectRatio;
+          final ctx = AnchorContext(
+            startFocalPoint: _startFocalPoint,
+            currentFocalPoint: details.focalPoint,
+            startRect: _startRect,
+            currentRect: currentRect,
+            scale: _startRect.width == 0 ? 1.0 : newWidth / _startRect.width,
+          );
+          final anchorFn = widget.overrides?.anchor
+              ?? _stage.overrides?.anchor
+              ?? defaultDragAnchor;
+          final newCenter = anchorFn(ctx);
+          _stage.rect.value = Rect.fromCenter(
+            center: newCenter,
+            width: newWidth,
+            height: newHeight,
+          );
+        } else {
+          final delta = details.focalPointDelta;
+          final dx = _frictionScaledX(
+            delta: delta.dx, bounds: drag.bounds,
+            currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+          );
+          final dy = _frictionScaledY(
+            delta: delta.dy, bounds: drag.bounds,
+            currentRect: currentRect, originRect: originRect, displayRect: displayRect,
+          );
+          _stage.rect.value = currentRect.translate(dx, dy);
+        }
       }
 
       case ScaleGesture scale: {
@@ -364,11 +405,12 @@ class _OriginState extends State<Origin> {
 
     final release = Release(x: xRelease, y: yRelease, scale: scaleRelease);
 
-    if (g.onRelease != null) {
-      g.onRelease!(context, release);
+    // Cascade: gesture > origin > stage > package default.
+    final handler = g.onRelease ?? widget.onRelease ?? _stage.onRelease;
+    if (handler != null) {
+      handler(context, release);
       return;
     }
-    if (!mounted) return;
     await _stage.backToOrigin(release, except: _swapDisplaced);
   }
 

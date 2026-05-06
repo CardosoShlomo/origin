@@ -175,6 +175,93 @@ double frictionFromScaleState({
   return delta * (1.0 - friction.evaluate(state.progress));
 }
 
+// ─── Drag scale-response coupling ────────────────────────────────────────────
+
+/// Combined scale factor for drag-with-[ScaleResponse]. Per axis:
+/// - Active bound = side of [baseRect.center] where [rawCenter] sits.
+/// - ScaleResponse resolved as `bounds[activeBound].scaleResponse ?? gestureResponse`.
+/// - Progress evaluated against in-display / past-display ramps.
+/// - Per-axis factors multiplied (axes without scaleResponse contribute 1.0).
+double dragScaleFactor({
+  required Offset rawCenter,
+  required Rect baseRect,
+  required Rect displayRect,
+  required Map<DragBound, DragBounds> bounds,
+  required ScaleResponse? gestureResponse,
+}) {
+  final DragBound boundY = rawCenter.dy < baseRect.center.dy ? .top : .bottom;
+  final responseY = bounds[boundY]?.scaleResponse ?? gestureResponse;
+  final factorY = _axisScaleFactor(
+    rawPos: rawCenter.dy,
+    basePos: baseRect.center.dy,
+    dispLow: displayRect.top,
+    dispHigh: displayRect.bottom,
+    halfBaseDim: baseRect.height / 2,
+    displayDim: displayRect.height,
+    response: responseY,
+  );
+
+  final DragBound boundX = rawCenter.dx < baseRect.center.dx ? .left : .right;
+  final responseX = bounds[boundX]?.scaleResponse ?? gestureResponse;
+  final factorX = _axisScaleFactor(
+    rawPos: rawCenter.dx,
+    basePos: baseRect.center.dx,
+    dispLow: displayRect.left,
+    dispHigh: displayRect.right,
+    halfBaseDim: baseRect.width / 2,
+    displayDim: displayRect.width,
+    response: responseX,
+  );
+
+  return factorX * factorY;
+}
+
+double _axisScaleFactor({
+  required double rawPos,
+  required double basePos,
+  required double dispLow,
+  required double dispHigh,
+  required double halfBaseDim,
+  required double displayDim,
+  required ScaleResponse? response,
+}) {
+  if (response == null) return 1.0;
+  final isHigh = rawPos >= basePos;
+  if (isHigh) {
+    final dispEdge = dispHigh - halfBaseDim;
+    if (rawPos <= dispEdge) {
+      final span = dispEdge - basePos;
+      if (span <= 0) return response.inDisplay?.start ?? 1.0;
+      final progress = ((rawPos - basePos) / span).clamp(0.0, 1.0);
+      return response.inDisplay?.evaluate(progress) ?? 1.0;
+    }
+    final progress = ((rawPos - dispEdge) / displayDim).clamp(0.0, 1.0);
+    return response.pastDisplay?.evaluate(progress)
+        ?? response.inDisplay?.end
+        ?? 1.0;
+  } else {
+    final dispEdge = dispLow + halfBaseDim;
+    if (rawPos >= dispEdge) {
+      final span = basePos - dispEdge;
+      if (span <= 0) return response.inDisplay?.start ?? 1.0;
+      final progress = ((basePos - rawPos) / span).clamp(0.0, 1.0);
+      return response.inDisplay?.evaluate(progress) ?? 1.0;
+    }
+    final progress = ((dispEdge - rawPos) / displayDim).clamp(0.0, 1.0);
+    return response.pastDisplay?.evaluate(progress)
+        ?? response.inDisplay?.end
+        ?? 1.0;
+  }
+}
+
+/// Default focal-point-preserving anchor: the rect.center is positioned so
+/// the user's finger stays at the same relative point of the rect as it
+/// scales. Used when no [Overrides.anchor] is configured.
+Offset defaultDragAnchor(AnchorContext ctx) {
+  final anchor = ctx.startFocalPoint - ctx.startRect.center;
+  return ctx.currentFocalPoint - anchor * ctx.scale;
+}
+
 /// Resolves a drag gesture from the [registered] map for the accumulated
 /// motion vector. Returns the matching [ActiveGesture], or null if motion is
 /// below the distance threshold or no gesture qualifies.
