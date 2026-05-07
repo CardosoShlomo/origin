@@ -1,410 +1,265 @@
 import 'package:flutter/widgets.dart';
 
+import 'gestures.dart';
+import 'physics.dart';
+import 'rect_ext.dart';
+
 /// A computed per-axis fling segment.
 ///
 /// `to`, `duration`, `curve` derive from the same FrictionSimulation —
 /// `curve` is the physics-exact mapping of normalized animation time to
 /// normalized position, not an approximation.
-typedef AxisFling = ({double to, Duration duration, Curve curve});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Sealed per-axis release hierarchies.
-//
-// Each axis (horizontal X, vertical Y, scale) has its own sealed parent.
-// Direction is encoded in the class name; the trajectory shape is the type.
-//
-// Trajectory shapes (per axis):
-//   - Idle in display              — no motion, rect inside display.
-//   - Idle past <side>             — no motion, rect past a bound. Rubber to edge.
-//   - <Direction> fling in display — decay ends inside display.
-//   - <Direction> continuation     — released past + retracting, didn't reach
-//                                    edge. Rubber continues inward to edge.
-//   - <Direction> spring-back      — outward trajectory ending past display.
-//                                    Rubber springs back from peak.
-//
-// Phase fields (when present) run sequentially in trajectory order.
-// Optional fields appear only for shapes where the phase may be skipped.
-// ─────────────────────────────────────────────────────────────────────────────
-
-sealed class HorizontalRelease {
-  const HorizontalRelease();
-}
-
-sealed class VerticalRelease {
-  const VerticalRelease();
-}
-
-sealed class ScaleRelease {
-  const ScaleRelease();
-}
-
-/// No motion, rect inside display. Shared across all three axes.
-final class IdleInDisplay
-    implements HorizontalRelease, VerticalRelease, ScaleRelease {
-  const IdleInDisplay();
-}
-
-// ─── Horizontal ──────────────────────────────────────────────────────────────
-
-final class IdlePastLeft implements HorizontalRelease {
-  const IdlePastLeft(this.rubber);
-  final AxisFling rubber;
-}
-
-final class IdlePastRight implements HorizontalRelease {
-  const IdlePastRight(this.rubber);
-  final AxisFling rubber;
-}
-
-final class LeftToRightFlingInDisplay implements HorizontalRelease {
-  const LeftToRightFlingInDisplay({this.pastLeft, this.left, this.right});
-  final AxisFling? pastLeft;
-  final AxisFling? left;
-  final AxisFling? right;
-}
-
-final class LeftToRightContinuation implements HorizontalRelease {
-  const LeftToRightContinuation({required this.pastLeft, required this.rubber});
-  final AxisFling pastLeft;
-  final AxisFling rubber;
-}
-
-final class LeftToRightSpringBack implements HorizontalRelease {
-  const LeftToRightSpringBack({
-    this.pastLeft,
-    this.left,
-    this.right,
-    required this.pastRight,
-    required this.rubber,
+class AxisFling {
+  const AxisFling({
+    required this.to,
+    required this.duration,
+    required this.curve,
   });
-  final AxisFling? pastLeft;
-  final AxisFling? left;
-  final AxisFling? right;
-  final AxisFling pastRight;
-  final AxisFling rubber;
+
+  final double to;
+  final Duration duration;
+  final Curve curve;
+
+  AxisFling copyWith({double? to, Duration? duration, Curve? curve}) =>
+      AxisFling(
+        to: to ?? this.to,
+        duration: duration ?? this.duration,
+        curve: curve ?? this.curve,
+      );
 }
 
-final class RightToLeftFlingInDisplay implements HorizontalRelease {
-  const RightToLeftFlingInDisplay({this.pastRight, this.right, this.left});
-  final AxisFling? pastRight;
-  final AxisFling? right;
-  final AxisFling? left;
+/// Per-axis release plan.
+///
+/// `decay` is the friction-decay phases (sequential), `settle` is the
+/// optional final rubber/snap to the natural rest target. The trajectory
+/// shape is described by the `direction` + `startZone` + `endZone` fields
+/// on the per-axis subclass — pattern-match those for behavior dispatch.
+sealed class AxisRelease {
+  const AxisRelease({this.decay = const [], this.settle});
+  final List<AxisFling> decay;
+  final AxisFling? settle;
 }
 
-final class RightToLeftContinuation implements HorizontalRelease {
-  const RightToLeftContinuation({required this.pastRight, required this.rubber});
-  final AxisFling pastRight;
-  final AxisFling rubber;
-}
+enum HorizontalDir { idle, ltr, rtl }
+enum HorizontalZone { pastLeft, left, right, pastRight }
 
-final class RightToLeftSpringBack implements HorizontalRelease {
-  const RightToLeftSpringBack({
-    this.pastRight,
-    this.right,
-    this.left,
-    required this.pastLeft,
-    required this.rubber,
+final class HorizontalRelease extends AxisRelease {
+  const HorizontalRelease({
+    required this.direction,
+    required this.startZone,
+    required this.endZone,
+    super.decay,
+    super.settle,
   });
-  final AxisFling? pastRight;
-  final AxisFling? right;
-  final AxisFling? left;
-  final AxisFling pastLeft;
-  final AxisFling rubber;
+  final HorizontalDir direction;
+  final HorizontalZone startZone;
+  final HorizontalZone endZone;
+
+  HorizontalRelease copyWith({
+    HorizontalDir? direction,
+    HorizontalZone? startZone,
+    HorizontalZone? endZone,
+    List<AxisFling>? decay,
+    AxisFling? settle,
+  }) =>
+      HorizontalRelease(
+        direction: direction ?? this.direction,
+        startZone: startZone ?? this.startZone,
+        endZone: endZone ?? this.endZone,
+        decay: decay ?? this.decay,
+        settle: settle ?? this.settle,
+      );
 }
 
-// ─── Vertical ────────────────────────────────────────────────────────────────
+enum VerticalDir { idle, ttb, btt }
+enum VerticalZone { pastTop, top, bottom, pastBottom }
 
-final class IdlePastTop implements VerticalRelease {
-  const IdlePastTop(this.rubber);
-  final AxisFling rubber;
-}
-
-final class IdlePastBottom implements VerticalRelease {
-  const IdlePastBottom(this.rubber);
-  final AxisFling rubber;
-}
-
-final class TopToBottomFlingInDisplay implements VerticalRelease {
-  const TopToBottomFlingInDisplay({this.pastTop, this.top, this.bottom});
-  final AxisFling? pastTop;
-  final AxisFling? top;
-  final AxisFling? bottom;
-}
-
-final class TopToBottomContinuation implements VerticalRelease {
-  const TopToBottomContinuation({required this.pastTop, required this.rubber});
-  final AxisFling pastTop;
-  final AxisFling rubber;
-}
-
-final class TopToBottomSpringBack implements VerticalRelease {
-  const TopToBottomSpringBack({
-    this.pastTop,
-    this.top,
-    this.bottom,
-    required this.pastBottom,
-    required this.rubber,
+final class VerticalRelease extends AxisRelease {
+  const VerticalRelease({
+    required this.direction,
+    required this.startZone,
+    required this.endZone,
+    super.decay,
+    super.settle,
   });
-  final AxisFling? pastTop;
-  final AxisFling? top;
-  final AxisFling? bottom;
-  final AxisFling pastBottom;
-  final AxisFling rubber;
+  final VerticalDir direction;
+  final VerticalZone startZone;
+  final VerticalZone endZone;
+
+  VerticalRelease copyWith({
+    VerticalDir? direction,
+    VerticalZone? startZone,
+    VerticalZone? endZone,
+    List<AxisFling>? decay,
+    AxisFling? settle,
+  }) =>
+      VerticalRelease(
+        direction: direction ?? this.direction,
+        startZone: startZone ?? this.startZone,
+        endZone: endZone ?? this.endZone,
+        decay: decay ?? this.decay,
+        settle: settle ?? this.settle,
+      );
 }
 
-final class BottomToTopFlingInDisplay implements VerticalRelease {
-  const BottomToTopFlingInDisplay({this.pastBottom, this.bottom, this.top});
-  final AxisFling? pastBottom;
-  final AxisFling? bottom;
-  final AxisFling? top;
-}
+enum ScaleDir { idle, outward, inward }
+enum ScaleZone { pastShrink, shrink, expand, pastExpand }
 
-final class BottomToTopContinuation implements VerticalRelease {
-  const BottomToTopContinuation({required this.pastBottom, required this.rubber});
-  final AxisFling pastBottom;
-  final AxisFling rubber;
-}
-
-final class BottomToTopSpringBack implements VerticalRelease {
-  const BottomToTopSpringBack({
-    this.pastBottom,
-    this.bottom,
-    this.top,
-    required this.pastTop,
-    required this.rubber,
+final class ScaleRelease extends AxisRelease {
+  const ScaleRelease({
+    required this.direction,
+    required this.startZone,
+    required this.endZone,
+    super.decay,
+    super.settle,
   });
-  final AxisFling? pastBottom;
-  final AxisFling? bottom;
-  final AxisFling? top;
-  final AxisFling pastTop;
-  final AxisFling rubber;
+  final ScaleDir direction;
+  final ScaleZone startZone;
+  final ScaleZone endZone;
+
+  ScaleRelease copyWith({
+    ScaleDir? direction,
+    ScaleZone? startZone,
+    ScaleZone? endZone,
+    List<AxisFling>? decay,
+    AxisFling? settle,
+  }) =>
+      ScaleRelease(
+        direction: direction ?? this.direction,
+        startZone: startZone ?? this.startZone,
+        endZone: endZone ?? this.endZone,
+        decay: decay ?? this.decay,
+        settle: settle ?? this.settle,
+      );
 }
 
-// ─── Scale ───────────────────────────────────────────────────────────────────
-
-final class IdlePastShrink implements ScaleRelease {
-  const IdlePastShrink(this.rubber);
-  final AxisFling rubber;
-}
-
-final class IdlePastExpand implements ScaleRelease {
-  const IdlePastExpand(this.rubber);
-  final AxisFling rubber;
-}
-
-final class ScaleInwardFlingInDisplay implements ScaleRelease {
-  const ScaleInwardFlingInDisplay({this.pastExpand, this.expand, this.shrink});
-  final AxisFling? pastExpand;
-  final AxisFling? expand;
-  final AxisFling? shrink;
-}
-
-final class ScaleInwardContinuation implements ScaleRelease {
-  const ScaleInwardContinuation({required this.pastExpand, required this.rubber});
-  final AxisFling pastExpand;
-  final AxisFling rubber;
-}
-
-final class ScaleInwardSpringBack implements ScaleRelease {
-  const ScaleInwardSpringBack({
-    this.pastExpand,
-    this.expand,
-    this.shrink,
-    required this.pastShrink,
-    required this.rubber,
+/// Inputs the package used (and the consumer can use) to build a [Release].
+/// Pure data — `gesture` carries the bound configs (decelerate, friction)
+/// and the maxScale/minScale used by the default plan.
+class ReleaseContext {
+  const ReleaseContext({
+    required this.currentRect,
+    required this.displayRect,
+    required this.aspectRatio,
+    required this.velocity,
+    required this.scaleVelocity,
+    required this.gesture,
   });
-  final AxisFling? pastExpand;
-  final AxisFling? expand;
-  final AxisFling? shrink;
-  final AxisFling pastShrink;
-  final AxisFling rubber;
+
+  final Rect currentRect;
+  final Rect displayRect;
+  final double aspectRatio;
+  final Velocity velocity;
+  final double scaleVelocity;
+  final Gesture gesture;
+
+  Rect get baseRect => displayRect.baseRect(aspectRatio);
 }
 
-final class ScaleOutwardFlingInDisplay implements ScaleRelease {
-  const ScaleOutwardFlingInDisplay({this.pastShrink, this.shrink, this.expand});
-  final AxisFling? pastShrink;
-  final AxisFling? shrink;
-  final AxisFling? expand;
-}
-
-final class ScaleOutwardContinuation implements ScaleRelease {
-  const ScaleOutwardContinuation({required this.pastShrink, required this.rubber});
-  final AxisFling pastShrink;
-  final AxisFling rubber;
-}
-
-final class ScaleOutwardSpringBack implements ScaleRelease {
-  const ScaleOutwardSpringBack({
-    this.pastShrink,
-    this.shrink,
-    this.expand,
-    required this.pastExpand,
-    required this.rubber,
-  });
-  final AxisFling? pastShrink;
-  final AxisFling? shrink;
-  final AxisFling? expand;
-  final AxisFling pastExpand;
-  final AxisFling rubber;
-}
-
-// ─── Per-axis runners ────────────────────────────────────────────────────────
-
-/// Animator signature compatible with Stage's per-axis animateCenterX /
-/// animateCenterY / animateWidth.
-typedef AxisAnimator = Future<void> Function({
-  required double to,
-  Duration? duration,
-  Curve curve,
-});
-
-/// Runs the X-axis [release] phases sequentially. Skips rubber when
-/// [includeRubber] is false (used by `backToOrigin` to play the decay portion
-/// only, before dismissing).
-Future<void> runHorizontalRelease(
-  HorizontalRelease release,
-  AxisAnimator animate, {
-  bool includeRubber = true,
-}) async {
-  Future<void> ph(AxisFling f) =>
-      animate(to: f.to, duration: f.duration, curve: f.curve);
-  switch (release) {
-    case IdleInDisplay():
-      return;
-    case IdlePastLeft(:final rubber) || IdlePastRight(:final rubber):
-      if (includeRubber) await ph(rubber);
-    case LeftToRightFlingInDisplay(:final pastLeft, :final left, :final right):
-      if (pastLeft != null) await ph(pastLeft);
-      if (left != null) await ph(left);
-      if (right != null) await ph(right);
-    case LeftToRightContinuation(:final pastLeft, :final rubber):
-      await ph(pastLeft);
-      if (includeRubber) await ph(rubber);
-    case LeftToRightSpringBack(
-        :final pastLeft, :final left, :final right, :final pastRight, :final rubber):
-      if (pastLeft != null) await ph(pastLeft);
-      if (left != null) await ph(left);
-      if (right != null) await ph(right);
-      await ph(pastRight);
-      if (includeRubber) await ph(rubber);
-    case RightToLeftFlingInDisplay(:final pastRight, :final right, :final left):
-      if (pastRight != null) await ph(pastRight);
-      if (right != null) await ph(right);
-      if (left != null) await ph(left);
-    case RightToLeftContinuation(:final pastRight, :final rubber):
-      await ph(pastRight);
-      if (includeRubber) await ph(rubber);
-    case RightToLeftSpringBack(
-        :final pastRight, :final right, :final left, :final pastLeft, :final rubber):
-      if (pastRight != null) await ph(pastRight);
-      if (right != null) await ph(right);
-      if (left != null) await ph(left);
-      await ph(pastLeft);
-      if (includeRubber) await ph(rubber);
-  }
-}
-
-/// Runs the Y-axis [release] phases sequentially.
-Future<void> runVerticalRelease(
-  VerticalRelease release,
-  AxisAnimator animate, {
-  bool includeRubber = true,
-}) async {
-  Future<void> ph(AxisFling f) =>
-      animate(to: f.to, duration: f.duration, curve: f.curve);
-  switch (release) {
-    case IdleInDisplay():
-      return;
-    case IdlePastTop(:final rubber) || IdlePastBottom(:final rubber):
-      if (includeRubber) await ph(rubber);
-    case TopToBottomFlingInDisplay(:final pastTop, :final top, :final bottom):
-      if (pastTop != null) await ph(pastTop);
-      if (top != null) await ph(top);
-      if (bottom != null) await ph(bottom);
-    case TopToBottomContinuation(:final pastTop, :final rubber):
-      await ph(pastTop);
-      if (includeRubber) await ph(rubber);
-    case TopToBottomSpringBack(
-        :final pastTop, :final top, :final bottom, :final pastBottom, :final rubber):
-      if (pastTop != null) await ph(pastTop);
-      if (top != null) await ph(top);
-      if (bottom != null) await ph(bottom);
-      await ph(pastBottom);
-      if (includeRubber) await ph(rubber);
-    case BottomToTopFlingInDisplay(:final pastBottom, :final bottom, :final top):
-      if (pastBottom != null) await ph(pastBottom);
-      if (bottom != null) await ph(bottom);
-      if (top != null) await ph(top);
-    case BottomToTopContinuation(:final pastBottom, :final rubber):
-      await ph(pastBottom);
-      if (includeRubber) await ph(rubber);
-    case BottomToTopSpringBack(
-        :final pastBottom, :final bottom, :final top, :final pastTop, :final rubber):
-      if (pastBottom != null) await ph(pastBottom);
-      if (bottom != null) await ph(bottom);
-      if (top != null) await ph(top);
-      await ph(pastTop);
-      if (includeRubber) await ph(rubber);
-  }
-}
-
-/// Runs the scale-axis [release] phases sequentially.
-Future<void> runScaleRelease(
-  ScaleRelease release,
-  AxisAnimator animate, {
-  bool includeRubber = true,
-}) async {
-  Future<void> ph(AxisFling f) =>
-      animate(to: f.to, duration: f.duration, curve: f.curve);
-  switch (release) {
-    case IdleInDisplay():
-      return;
-    case IdlePastShrink(:final rubber) || IdlePastExpand(:final rubber):
-      if (includeRubber) await ph(rubber);
-    case ScaleInwardFlingInDisplay(:final pastExpand, :final expand, :final shrink):
-      if (pastExpand != null) await ph(pastExpand);
-      if (expand != null) await ph(expand);
-      if (shrink != null) await ph(shrink);
-    case ScaleInwardContinuation(:final pastExpand, :final rubber):
-      await ph(pastExpand);
-      if (includeRubber) await ph(rubber);
-    case ScaleInwardSpringBack(
-        :final pastExpand, :final expand, :final shrink, :final pastShrink, :final rubber):
-      if (pastExpand != null) await ph(pastExpand);
-      if (expand != null) await ph(expand);
-      if (shrink != null) await ph(shrink);
-      await ph(pastShrink);
-      if (includeRubber) await ph(rubber);
-    case ScaleOutwardFlingInDisplay(:final pastShrink, :final shrink, :final expand):
-      if (pastShrink != null) await ph(pastShrink);
-      if (shrink != null) await ph(shrink);
-      if (expand != null) await ph(expand);
-    case ScaleOutwardContinuation(:final pastShrink, :final rubber):
-      await ph(pastShrink);
-      if (includeRubber) await ph(rubber);
-    case ScaleOutwardSpringBack(
-        :final pastShrink, :final shrink, :final expand, :final pastExpand, :final rubber):
-      if (pastShrink != null) await ph(pastShrink);
-      if (shrink != null) await ph(shrink);
-      if (expand != null) await ph(expand);
-      await ph(pastExpand);
-      if (includeRubber) await ph(rubber);
-  }
-}
-
-// ─── Release: bundled per-axis plans ─────────────────────────────────────────
-
-/// The package's computed release plan for a gesture's end. Pure data — three
-/// per-axis trajectory plans. Execution helpers live on [StageData] (call
-/// `Stage.of(context).backToDisplay(release)` etc.).
+/// Bundled per-axis plans. Built from a [ReleaseContext] via factories.
 class Release {
   const Release({required this.x, required this.y, required this.scale});
 
   final HorizontalRelease x;
   final VerticalRelease y;
   final ScaleRelease scale;
+
+  /// The default plan: settle back into the viewport (display). Per axis,
+  /// physics-derived flings whose final settle (rubber) lands at a viewport-
+  /// correct position — covers display when zoomed (with maxScale clamp +
+  /// proportional pan preservation), snaps to base when not zoomed.
+  factory Release.toDisplay(ReleaseContext data) {
+    final scaleRelease = _scaleReleaseFor(data);
+    final scaleTargetWidth = scaleRelease.settle?.to
+        ?? (scaleRelease.decay.isEmpty
+            ? data.currentRect.width
+            : scaleRelease.decay.last.to);
+    // Rect at the post-scale-settle dims — used by per-axis helpers to
+    // compute viewport-fit at gesture-end *and* decay-end positions.
+    final projectedRect = data.currentRect.resizeOnCenter(
+      scaleTargetWidth,
+      scaleTargetWidth / data.aspectRatio,
+    );
+    return Release(
+      x: releaseFromStateX(
+        currentRect: data.currentRect,
+        displayRect: data.displayRect,
+        bounds: data.gesture.bounds,
+        velocity: data.velocity.pixelsPerSecond.dx,
+        projectedRect: projectedRect,
+      ),
+      y: releaseFromStateY(
+        currentRect: data.currentRect,
+        displayRect: data.displayRect,
+        bounds: data.gesture.bounds,
+        velocity: data.velocity.pixelsPerSecond.dy,
+        projectedRect: projectedRect,
+      ),
+      scale: scaleRelease,
+    );
+  }
+
+  /// Decay-only plan: physics-derived friction phases per axis, no settle.
+  /// The rect ends wherever the physics naturally halts. Useful as a building
+  /// block for flows that compose decay with a custom finalize step (e.g.,
+  /// dismiss to origin).
+  factory Release.toHalt(ReleaseContext data) {
+    final plan = Release.toDisplay(data);
+    return Release(
+      x: HorizontalRelease(
+        direction: plan.x.direction,
+        startZone: plan.x.startZone,
+        endZone: plan.x.endZone,
+        decay: plan.x.decay,
+      ),
+      y: VerticalRelease(
+        direction: plan.y.direction,
+        startZone: plan.y.startZone,
+        endZone: plan.y.endZone,
+        decay: plan.y.decay,
+      ),
+      scale: ScaleRelease(
+        direction: plan.scale.direction,
+        startZone: plan.scale.startZone,
+        endZone: plan.scale.endZone,
+        decay: plan.scale.decay,
+      ),
+    );
+  }
+
+  Release copyWith({
+    HorizontalRelease? x,
+    VerticalRelease? y,
+    ScaleRelease? scale,
+  }) =>
+      Release(
+        x: x ?? this.x,
+        y: y ?? this.y,
+        scale: scale ?? this.scale,
+      );
+
+  static ScaleRelease _scaleReleaseFor(ReleaseContext data) {
+    final baseWidth = data.displayRect.baseWidth(data.aspectRatio);
+    if (data.gesture case ScaleGesture(:final shrink, :final expand)) {
+      return releaseFromStateScale(
+        width: data.currentRect.width,
+        baseWidth: baseWidth,
+        shrink: shrink,
+        expand: expand,
+        velocity: data.scaleVelocity * baseWidth,
+      );
+    }
+    return releaseFromStateScale(
+      width: data.currentRect.width,
+      baseWidth: baseWidth,
+      shrink: null,
+      expand: null,
+      velocity: 0,
+    );
+  }
 }
 
-/// Signature for a gesture-end handler. Used by [Gesture.onRelease] and the
-/// cascade fallbacks on [Origin], [Stage], and [DisplayConfig].
-typedef OnRelease = void Function(BuildContext context, Release release);
+/// Signature for a gesture-end handler. Consumer receives raw inputs via
+/// [ReleaseContext]; calls `Release.toDisplay(data)` (or builds a custom plan)
+/// and runs it via `Stage.of(context).release(...)` / `.run(...)`.
+typedef OnRelease = void Function(BuildContext context, ReleaseContext data);

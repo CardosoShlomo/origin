@@ -2,7 +2,7 @@ import 'package:flutter/gestures.dart';
 import 'gestures.dart';
 
 class StageScaleRecognizer extends ScaleGestureRecognizer {
-  StageScaleRecognizer({super.supportedDevices, super.dragStartBehavior = DragStartBehavior.down});
+  StageScaleRecognizer({super.supportedDevices, super.dragStartBehavior = .down});
 
   Map<DragStart, DragGesture>? drag;
   Map<ScaleStart, ScaleGesture>? scale;

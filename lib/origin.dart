@@ -8,6 +8,7 @@ export 'gestures.dart';
 export 'origin_rect.dart';
 export 'ratio.dart';
 export 'recognizer.dart';
+export 'release.dart';
 export 'resolution.dart';
 export 'side.dart';
 export 'stage.dart';
@@ -193,7 +194,7 @@ class _OriginState extends State<Origin> {
 
   void _finishSwap() {
     if (_swapDisplaced != null) {
-      _stage.release(_swapDisplaced!);
+      _stage.releaseSend(_swapDisplaced!);
       widget.onSwap?.call(_swapDisplaced!);
       _swapDisplaced = null;
     }
@@ -209,8 +210,14 @@ class _OriginState extends State<Origin> {
   Offset _totalDelta = .zero;
 
   void _onScaleStart(ScaleStartDetails details) {
+    // onStart fires on every pointer-count change. Once committed, refresh
+    // start refs but keep _active — Origin uses single-commit semantics
+    // (one gesture for the entire pointer-tracking lifetime). Stage handles
+    // mid-interaction switching when the displayed item is on stage.
     _startRect = _stage.rect.value;
     _startFocalPoint = details.focalPoint;
+    if (_active != null) return;
+    _totalDelta = .zero;
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
@@ -229,6 +236,17 @@ class _OriginState extends State<Origin> {
         _active = active;
 
         final data = _setup();
+
+        // Apply DragGesture.override if set.
+        if (active.gesture case DragGesture(:final override?)) {
+          final baseRect = data.display.rect.baseRect(data.aspectRatio);
+          final replacement = override(data.rect.value, baseRect);
+          if (replacement != null) {
+            active = (start: active.start, gesture: replacement);
+            _active = active;
+          }
+        }
+
         final builder = active.gesture.builder;
         if (builder != null) data.setGestureBuilder(builder);
         _startRect = data.rect.value;
@@ -238,7 +256,7 @@ class _OriginState extends State<Origin> {
       }
 
       case DragGesture drag: {
-        final hasScaleResponse = drag.scaleResponse != null ||
+        final hasScaleResponse =
             drag.bounds.values.any((b) => b.scaleResponse != null);
         final currentRect = _stage.rect.value;
         final originRect = _stage.origin.rect;
@@ -250,10 +268,10 @@ class _OriginState extends State<Origin> {
           final rawCenter = details.focalPoint - anchor;
           final factor = dragScaleFactor(
             rawCenter: rawCenter,
+            actualRect: currentRect,
             baseRect: baseRect,
             displayRect: displayRect,
             bounds: drag.bounds,
-            gestureResponse: drag.scaleResponse,
           );
           final newWidth = baseRect.width * factor;
           final newHeight = newWidth / _stage.aspectRatio;
@@ -313,7 +331,8 @@ class _OriginState extends State<Origin> {
           delta: dw,
         );
         final newWidth = currentRect.width + scaledDw;
-        final newHeight = newWidth / _stage.aspectRatio;
+        final scaleRatio = _startRect.width == 0 ? 1.0 : newWidth / _startRect.width;
+        final newHeight = _startRect.height * scaleRatio;
         final center = (currentRect.center - details.focalPoint) * newWidth / currentRect.width
             + details.focalPoint
             + Offset(dx, dy);
@@ -370,48 +389,26 @@ class _OriginState extends State<Origin> {
     final active = _active;
     if (active == null) return;
 
-    final g = active.gesture;
-    final velocity = details.velocity.pixelsPerSecond;
-    final currentRect = _stage.rect.value;
-    final displayRect = _stage.display.rect;
-
-    final xRelease = releaseFromStateX(
-      currentRect: currentRect,
-      displayRect: displayRect,
-      bounds: g.bounds,
-      velocity: velocity.dx,
+    final data = ReleaseContext(
+      currentRect: _stage.rect.value,
+      displayRect: _stage.display.rect,
+      aspectRatio: _stage.aspectRatio,
+      velocity: details.velocity,
+      scaleVelocity: details.scaleVelocity,
+      gesture: active.gesture,
     );
-    final yRelease = releaseFromStateY(
-      currentRect: currentRect,
-      displayRect: displayRect,
-      bounds: g.bounds,
-      velocity: velocity.dy,
-    );
-    final baseWidth = displayRect.baseWidth(_stage.aspectRatio);
-    final scaleRelease = switch (g) {
-      DragGesture _ => const IdleInDisplay(),
-      ScaleGesture s => releaseFromStateScale(
-          width: currentRect.width,
-          baseWidth: baseWidth,
-          shrink: s.shrink,
-          expand: s.expand,
-          velocity: details.scaleVelocity * baseWidth,
-        ),
-    };
 
     _active = null;
     _totalDelta = .zero;
     _stopSwapListening();
 
-    final release = Release(x: xRelease, y: yRelease, scale: scaleRelease);
-
     // Cascade: gesture > origin > stage > package default.
-    final handler = g.onRelease ?? widget.onRelease ?? _stage.onRelease;
+    final handler = data.gesture.onRelease ?? widget.onRelease ?? _stage.onRelease;
     if (handler != null) {
-      handler(context, release);
+      handler(context, data);
       return;
     }
-    await _stage.backToOrigin(release, except: _swapDisplaced);
+    await _stage.backToOrigin(data, except: _swapDisplaced);
   }
 
   StageData _setup() {

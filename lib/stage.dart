@@ -167,6 +167,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   Offset _startFocalPoint = .zero;
   Offset _totalDelta = .zero;
   ActiveGesture? _active;
+  // Last gesture committed during the current pointer-tracking lifetime.
+  // Preserved across pointer-count changes so [_onScaleEnd] can still cascade
+  // onRelease even when a re-resolution didn't commit anything new before lift.
+  ActiveGesture? _lastActive;
+  // Pointer count at the previous [_onScaleStart] firing, used to detect
+  // adds vs removes (recognizer fires onStart on every pointer-count change).
+  int _prevPointerCount = 0;
   DisplayConfig? _displayConfig;
 
   /// Effective drag map: Stage.drag overlaid by active Origin's displayConfig.drag.
@@ -184,10 +191,24 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   void _setDisplayConfig(DisplayConfig? v) => _displayConfig = v;
 
   void _onScaleStart(ScaleStartDetails details) {
+    // onStart fires on every pointer-count change, not just first touch.
     _startRect = _rect.value;
     _startFocalPoint = details.focalPoint;
-    _totalDelta = .zero;
+
+    final added = details.pointerCount > _prevPointerCount;
+    _prevPointerCount = details.pointerCount;
+
+    // Pointer removed (count went down): keep current gesture. The real end
+    // is when all pointers leave — that's the recognizer's onEnd.
+    if (!added) return;
+    // One-way switch: drag → scale. Once scale wins, it stays for the rest
+    // of the interaction; adding more pointers doesn't reassess.
+    if (_active?.gesture case ScaleGesture _) return;
+
+    // Pointer added while idle or in drag: clear so the resolver re-runs
+    // with the new pointer count (will commit scale on the next pinch).
     _active = null;
+    _totalDelta = .zero;
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
@@ -209,6 +230,18 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         }
         if (_active == null) return;
 
+        // Apply DragGesture.override if set — lets consumer pick a variant
+        // based on starting rect state.
+        final committed = _active!;
+        if (committed.gesture case DragGesture(:final override?)) {
+          final baseRect = _display.rect.baseRect(_aspectRatio);
+          final replacement = override(_rect.value, baseRect);
+          if (replacement != null) {
+            _active = (start: committed.start, gesture: replacement);
+          }
+        }
+
+        _lastActive = _active;
         final builder = _active!.gesture.builder;
         if (builder != null) _setGestureBuilder(builder);
         _startRect = _rect.value;
@@ -217,11 +250,14 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       }
 
       case DragGesture drag: {
-        final hasScaleResponse = drag.scaleResponse != null ||
+        final hasScaleResponse =
             drag.bounds.values.any((b) => b.scaleResponse != null);
         final currentRect = _rect.value;
-        final originRect = _origin.rect;
         final displayRect = _display.rect;
+        // For displayed items, the natural rest is the base rect (centered in
+        // display), not the thumbnail. axisState's `originRect` parameter is
+        // really "the reference rest" — pass base, not _origin.
+        final originRect = displayRect.baseRect(_aspectRatio);
 
         if (hasScaleResponse) {
           // Scale-coupled drag: rect width follows scaleResponse, center is
@@ -231,10 +267,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
           final rawCenter = details.focalPoint - anchor;
           final factor = dragScaleFactor(
             rawCenter: rawCenter,
+            actualRect: currentRect,
             baseRect: baseRect,
             displayRect: displayRect,
             bounds: drag.bounds,
-            gestureResponse: drag.scaleResponse,
           );
           final newWidth = baseRect.width * factor;
           final newHeight = newWidth / _aspectRatio;
@@ -298,7 +334,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
           delta: dw,
         );
         final newWidth = currentRect.width + scaledDw;
-        final newHeight = newWidth / _aspectRatio;
+        // Preserve startRect's aspect ratio (not _aspectRatio, which may
+        // differ if startRect was off-aspect).
+        final scaleRatio = _startRect.width == 0 ? 1.0 : newWidth / _startRect.width;
+        final newHeight = _startRect.height * scaleRatio;
         final center = (currentRect.center - details.focalPoint) * newWidth / currentRect.width
             + details.focalPoint
             + Offset(dx, dy);
@@ -307,51 +346,34 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _onScaleEnd(ScaleEndDetails details) async {
-    final active = _active;
+  Future<void> _onScaleEnd(ScaleEndDetails details, BuildContext context) async {
+    // Prefer _active (current commit), fall back to _lastActive (last commit
+    // within this lifetime — covers cases where re-resolution after a pointer
+    // change didn't commit a new gesture before all fingers lifted).
+    final active = _active ?? _lastActive;
     if (active == null) return;
 
-    final g = active.gesture;
-    final velocity = details.velocity.pixelsPerSecond;
-    final currentRect = _rect.value;
-    final displayRect = _display.rect;
-
-    final xRelease = releaseFromStateX(
-      currentRect: currentRect,
-      displayRect: displayRect,
-      bounds: g.bounds,
-      velocity: velocity.dx,
+    final data = ReleaseContext(
+      currentRect: _rect.value,
+      displayRect: _display.rect,
+      aspectRatio: _aspectRatio,
+      velocity: details.velocity,
+      scaleVelocity: details.scaleVelocity,
+      gesture: active.gesture,
     );
-    final yRelease = releaseFromStateY(
-      currentRect: currentRect,
-      displayRect: displayRect,
-      bounds: g.bounds,
-      velocity: velocity.dy,
-    );
-    final baseWidth = displayRect.baseWidth(_aspectRatio);
-    final scaleRelease = switch (g) {
-      DragGesture _ => const IdleInDisplay(),
-      ScaleGesture s => releaseFromStateScale(
-          width: currentRect.width,
-          baseWidth: baseWidth,
-          shrink: s.shrink,
-          expand: s.expand,
-          velocity: details.scaleVelocity * baseWidth,
-        ),
-    };
 
     _active = null;
+    _lastActive = null;
     _totalDelta = .zero;
-
-    final release = Release(x: xRelease, y: yRelease, scale: scaleRelease);
+    _prevPointerCount = 0;
 
     // Cascade: gesture > displayConfig > stage > package default.
-    final handler = g.onRelease ?? _displayConfig?.onRelease ?? widget.onRelease;
+    final handler = data.gesture.onRelease ?? _displayConfig?.onRelease ?? widget.onRelease;
     if (handler != null) {
-      handler(context, release);
+      handler(context, data);
       return;
     }
-    await Stage.of(context).backToDisplay(release);
+    await Stage.of(context).release(.toDisplay(data));
   }
 
   void _setOrigin(OriginRect v) => _origin = v;
@@ -599,7 +621,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     for (final t in _sends.keys) {
       if (t == tag) continue;
       final state = _tagStates[t];
-      if (state == .sending || state == .parked) {
+      if (state case .sending || .parked) {
         _setTagState(t, .returning);
       }
     }
@@ -607,7 +629,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _setTagState(tag, .sending);
   }
 
-  void _release(Object tag) {
+  void _releaseSend(Object tag) {
     _sends.remove(tag);
     _clearTagState(tag);
   }
@@ -675,7 +697,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       animateToBase: animateToBase,
       dismiss: dismiss,
       displace: _displace,
-      release: _release,
+      releaseSend: _releaseSend,
       runEffect: runEffect,
       register: _register,
       unregister: _unregister,
@@ -711,7 +733,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                       ..scale = _effectiveScale
                       ..onStart = _onScaleStart
                       ..onUpdate = _onScaleUpdate
-                      ..onEnd = _onScaleEnd,
+                      ..onEnd = (details) => _onScaleEnd(details, context),
                   ),
               },
             );
@@ -767,7 +789,7 @@ class StageData extends InheritedModel<Object> {
     required this.animateToBase,
     required this.dismiss,
     required this.displace,
-    required this.release,
+    required this.releaseSend,
     required this.runEffect,
     required this.register,
     required this.unregister,
@@ -823,7 +845,7 @@ class StageData extends InheritedModel<Object> {
   final Future<void> Function() animateToBase;
   final Future<void> Function({Object? tag, Object? except}) dismiss;
   final void Function(Object tag, {required Object target, bool park}) displace;
-  final void Function(Object tag) release;
+  final void Function(Object tag) releaseSend;
   final Future<void> Function({
     double? rotateX,
     double? rotateY,
@@ -840,44 +862,67 @@ class StageData extends InheritedModel<Object> {
   final Future<void> Function(Object tag) openEntry;
   final Future<void> Function(Object tag, Rect Function(Rect), {VoidCallback? onEnd}) sendEntry;
 
-  // ─── Release helpers ──────────────────────────────────────────────────────
-  // Default reactions to a [Release]. Consumers call these from [Gesture.onRelease].
+  Future<void> release(Release plan) {
+    // Sync all tweens to the current rect so non-animating axes don't pull
+    // stale tween values when _updateRect fires on the first tick.
+    setRect(rect.value);
+    return Future.wait([
+      _runAxis(plan.x, animateCenterX),
+      _runAxis(plan.y, animateCenterY),
+      _runAxis(plan.scale, animateWidth),
+    ]);
+  }
 
-  /// Runs the full per-axis trajectory (decay + rubber) back to the displayed
-  /// (base) rect. Stage's default when [Gesture.onRelease] is null.
-  Future<void> backToDisplay(Release plan) => Future.wait([
-        runHorizontalRelease(plan.x, animateCenterX),
-        runVerticalRelease(plan.y, animateCenterY),
-        runScaleRelease(plan.scale, animateWidth),
-      ]);
+  Future<void> run({
+    List<AxisFling>? x,
+    List<AxisFling>? y,
+    List<AxisFling>? scale,
+  }) {
+    setRect(rect.value);
+    return Future.wait([
+      if (x != null) _runFlings(x, animateCenterX),
+      if (y != null) _runFlings(y, animateCenterY),
+      if (scale != null) _runFlings(scale, animateWidth),
+    ]);
+  }
 
-  /// Snaps directly to the base rect (no physics).
   Future<void> backToBase() =>
       animateRect(to: display.rect.baseRect(aspectRatio), curve: Curves.easeOut);
 
-  /// Runs the decay phases (without rubber), then dismisses to origin —
-  /// fling-aware dismiss. Origin's default when [Gesture.onRelease] is null.
-  Future<void> backToOrigin(Release plan, {Object? except}) async {
-    await Future.wait([
-      runHorizontalRelease(plan.x, animateCenterX, includeRubber: false),
-      runVerticalRelease(plan.y, animateCenterY, includeRubber: false),
-      runScaleRelease(plan.scale, animateWidth, includeRubber: false),
-    ]);
+  Future<void> backToOrigin(ReleaseContext data, {Object? except}) async {
+    await release(Release.toHalt(data));
     await dismiss(except: except);
   }
 
-  /// Runs a custom mix. Each non-null axis runs the provided plan; null axes
-  /// are skipped. Pass [Release.x] / [y] / [scale] to use the package's plan.
-  Future<void> run({
-    HorizontalRelease? x,
-    VerticalRelease? y,
-    ScaleRelease? scale,
-  }) =>
-      Future.wait([
-        if (x != null) runHorizontalRelease(x, animateCenterX),
-        if (y != null) runVerticalRelease(y, animateCenterY),
-        if (scale != null) runScaleRelease(scale, animateWidth),
-      ]);
+  Future<void> _runAxis(
+    AxisRelease axis,
+    Future<void> Function({
+      required double to,
+      Duration? duration,
+      Curve curve,
+    }) animate,
+  ) async {
+    for (final f in axis.decay) {
+      await animate(to: f.to, duration: f.duration, curve: f.curve);
+    }
+    final s = axis.settle;
+    if (s != null) {
+      await animate(to: s.to, duration: s.duration, curve: s.curve);
+    }
+  }
+
+  Future<void> _runFlings(
+    List<AxisFling> flings,
+    Future<void> Function({
+      required double to,
+      Duration? duration,
+      Curve curve,
+    }) animate,
+  ) async {
+    for (final f in flings) {
+      await animate(to: f.to, duration: f.duration, curve: f.curve);
+    }
+  }
 
   @override
   bool updateShouldNotify(StageData oldWidget) => true;

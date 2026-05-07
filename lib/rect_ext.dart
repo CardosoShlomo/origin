@@ -27,6 +27,30 @@ extension RectExt on Rect {
     return Rect.fromCenter(center: center, width: width, height: height);
   }
 
+  /// Computes the "viewport-correct" end rect for a release-while-displayed.
+  /// Mirrors the imagineai `interactionEndRect`:
+  /// - Zoomed (scale > 1.02) past [maxScale]: clamp scale to maxScale,
+  ///   adjust center proportionally so the same scene stays centered, then
+  ///   shift to fit inside [displayRect].
+  /// - Zoomed within [maxScale]: shift to fit inside [displayRect] (covers
+  ///   display when rect is bigger than display).
+  /// - Not zoomed: return [baseRect] (snap to base).
+  Rect viewportEndRect(Rect baseRect, Rect displayRect, {double? maxScale}) {
+    final scale = width / baseRect.width;
+    if (scale <= 1.02) return baseRect;
+    Rect target = this;
+    if (maxScale != null && scale > maxScale) {
+      final ratio = (baseRect.width * maxScale) / width;
+      final newCenter =
+          (center - displayRect.center) * ratio + displayRect.center;
+      target = resizeOnCenter(
+        baseRect.width * maxScale,
+        baseRect.height * maxScale,
+      ).copyWithCenter(newCenter);
+    }
+    return target.shiftXToFitInside(displayRect).shiftYToFitInside(displayRect);
+  }
+
   /// [force] represents the fraction of which we want to force the rect towards the container
   /// when force is equal to one, then the returned rect will be inside the container
   Rect shiftXToFitInside(Rect container, {double force = 1}) {

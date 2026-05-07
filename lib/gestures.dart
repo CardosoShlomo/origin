@@ -98,12 +98,24 @@ class DecelerateConfig {
     this.extendingPastDisplay,
     this.retracting,
     this.retractingPastDisplay,
+    this.settle,
   });
 
   final Friction? extending;
   final Friction? extendingPastDisplay;
   final Friction? retracting;
   final Friction? retractingPastDisplay;
+
+  /// Drives the rubber-back / settle animation that runs after a decay
+  /// phase ends. Both fields are used:
+  /// - [Friction.start] = drag coefficient for the synthesized friction
+  ///   simulation that determines the settle's duration based on the
+  ///   rubber-back distance (lower = more drag = shorter settle).
+  /// - [Friction.curve] = animation curve for the settle.
+  ///
+  /// [Friction.end] is unused (settle isn't a start→end interpolation).
+  /// Defaults when null: drag 0.135 (iOS-like), curve [Curves.easeOut].
+  final Friction? settle;
 }
 
 /// Shared base for bound configurations.
@@ -215,9 +227,10 @@ sealed class Gesture {
   final GestureConstraints? constraints;
   final StageBuilder? builder;
 
-  /// Called when the gesture ends with the package's computed [Release] —
-  /// per-axis trajectory plans. Consumer calls [StageData.backToDisplay] /
-  /// [StageData.backToOrigin] / etc. via `Stage.of(context)` to react.
+  /// Called when the gesture ends with a [ReleaseContext] — raw end-state
+  /// inputs. Consumer calls `Stage.of(context).release(Release.toDisplay(data))`
+  /// for the default plan, or builds a custom plan and calls `.run(...)` /
+  /// `.backToOrigin(data)` / etc.
   ///
   /// Cascade fallback when null: [DisplayConfig.onRelease] →
   /// [Origin.onRelease] / [Stage.onRelease] → package default.
@@ -230,14 +243,15 @@ class DragGesture extends Gesture {
     super.constraints,
     super.builder,
     super.onRelease,
-    this.scaleResponse,
+    this.override,
   });
 
-  /// Gesture-level scale-coupling fallback. Applied to any active bound that
-  /// doesn't define its own [DragBounds.scaleResponse]. When set (here or on
-  /// any active bound), the drag switches to focal-point-preserving anchor
-  /// math instead of plain translation.
-  final ScaleResponse? scaleResponse;
+  /// Optional resolver invoked at gesture commit. Receives the rect at gesture
+  /// start and the base rect; returns the [DragGesture] to actually use for
+  /// the rest of the gesture (or null to keep this one). Lets consumers pick
+  /// a different variant based on starting rect state — e.g., shrink-on-drag
+  /// only when starting at base; plain translation otherwise.
+  final DragGesture? Function(Rect startRect, Rect baseRect)? override;
 }
 
 class ScaleGesture extends Gesture {
