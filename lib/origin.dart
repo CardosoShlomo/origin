@@ -241,7 +241,7 @@ class _OriginState extends State<Origin> {
     // While Stage's hybrid merger owns the rect, Origin stops manipulating
     // it directly — pointer positions are still being forwarded via the
     // recognizer's `onPointersChanged` so Stage has live data.
-    if (_stage.isHybridDriving) return;
+    if (_stage.isHybridDriving()) return;
 
     switch (_active?.gesture) {
       case null: {
@@ -435,6 +435,22 @@ class _OriginState extends State<Origin> {
     final active = _active;
     if (active == null) return;
 
+    _active = null;
+    _totalDelta = .zero;
+    _stopSwapListening();
+    // Origin's pointers are gone — push empty so Stage's merger sees it.
+    _stage.setOriginPointers(const {});
+
+    // If Stage still has pointers, the gesture continues there. Defer the
+    // release — Stage's onScaleEnd will fire it when the last stage pointer
+    // leaves. Leave _originGesture set so Stage can use it.
+    if (_stage.stagePointerCount() > 0) return;
+
+    // Stage has no pointers either. If a previous release path already fired
+    // (clearing _originGesture), skip — this happens on simultaneous lift
+    // when Stage's onScaleEnd ran first.
+    if (_stage.originGesture() == null) return;
+
     final data = ReleaseContext(
       currentRect: _stage.rect.value,
       displayRect: _stage.display.rect,
@@ -443,11 +459,7 @@ class _OriginState extends State<Origin> {
       scaleVelocity: details.scaleVelocity,
       gesture: active.gesture,
     );
-
-    _active = null;
-    _totalDelta = .zero;
     _stage.setOriginGesture(null);
-    _stopSwapListening();
 
     // Cascade: gesture > origin > stage > package default.
     final handler = data.gesture.onRelease ?? widget.onRelease ?? _stage.onRelease;
@@ -553,7 +565,7 @@ class _OriginState extends State<Origin> {
                 // driving the rect via the hybrid merger. Initial positions
                 // are pushed at commit time (see [_onScaleUpdate]).
                 r.onPointersChanged = () {
-                  if (_active != null && _stage.isHybridDriving) {
+                  if (_active != null && _stage.isHybridDriving()) {
                     _stage.setOriginPointers(r.pointerPositions);
                   }
                 };

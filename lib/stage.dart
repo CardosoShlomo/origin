@@ -360,14 +360,51 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   Future<void> _onScaleEnd(ScaleEndDetails details, BuildContext context) async {
-    // Hybrid: stage's pointers are gone but origin may still be tracking.
-    // Origin's onScaleEnd will handle the release when its pointers leave.
-    // Stage just lets the merger reset itself via the next pointer-empty
-    // change.
-    if (_isHybridDriving) return;
-    // Prefer _active (current commit), fall back to _lastActive (last commit
-    // within this lifetime — covers cases where re-resolution after a pointer
-    // change didn't commit a new gesture before all fingers lifted).
+    // If origin is still gesturing (its recognizer has pointers), defer —
+    // origin's onScaleEnd will fire the release when its last pointer leaves.
+    if (_originPointers.isNotEmpty) {
+      _active = null;
+      _lastActive = null;
+      _totalDelta = .zero;
+      _prevPointerCount = 0;
+      return;
+    }
+
+    // Hybrid release path: origin's pointers are also gone (or the gesture
+    // was hybrid-driven). Fire release using stage's velocity, drawing the
+    // gesture from the stored origin gesture.
+    final og = _originGesture;
+    if (og != null) {
+      final data = ReleaseContext(
+        currentRect: _rect.value,
+        displayRect: _display.rect,
+        aspectRatio: _aspectRatio,
+        velocity: details.velocity,
+        scaleVelocity: details.scaleVelocity,
+        gesture: og.active.gesture,
+      );
+      _setOriginGesture(null);
+      _resetHybridMerger();
+      _active = null;
+      _lastActive = null;
+      _totalDelta = .zero;
+      _prevPointerCount = 0;
+
+      final handler = data.gesture.onRelease
+          ?? _displayConfig?.onRelease
+          ?? widget.onRelease;
+      if (handler != null) {
+        handler(context, data);
+        return;
+      }
+      await Stage.of(context).release(.toDisplay(data));
+      return;
+    }
+
+    // Non-hybrid: prefer _active (current commit), fall back to _lastActive
+    // (last commit within this lifetime — covers cases where re-resolution
+    // after a pointer change didn't commit a new gesture before all fingers
+    // lifted).
     final active = _active ?? _lastActive;
     if (active == null) return;
 
@@ -422,11 +459,12 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   // used to read its [pointerPositions] for the hybrid merger.
   StageScaleRecognizer? _stageRecognizer;
 
-  // Hybrid merger state — captured at first hybrid update, used as the
-  // reference frame for all subsequent merged updates within this lifetime.
+  // Hybrid merger state — captured at first hybrid update or when pointer
+  // count changes. Used as the reference frame for subsequent merged updates.
   Offset? _hybridStartFocal;
   double? _hybridStartSpread;
   Rect? _hybridStartRect;
+  int _hybridLastCount = 0;
   // True while Stage's hybrid merger is driving the rect — Origin reads this
   // and silences its own rect manipulation when set.
   bool _isHybridDriving = false;
@@ -440,6 +478,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _hybridStartFocal = null;
     _hybridStartSpread = null;
     _hybridStartRect = null;
+    _hybridLastCount = 0;
     _setIsHybridDriving(false);
   }
 
@@ -462,6 +501,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   /// forwards via [_setOriginPointers]; stage's own via the recognizer's
   /// `onPointersChanged`). Combines both pointer sets into a unified focal /
   /// spread / scale, and drives the rect from a captured reference frame.
+  /// Re-baselines the reference frame whenever the pointer count changes so
+  /// drop-to-1 / re-add transitions stay smooth.
   void _onHybridPointersChanged() {
     final og = _originGesture;
     if (og == null) {
@@ -476,7 +517,9 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     final stagePointers = _stageRecognizer?.pointerPositions ?? const {};
     final all = {..._originPointers, ...stagePointers};
-    if (all.isEmpty) {
+    if (all.isEmpty || stagePointers.isEmpty) {
+      // No stage pointers ⇒ exit hybrid; Origin resumes local manipulation
+      // (or, if Origin's pointers also gone, the gesture is fully over).
       _resetHybridMerger();
       return;
     }
@@ -484,10 +527,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     final focal = _meanOffset(all.values);
     final spread = _meanDistance(all.values, focal);
 
-    if (_hybridStartFocal == null) {
+    // First activation OR pointer count change ⇒ re-baseline the merger
+    // reference frame to the current rect/focal/spread.
+    if (_hybridStartFocal == null || all.length != _hybridLastCount) {
       _hybridStartFocal = focal;
       _hybridStartSpread = spread;
       _hybridStartRect = _rect.value;
+      _hybridLastCount = all.length;
       _setIsHybridDriving(true);
       return;
     }
@@ -495,9 +541,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     final delta = focal - _hybridStartFocal!;
     final start = _hybridStartRect!;
     final newCenter = start.center + delta;
-    final scale = (hybrid.drag == DragHybrid.asDrag)
+    final scale = (hybrid.drag == DragHybrid.asDrag ||
+            all.length < 2 ||
+            _hybridStartSpread! <= 0)
         ? 1.0
-        : (_hybridStartSpread! > 0 ? spread / _hybridStartSpread! : 1.0);
+        : spread / _hybridStartSpread!;
     final newWidth = start.width * scale;
     _rect.value = Rect.fromCenter(
       center: newCenter,
@@ -807,10 +855,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       overrides: widget.overrides,
       dragHybridFromStage: widget.dragHybridFromStage,
       scaleHybridFromStage: widget.scaleHybridFromStage,
-      originGesture: _originGesture,
+      originGesture: () => _originGesture,
       setOriginGesture: _setOriginGesture,
       setOriginPointers: _setOriginPointers,
-      isHybridDriving: _isHybridDriving,
+      isHybridDriving: () => _isHybridDriving,
+      stagePointerCount: () => _stageRecognizer?.pointerPositions.length ?? 0,
       onEnd: _onEnd,
       tag: _tag,
       locked: _locked,
@@ -919,6 +968,7 @@ class StageData extends InheritedModel<Object> {
     required this.setOriginGesture,
     required this.setOriginPointers,
     required this.isHybridDriving,
+    required this.stagePointerCount,
     required this.onEnd,
     required this.tag,
     required this.locked,
@@ -979,12 +1029,15 @@ class StageData extends InheritedModel<Object> {
   final DragHybrid? dragHybridFromStage;
   final ScaleHybrid? scaleHybridFromStage;
 
-  /// Currently-in-flight Origin gesture (drag or scale on an un-displayed
-  /// item), with its hybrid mode partially resolved up to Origin's level.
-  /// Stage uses this to decide what to do with new pointers landing in
-  /// stage-area regions while the Origin is gesturing. Null when no Origin
-  /// is gesturing.
-  final OriginGesture? originGesture;
+  /// Live reader: currently-in-flight Origin gesture (drag or scale on an
+  /// un-displayed item), with its hybrid mode partially resolved up to
+  /// Origin's level. Stage uses this to decide what to do with new pointers
+  /// landing in stage-area regions while the Origin is gesturing. Null when
+  /// no Origin is gesturing.
+  ///
+  /// Exposed as a function (not a value) so callers reading it from a cached
+  /// [StageData] reference still see the latest state.
+  final OriginGesture? Function() originGesture;
   final ValueSetter<OriginGesture?> setOriginGesture;
 
   /// Origin forwards its recognizer's [pointerPositions] here whenever they
@@ -992,9 +1045,14 @@ class StageData extends InheritedModel<Object> {
   /// hybrid gesture math.
   final ValueSetter<Map<int, Offset>> setOriginPointers;
 
-  /// True while Stage's hybrid merger is driving the rect. Origin reads this
-  /// to silence its own rect manipulation while Stage is in control.
-  final bool isHybridDriving;
+  /// Live reader: true while Stage's hybrid merger is driving the rect.
+  /// Origin reads this to silence its own rect manipulation while Stage is
+  /// in control.
+  final bool Function() isHybridDriving;
+
+  /// Live reader: count of stage's recognizer pointers. Origin reads this to
+  /// decide whether to defer release until stage's pointers also leave.
+  final int Function() stagePointerCount;
 
   final FutureOr<void> Function()? onEnd;
   final Object? tag;
