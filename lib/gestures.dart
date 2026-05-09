@@ -34,6 +34,17 @@ sealed class GestureStart {}
 /// A committed gesture: the matched key (start) and value (gesture).
 typedef ActiveGesture = ({GestureStart start, Gesture gesture});
 
+/// An Origin-level gesture currently in flight, surfaced to [StageData] so
+/// Stage can decide what to do with new pointers (see [DragHybrid] /
+/// [ScaleHybrid]). The hybrid fields are *partially-resolved* — Origin
+/// folds in gesture-level + Origin-level, Stage finishes with its own
+/// fallback and the package default.
+typedef OriginGesture = ({
+  ActiveGesture active,
+  DragHybrid? dragHybrid,
+  ScaleHybrid? scaleHybrid,
+});
+
 enum DragStart implements GestureStart {
   left, right, up, down,
   upLeft, upRight, downLeft, downRight,
@@ -237,6 +248,30 @@ sealed class Gesture {
   final OnRelease? onRelease;
 }
 
+/// How a Stage receives pointer additions while an Origin is dragging.
+/// Cascade: per-gesture > per-Origin > per-Stage > [lock] default.
+enum DragHybrid {
+  /// Stage pointers are ignored — Origin's drag stays sole controller.
+  lock,
+  /// Stage pointers join the drag, contributing to the focal x/y. Origin's
+  /// drag config (bounds, friction, override) continues to apply. No scale
+  /// math, even with multiple pointers.
+  asDrag,
+  /// Stage pointers promote drag → scale via Origin's `scale` map. Resolver
+  /// re-runs against that map with the new pointer count to pick the
+  /// matching [ScaleStart].
+  asScale,
+}
+
+/// How a Stage receives pointer additions while an Origin is scaling.
+/// Cascade: per-gesture > per-Origin > per-Stage > [lock] default.
+enum ScaleHybrid {
+  /// Stage pointers are ignored.
+  lock,
+  /// Stage pointers merge into Origin's scale; Origin's scale config applies.
+  merge,
+}
+
 class DragGesture extends Gesture {
   const DragGesture({
     super.bounds,
@@ -244,6 +279,7 @@ class DragGesture extends Gesture {
     super.builder,
     super.onRelease,
     this.override,
+    this.hybridFromStage,
   });
 
   /// Optional resolver invoked at gesture commit. Receives the rect at gesture
@@ -252,6 +288,11 @@ class DragGesture extends Gesture {
   /// a different variant based on starting rect state — e.g., shrink-on-drag
   /// only when starting at base; plain translation otherwise.
   final DragGesture? Function(Rect startRect, Rect baseRect)? override;
+
+  /// Per-gesture override for how Stage receives new pointers while this
+  /// drag is active. Cascades up to [Origin.dragHybridFromStage] →
+  /// [Stage.dragHybridFromStage] → [DragHybrid.lock] when null.
+  final DragHybrid? hybridFromStage;
 }
 
 class ScaleGesture extends Gesture {
@@ -262,6 +303,7 @@ class ScaleGesture extends Gesture {
     super.onRelease,
     this.shrink,
     this.expand,
+    this.hybridFromStage,
   });
 
   /// Shrink-axis bound config (with optional minScale threshold).
@@ -269,6 +311,11 @@ class ScaleGesture extends Gesture {
 
   /// Expand-axis bound config (with optional maxScale threshold).
   final ExpandBounds? expand;
+
+  /// Per-gesture override for how Stage receives new pointers while this
+  /// scale is active. Cascades up to [Origin.scaleHybridFromStage] →
+  /// [Stage.scaleHybridFromStage] → [ScaleHybrid.lock] when null.
+  final ScaleHybrid? hybridFromStage;
 }
 
 class GestureConstraints {

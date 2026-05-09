@@ -48,6 +48,8 @@ class Stage extends StatefulWidget {
     this.constraints,
     this.onRelease,
     this.overrides,
+    this.dragHybridFromStage,
+    this.scaleHybridFromStage,
   });
 
   final Widget child;
@@ -70,6 +72,13 @@ class Stage extends StatefulWidget {
   /// Resolved last in the per-field overrides cascade (gesture-context-
   /// specific levels first, Stage as final fallback).
   final Overrides? overrides;
+
+  /// Stage-level cascade fallback for how new pointers are handled during
+  /// an active gesture (see [DragGesture.hybridFromStage] /
+  /// [ScaleGesture.hybridFromStage]). Final fallback before
+  /// [DragHybrid.lock] / [ScaleHybrid.lock].
+  final DragHybrid? dragHybridFromStage;
+  final ScaleHybrid? scaleHybridFromStage;
 
   static StageData of(BuildContext context) {
     return context.dependOnInheritedWidgetOfExactType<StageData>()!;
@@ -388,6 +397,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   void _setTag(Object? tag) => setState(() => _tag = tag);
   void _setWidget(Widget? v) => setState(() => _widget = v);
   void _setLocked(bool v) => setState(() => _locked = v);
+  OriginGesture? _originGesture;
+  void _setOriginGesture(OriginGesture? v) => setState(() => _originGesture = v);
   void _setDismissing(bool v) {
     if (v && !_dismissing) {
       _dismissStartContainer = _container.value?.rect;
@@ -670,6 +681,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       gestureBuilder: _gestureBuilder,
       onRelease: widget.onRelease,
       overrides: widget.overrides,
+      dragHybridFromStage: widget.dragHybridFromStage,
+      scaleHybridFromStage: widget.scaleHybridFromStage,
+      originGesture: _originGesture,
+      setOriginGesture: _setOriginGesture,
       onEnd: _onEnd,
       tag: _tag,
       locked: _locked,
@@ -762,6 +777,10 @@ class StageData extends InheritedModel<Object> {
     required this.gestureBuilder,
     required this.onRelease,
     required this.overrides,
+    required this.dragHybridFromStage,
+    required this.scaleHybridFromStage,
+    required this.originGesture,
+    required this.setOriginGesture,
     required this.onEnd,
     required this.tag,
     required this.locked,
@@ -816,6 +835,20 @@ class StageData extends InheritedModel<Object> {
   final StageBuilder? gestureBuilder;
   final OnRelease? onRelease;
   final Overrides? overrides;
+
+  /// Stage-level cascade fallback for hybrid pointer routing. Resolved last
+  /// before [DragHybrid.lock] / [ScaleHybrid.lock].
+  final DragHybrid? dragHybridFromStage;
+  final ScaleHybrid? scaleHybridFromStage;
+
+  /// Currently-in-flight Origin gesture (drag or scale on an un-displayed
+  /// item), with its hybrid mode partially resolved up to Origin's level.
+  /// Stage uses this to decide what to do with new pointers landing in
+  /// stage-area regions while the Origin is gesturing. Null when no Origin
+  /// is gesturing.
+  final OriginGesture? originGesture;
+  final ValueSetter<OriginGesture?> setOriginGesture;
+
   final FutureOr<void> Function()? onEnd;
   final Object? tag;
   final bool locked;

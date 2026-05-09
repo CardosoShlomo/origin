@@ -180,19 +180,25 @@ class Release {
       scaleTargetWidth,
       scaleTargetWidth / data.aspectRatio,
     );
+    // Damp translation velocity by how scale-y the gesture was at end —
+    // a strong pinch means the residual finger drift on the focal point
+    // shouldn't translate into a pan fling. Linear cutoff at scaleVel=1.
+    final translationFactor =
+        (1.0 - data.scaleVelocity.abs()).clamp(0.0, 1.0);
+    final dampedVelocity = data.velocity.pixelsPerSecond * translationFactor;
     return Release(
       x: releaseFromStateX(
         currentRect: data.currentRect,
         displayRect: data.displayRect,
         bounds: data.gesture.bounds,
-        velocity: data.velocity.pixelsPerSecond.dx,
+        velocity: dampedVelocity.dx,
         projectedRect: projectedRect,
       ),
       y: releaseFromStateY(
         currentRect: data.currentRect,
         displayRect: data.displayRect,
         bounds: data.gesture.bounds,
-        velocity: data.velocity.pixelsPerSecond.dy,
+        velocity: dampedVelocity.dy,
         projectedRect: projectedRect,
       ),
       scale: scaleRelease,

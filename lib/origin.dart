@@ -46,6 +46,8 @@ class Origin extends StatefulWidget {
     this.swapTags,
     this.onSwap,
     this.builder,
+    this.dragHybridFromStage,
+    this.scaleHybridFromStage,
     required this.child,
   });
 
@@ -68,6 +70,16 @@ class Origin extends StatefulWidget {
   final Set<Object>? swapTags;
   final ValueSetter<Object>? onSwap;
   final StageBuilder? builder;
+
+  /// Origin-level cascade fallback for how new pointers are handled during
+  /// an active gesture on this Origin (see [DragGesture.hybridFromStage] /
+  /// [ScaleGesture.hybridFromStage] for per-gesture overrides). Resolved
+  /// after the per-gesture field, before [Stage.dragHybridFromStage] /
+  /// [Stage.scaleHybridFromStage] and the [DragHybrid.lock] / [ScaleHybrid.lock]
+  /// package default.
+  final DragHybrid? dragHybridFromStage;
+  final ScaleHybrid? scaleHybridFromStage;
+
   final Widget child;
 
   bool get _isItem =>
@@ -247,6 +259,10 @@ class _OriginState extends State<Origin> {
           }
         }
 
+        // Surface the committed gesture to Stage with hybrid resolved up
+        // to Origin's level — Stage finishes the cascade for new pointers.
+        _stage.setOriginGesture(_toOriginGesture(active));
+
         final builder = active.gesture.builder;
         if (builder != null) data.setGestureBuilder(builder);
         _startRect = data.rect.value;
@@ -378,6 +394,23 @@ class _OriginState extends State<Origin> {
     return resolveScaleArena(scale: details.scale, registered: map);
   }
 
+  /// Builds an [OriginGesture] for [_active] with hybrid mode resolved
+  /// through gesture-level → Origin-level. Stage finishes the cascade.
+  OriginGesture _toOriginGesture(ActiveGesture active) {
+    return switch (active.gesture) {
+      DragGesture g => (
+          active: active,
+          dragHybrid: g.hybridFromStage ?? widget.dragHybridFromStage,
+          scaleHybrid: null,
+        ),
+      ScaleGesture g => (
+          active: active,
+          dragHybrid: null,
+          scaleHybrid: g.hybridFromStage ?? widget.scaleHybridFromStage,
+        ),
+    };
+  }
+
   /// Resolves the active drag gesture from [Origin.drag].
   ActiveGesture? _resolveDragArena() {
     final map = widget.drag;
@@ -400,6 +433,7 @@ class _OriginState extends State<Origin> {
 
     _active = null;
     _totalDelta = .zero;
+    _stage.setOriginGesture(null);
     _stopSwapListening();
 
     // Cascade: gesture > origin > stage > package default.
