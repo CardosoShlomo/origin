@@ -217,6 +217,9 @@ class _OriginState extends State<Origin> {
 
   /// Single active-gesture slot. Null = uncommitted.
   ActiveGesture? _active;
+  /// Reference to the active recognizer (set by the factory builder).
+  /// Used to push pointer positions to Stage at hybrid takeover.
+  StageScaleRecognizer? _recognizer;
   Rect _startRect = .zero;
   Offset _startFocalPoint = .zero;
   Offset _totalDelta = .zero;
@@ -234,6 +237,11 @@ class _OriginState extends State<Origin> {
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
     _totalDelta += details.focalPointDelta;
+
+    // While Stage's hybrid merger owns the rect, Origin stops manipulating
+    // it directly — pointer positions are still being forwarded via the
+    // recognizer's `onPointersChanged` so Stage has live data.
+    if (_stage.isHybridDriving) return;
 
     switch (_active?.gesture) {
       case null: {
@@ -261,7 +269,12 @@ class _OriginState extends State<Origin> {
 
         // Surface the committed gesture to Stage with hybrid resolved up
         // to Origin's level — Stage finishes the cascade for new pointers.
+        // Also push current pointer positions so Stage's merger has data
+        // available the instant a Stage-area pointer triggers takeover.
         _stage.setOriginGesture(_toOriginGesture(active));
+        if (_recognizer != null) {
+          _stage.setOriginPointers(_recognizer!.pointerPositions);
+        }
 
         final builder = active.gesture.builder;
         if (builder != null) data.setGestureBuilder(builder);
@@ -529,17 +542,22 @@ class _OriginState extends State<Origin> {
           if (hasGestures)
             StageScaleRecognizer: GestureRecognizerFactoryWithHandlers<StageScaleRecognizer>(
               StageScaleRecognizer.new,
-              (r) => r
-                ..drag = widget.drag
-                ..scale = widget.scale
-                ..onStart = _onScaleStart
-                ..onUpdate = _onScaleUpdate
-                ..onEnd = _onScaleEnd
-                ..onPointersChanged = () {
-                  // Forward live positions to Stage; Stage merges with its
-                  // own pointers when the Origin's gesture is hybrid.
-                  if (_active != null) _stage.setOriginPointers(r.pointerPositions);
-                },
+              (r) {
+                _recognizer = r;
+                r.drag = widget.drag;
+                r.scale = widget.scale;
+                r.onStart = _onScaleStart;
+                r.onUpdate = _onScaleUpdate;
+                r.onEnd = _onScaleEnd;
+                // Forward live positions to Stage only while it's actively
+                // driving the rect via the hybrid merger. Initial positions
+                // are pushed at commit time (see [_onScaleUpdate]).
+                r.onPointersChanged = () {
+                  if (_active != null && _stage.isHybridDriving) {
+                    _stage.setOriginPointers(r.pointerPositions);
+                  }
+                };
+              },
             ),
         },
         child: Stage.isTagOf(context, widget.tag)
