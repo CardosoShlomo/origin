@@ -398,7 +398,112 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   void _setWidget(Widget? v) => setState(() => _widget = v);
   void _setLocked(bool v) => setState(() => _locked = v);
   OriginGesture? _originGesture;
-  void _setOriginGesture(OriginGesture? v) => setState(() => _originGesture = v);
+  void _setOriginGesture(OriginGesture? v) {
+    setState(() => _originGesture = v);
+    if (v == null) _originPointers = const {};
+  }
+  // Pointer positions forwarded from the active Origin's recognizer. Combined
+  // with stage's own recognizer's positions to drive hybrid gesture math.
+  Map<int, Offset> _originPointers = const {};
+  void _setOriginPointers(Map<int, Offset> v) {
+    _originPointers = Map.of(v);
+    _onHybridPointersChanged();
+  }
+  // Reference to stage's own recognizer (set when [active] is true in build),
+  // used to read its [pointerPositions] for the hybrid merger.
+  StageScaleRecognizer? _stageRecognizer;
+
+  // Hybrid merger state — captured at first hybrid update, used as the
+  // reference frame for all subsequent merged updates within this lifetime.
+  Offset? _hybridStartFocal;
+  double? _hybridStartSpread;
+  Rect? _hybridStartRect;
+
+  void _resetHybridMerger() {
+    _hybridStartFocal = null;
+    _hybridStartSpread = null;
+    _hybridStartRect = null;
+  }
+
+  /// Resolves the active-gesture-type hybrid mode through Origin → Stage →
+  /// package-default cascade. Returns null if locked / no hybrid intent.
+  ({DragHybrid? drag, ScaleHybrid? scale})? _resolveHybrid(OriginGesture og) {
+    return switch (og.active.gesture) {
+      DragGesture _ => () {
+          final h = og.dragHybrid ?? widget.dragHybridFromStage ?? DragHybrid.lock;
+          return h == DragHybrid.lock ? null : (drag: h, scale: null);
+        }(),
+      ScaleGesture _ => () {
+          final h = og.scaleHybrid ?? widget.scaleHybridFromStage ?? ScaleHybrid.lock;
+          return h == ScaleHybrid.lock ? null : (drag: null, scale: h);
+        }(),
+    };
+  }
+
+  /// Triggered whenever pointer positions change on either recognizer (origin
+  /// forwards via [_setOriginPointers]; stage's own via the recognizer's
+  /// `onPointersChanged`). Combines both pointer sets into a unified focal /
+  /// spread / scale, and drives the rect from a captured reference frame.
+  void _onHybridPointersChanged() {
+    final og = _originGesture;
+    if (og == null) {
+      _resetHybridMerger();
+      return;
+    }
+    final hybrid = _resolveHybrid(og);
+    if (hybrid == null) {
+      _resetHybridMerger();
+      return;
+    }
+
+    final stagePointers = _stageRecognizer?.pointerPositions ?? const {};
+    final all = {..._originPointers, ...stagePointers};
+    if (all.isEmpty) {
+      _resetHybridMerger();
+      return;
+    }
+
+    final focal = _meanOffset(all.values);
+    final spread = _meanDistance(all.values, focal);
+
+    if (_hybridStartFocal == null) {
+      _hybridStartFocal = focal;
+      _hybridStartSpread = spread;
+      _hybridStartRect = _rect.value;
+      return;
+    }
+
+    final delta = focal - _hybridStartFocal!;
+    final start = _hybridStartRect!;
+    final newCenter = start.center + delta;
+    final scale = (hybrid.drag == DragHybrid.asDrag)
+        ? 1.0
+        : (_hybridStartSpread! > 0 ? spread / _hybridStartSpread! : 1.0);
+    final newWidth = start.width * scale;
+    _rect.value = Rect.fromCenter(
+      center: newCenter,
+      width: newWidth,
+      height: newWidth / _aspectRatio,
+    );
+  }
+
+  static Offset _meanOffset(Iterable<Offset> positions) {
+    if (positions.isEmpty) return .zero;
+    Offset sum = .zero;
+    for (final p in positions) {
+      sum += p;
+    }
+    return sum / positions.length.toDouble();
+  }
+
+  static double _meanDistance(Iterable<Offset> positions, Offset focal) {
+    if (positions.isEmpty) return 0;
+    double sum = 0;
+    for (final p in positions) {
+      sum += (p - focal).distance;
+    }
+    return sum / positions.length;
+  }
   void _setDismissing(bool v) {
     if (v && !_dismissing) {
       _dismissStartContainer = _container.value?.rect;
@@ -685,6 +790,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       scaleHybridFromStage: widget.scaleHybridFromStage,
       originGesture: _originGesture,
       setOriginGesture: _setOriginGesture,
+      setOriginPointers: _setOriginPointers,
       onEnd: _onEnd,
       tag: _tag,
       locked: _locked,
@@ -743,12 +849,15 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                 if (active)
                   StageScaleRecognizer: GestureRecognizerFactoryWithHandlers<StageScaleRecognizer>(
                     StageScaleRecognizer.new,
-                    (r) => r
-                      ..drag = _effectiveDrag
-                      ..scale = _effectiveScale
-                      ..onStart = _onScaleStart
-                      ..onUpdate = _onScaleUpdate
-                      ..onEnd = (details) => _onScaleEnd(details, context),
+                    (r) {
+                      _stageRecognizer = r;
+                      r.drag = _effectiveDrag;
+                      r.scale = _effectiveScale;
+                      r.onStart = _onScaleStart;
+                      r.onUpdate = _onScaleUpdate;
+                      r.onEnd = (details) => _onScaleEnd(details, context);
+                      r.onPointersChanged = _onHybridPointersChanged;
+                    },
                   ),
               },
             );
@@ -781,6 +890,7 @@ class StageData extends InheritedModel<Object> {
     required this.scaleHybridFromStage,
     required this.originGesture,
     required this.setOriginGesture,
+    required this.setOriginPointers,
     required this.onEnd,
     required this.tag,
     required this.locked,
@@ -848,6 +958,11 @@ class StageData extends InheritedModel<Object> {
   /// is gesturing.
   final OriginGesture? originGesture;
   final ValueSetter<OriginGesture?> setOriginGesture;
+
+  /// Origin forwards its recognizer's [pointerPositions] here whenever they
+  /// change. Stage merges with its own recognizer's positions to drive the
+  /// hybrid gesture math.
+  final ValueSetter<Map<int, Offset>> setOriginPointers;
 
   final FutureOr<void> Function()? onEnd;
   final Object? tag;

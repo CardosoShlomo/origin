@@ -35,7 +35,14 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
     _onUpdate?.call(details);
   }
 
-  final trackedPointers = <int>{};
+  /// Current positions per tracked pointer (live state). Updated on pointer
+  /// down/move/up. Exposed for hybrid mergers that combine pointer sets
+  /// across recognizers.
+  final pointerPositions = <int, Offset>{};
+  /// Fires whenever [pointerPositions] changes (pointer added, moved, or
+  /// removed). Receivers can read [pointerPositions] from this recognizer
+  /// to get the latest state.
+  void Function()? onPointersChanged;
   Offset _totalDelta = .zero;
 
   // Sample pairs for end-velocity computation (linear focal-point + scale rate).
@@ -52,7 +59,7 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
 
   @override
   void addAllowedPointer(PointerDownEvent event) {
-    if (trackedPointers.isEmpty) {
+    if (pointerPositions.isEmpty) {
       _totalDelta = .zero;
       _resolved = false;
       _accepted = false;
@@ -60,9 +67,10 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
       _prevFocal = _lastFocal = .zero;
       _prevTime = _lastTime = null;
     }
-    trackedPointers.add(event.pointer);
+    pointerPositions[event.pointer] = event.position;
+    onPointersChanged?.call();
     super.addAllowedPointer(event);
-    if (_hasAny && trackedPointers.length > 1 && !_hasMulti) {
+    if (_hasAny && pointerPositions.length > 1 && !_hasMulti) {
       _resolved = true;
       resolve(.rejected);
     }
@@ -79,16 +87,23 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
 
   @override
   void handleEvent(PointerEvent event) {
-    if (event is PointerMoveEvent) _totalDelta += event.delta;
-    if (event is PointerUpEvent || event is PointerCancelEvent) {
-      trackedPointers.remove(event.pointer);
+    var pointersDirty = false;
+    if (event is PointerMoveEvent) {
+      _totalDelta += event.delta;
+      pointerPositions[event.pointer] = event.position;
+      pointersDirty = true;
     }
+    if (event is PointerUpEvent || event is PointerCancelEvent) {
+      pointerPositions.remove(event.pointer);
+      pointersDirty = true;
+    }
+    if (pointersDirty) onPointersChanged?.call();
     super.handleEvent(event);
-    if (!_resolved && (!_hasAny || trackedPointers.length > 1 || _totalDelta.distance > 4)) {
+    if (!_resolved && (!_hasAny || pointerPositions.length > 1 || _totalDelta.distance > 4)) {
       _resolved = true;
       resolve(.accepted);
     }
-    if (trackedPointers.isEmpty && _accepted) {
+    if (pointerPositions.isEmpty && _accepted) {
       _onEnd?.call(_buildEndDetails());
     }
   }
@@ -108,7 +123,7 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
   @override
   void resolve(GestureDisposition disposition) {
     if (disposition == .accepted && _hasAny) {
-      if (trackedPointers.length <= 1) {
+      if (pointerPositions.length <= 1) {
         if (!_hasSingle) {
           super.resolve(.rejected);
           return;
@@ -125,7 +140,7 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
 
   @override
   void rejectGesture(int pointer) {
-    trackedPointers.remove(pointer);
+    pointerPositions.remove(pointer);
     super.rejectGesture(pointer);
   }
 }

@@ -534,7 +534,12 @@ class _OriginState extends State<Origin> {
                 ..scale = widget.scale
                 ..onStart = _onScaleStart
                 ..onUpdate = _onScaleUpdate
-                ..onEnd = _onScaleEnd,
+                ..onEnd = _onScaleEnd
+                ..onPointersChanged = () {
+                  // Forward live positions to Stage; Stage merges with its
+                  // own pointers when the Origin's gesture is hybrid.
+                  if (_active != null) _stage.setOriginPointers(r.pointerPositions);
+                },
             ),
         },
         child: Stage.isTagOf(context, widget.tag)
