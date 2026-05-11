@@ -4,6 +4,41 @@ import 'gestures.dart';
 import 'physics.dart';
 import 'rect_ext.dart';
 
+/// Partially cancel translation velocity based on scale velocity. Call at
+/// the start of `onScaleEnd` and use the returned details as the gesture's
+/// velocity for the rest of the release pipeline.
+///
+/// Two-stage cancellation: below a small threshold, no cancellation at all
+/// (the pinch was too subtle to count). Past the threshold, a baseline 30%
+/// cancellation kicks in, plus a quadratic growth term in the excess scale
+/// velocity. `k ∈ [0, 1]` scales the whole effect, so `k=0` disables.
+///
+///   amount = k × (0.3 + (|scaleVelocity| − threshold)²)   if past threshold
+///   factor = clamp(1 − amount, 0, 1)
+///
+/// - `k = 0`   → never cancel.
+/// - `k = 0.5, threshold = 0.1`: scaleVel 0.1 → 15%; 0.5 → 23%; 1.0 → 55%.
+/// - `k = 0.8, threshold = 0.1`: scaleVel 0.1 → 24%; 0.5 → 37%; 1.0 → 89%.
+/// - `k = 1.0, threshold = 0.1`: scaleVel 0.1 → 30%; 0.5 → 46%; 1.0 → full.
+extension ScaleEndDetailsCancel on ScaleEndDetails {
+  static const _threshold = 0.1;
+
+  ScaleEndDetails cancelTranslation(double k) {
+    if (k <= 0) return this;
+    final scaleVel = scaleVelocity.abs();
+    if (scaleVel < _threshold) return this;
+    final excess = scaleVel - _threshold;
+    final amount = (k * (0.3 + excess * excess)).clamp(0.0, 1.0);
+    final factor = 1.0 - amount;
+    if (factor == 1.0) return this;
+    return ScaleEndDetails(
+      velocity: Velocity(pixelsPerSecond: velocity.pixelsPerSecond * factor),
+      scaleVelocity: scaleVelocity,
+      pointerCount: pointerCount,
+    );
+  }
+}
+
 /// A computed per-axis fling segment.
 ///
 /// `to`, `duration`, `curve` derive from the same FrictionSimulation —
@@ -182,23 +217,22 @@ class Release {
     );
     // Damp translation velocity by how scale-y the gesture was at end —
     // a strong pinch means the residual finger drift on the focal point
-    // shouldn't translate into a pan fling. Linear cutoff at scaleVel=1.
-    final translationFactor =
-        (1.0 - data.scaleVelocity.abs()).clamp(0.0, 1.0);
-    final dampedVelocity = data.velocity.pixelsPerSecond * translationFactor;
+    // shouldn't translate into a pan fling. `scaleVelocityCancel` (0..1)
+    // tunes the overall strength.
+    //
     return Release(
       x: releaseFromStateX(
         currentRect: data.currentRect,
         displayRect: data.displayRect,
         bounds: data.gesture.bounds,
-        velocity: dampedVelocity.dx,
+        velocity: data.velocity.pixelsPerSecond.dx,
         projectedRect: projectedRect,
       ),
       y: releaseFromStateY(
         currentRect: data.currentRect,
         displayRect: data.displayRect,
         bounds: data.gesture.bounds,
-        velocity: dampedVelocity.dy,
+        velocity: data.velocity.pixelsPerSecond.dy,
         projectedRect: projectedRect,
       ),
       scale: scaleRelease,
@@ -243,6 +277,7 @@ class Release {
         y: y ?? this.y,
         scale: scale ?? this.scale,
       );
+
 
   static ScaleRelease _scaleReleaseFor(ReleaseContext data) {
     final baseWidth = data.displayRect.baseWidth(data.aspectRatio);

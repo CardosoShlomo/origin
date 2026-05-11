@@ -27,6 +27,35 @@ class TapEvent {
   }) runEffect;
 }
 
+/// Signature for a displayed-state double-tap handler.
+///
+/// Distinct from Origin's [onDoubleTap] (which is a [StageTap], mirroring
+/// [onTap]) — this one runs on the displayed view, carries rect info, and
+/// has a package default. Cascade: [DisplayConfig.onDoubleTap] →
+/// [Stage.onDoubleTap] → package default (toggle baseRect ↔ fit-cover-at-focal).
+typedef OnDoubleTap = void Function(BuildContext context, DoubleTapEvent event);
+
+/// Inputs passed to [OnDoubleTap] when the displayed view receives a
+/// double-tap. Carries the tap position plus the current/base/display rects
+/// so handlers can compute a target without re-reading [StageData].
+class DoubleTapEvent {
+  const DoubleTapEvent({
+    required this.localPosition,
+    required this.globalPosition,
+    required this.currentRect,
+    required this.displayRect,
+    required this.baseRect,
+    required this.aspectRatio,
+  });
+
+  final Offset localPosition;
+  final Offset globalPosition;
+  final Rect currentRect;
+  final Rect displayRect;
+  final Rect baseRect;
+  final double aspectRatio;
+}
+
 /// Sealed parent for gesture-start enums. Pattern-match exhaustiveness on
 /// [DragStart] vs [ScaleStart] is guaranteed.
 sealed class GestureStart {}
@@ -39,10 +68,18 @@ typedef ActiveGesture = ({GestureStart start, Gesture gesture});
 /// [ScaleHybrid]). The hybrid fields are *partially-resolved* — Origin
 /// folds in gesture-level + Origin-level, Stage finishes with its own
 /// fallback and the package default.
+///
+/// [scale] carries Origin's scale map so the hybrid merger can re-resolve
+/// drag → scale via the scale arena when [DragHybrid.asScale] is active.
+/// [onRelease] is Origin's own onRelease fallback, used in the cascade
+/// when Stage fires the hybrid release (gesture → Origin → Stage → default).
 typedef OriginGesture = ({
   ActiveGesture active,
   DragHybrid? dragHybrid,
   ScaleHybrid? scaleHybrid,
+  Map<ScaleStart, ScaleGesture>? scale,
+  OnRelease? onRelease,
+  double? scaleVelocityCancel,
 });
 
 enum DragStart implements GestureStart {
@@ -229,6 +266,7 @@ sealed class Gesture {
     this.constraints,
     this.builder,
     this.onRelease,
+    this.scaleVelocityCancel,
   });
 
   /// Directional bounds active during this gesture (drag) or directional
@@ -246,6 +284,13 @@ sealed class Gesture {
   /// Cascade fallback when null: [DisplayConfig.onRelease] →
   /// [Origin.onRelease] / [Stage.onRelease] → package default.
   final OnRelease? onRelease;
+
+  /// Per-gesture strength of scale-velocity-based translation cancellation
+  /// in `[0, 1]`. Cascade fallback when null: [DisplayConfig.scaleVelocityCancel]
+  /// → [Origin.scaleVelocityCancel] → [Stage.scaleVelocityCancel] → 0.5.
+  /// Most relevant on [ScaleGesture]; a no-op on [DragGesture] since
+  /// scaleVelocity is ~0 there.
+  final double? scaleVelocityCancel;
 }
 
 /// How a Stage receives pointer additions while an Origin is dragging.
@@ -272,14 +317,27 @@ enum ScaleHybrid {
   merge,
 }
 
+/// What Stage does in displayed state when a 2nd pointer is added while a
+/// [DragGesture] is the active gesture. Cascade: per-gesture > per-displayConfig
+/// > per-stage > [scale] default.
+enum DragPromote {
+  /// Keep the drag; adding a 2nd pointer does not re-resolve to a scale gesture.
+  lock,
+  /// Default. On 2nd-pointer add, scale arena re-resolves against
+  /// [Stage.scale] ∪ [DisplayConfig.scale].
+  scale,
+}
+
 class DragGesture extends Gesture {
   const DragGesture({
     super.bounds,
     super.constraints,
     super.builder,
     super.onRelease,
+    super.scaleVelocityCancel,
     this.override,
     this.hybridFromStage,
+    this.promote,
   });
 
   /// Optional resolver invoked at gesture commit. Receives the rect at gesture
@@ -292,7 +350,23 @@ class DragGesture extends Gesture {
   /// Per-gesture override for how Stage receives new pointers while this
   /// drag is active. Cascades up to [Origin.dragHybridFromStage] →
   /// [Stage.dragHybridFromStage] → [DragHybrid.lock] when null.
+  ///
+  /// Context-specific: only read when this [DragGesture] is registered on
+  /// [Origin.drag] (an un-displayed item whose drag may be joined by stage
+  /// pointers via the hybrid merger). No-op when this gesture is registered
+  /// in [Stage.drag] or [DisplayConfig.drag] — see [promote] for the
+  /// displayed-state analog.
   final DragHybrid? hybridFromStage;
+
+  /// Per-gesture override for displayed-state drag→scale promotion when a
+  /// 2nd pointer is added. Cascades up to [DisplayConfig.dragPromote] →
+  /// [Stage.dragPromote] → [DragPromote.scale] when null.
+  ///
+  /// Context-specific: only read when this [DragGesture] is registered on
+  /// [Stage.drag] or [DisplayConfig.drag] (used in displayed state). No-op
+  /// when registered on [Origin.drag] — see [hybridFromStage] for the
+  /// hybrid-context analog.
+  final DragPromote? promote;
 }
 
 class ScaleGesture extends Gesture {
@@ -301,6 +375,7 @@ class ScaleGesture extends Gesture {
     super.constraints,
     super.builder,
     super.onRelease,
+    super.scaleVelocityCancel,
     this.shrink,
     this.expand,
     this.hybridFromStage,
@@ -341,6 +416,10 @@ class DisplayConfig {
     this.scale,
     this.constraints,
     this.onRelease,
+    this.onDoubleTap,
+    this.doubleTapPullFactor,
+    this.dragPromote,
+    this.scaleVelocityCancel,
     this.overrides,
   });
 
@@ -351,6 +430,23 @@ class DisplayConfig {
   /// Cascade fallback for [Gesture.onRelease] while the origin is displayed.
   /// Resolved as: gesture > displayConfig > stage > package default.
   final OnRelease? onRelease;
+
+  /// Cascade fallback for displayed-state double-tap. Resolved as:
+  /// displayConfig > stage > package default (toggle baseRect ↔ fit-cover).
+  final OnDoubleTap? onDoubleTap;
+
+  /// Tunes the panning behavior of the default at-base double-tap (passed to
+  /// [RectExt.fitCoverRect] as `pullFactor`). `0` = under-finger, `1` = max
+  /// edge attraction. Cascade: displayConfig > stage > package default.
+  final double? doubleTapPullFactor;
+
+  /// Cascade fallback for displayed-state drag→scale promotion. Resolved as:
+  /// gesture > displayConfig > stage > [DragPromote.scale] default.
+  final DragPromote? dragPromote;
+
+  /// Cascade fallback for scale-velocity-based translation cancellation in
+  /// `[0, 1]`. Resolved as: gesture > displayConfig > stage > 0.5 default.
+  final double? scaleVelocityCancel;
 
   /// Cascade fallback for [Stage.overrides]/[Origin.overrides] while the
   /// origin is displayed.

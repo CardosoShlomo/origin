@@ -27,6 +27,47 @@ extension RectExt on Rect {
     return Rect.fromCenter(center: center, width: width, height: height);
   }
 
+  /// Computes the fit-cover end rect for a double-tap on a displayed
+  /// (at-base) view. Scales the rect from BoxFit.contain to BoxFit.cover
+  /// (so it fills the display), then pans toward [touchGlobalPosition] on
+  /// the overflowing axis (clamped to cover bounds).
+  ///
+  /// `this` is the displayed container, `baseRect` is the at-base rect
+  /// (BoxFit.contain inside `this`).
+  ///
+  /// [pullFactor] ∈ [0, 1] selects the panning behavior:
+  /// - `0` → Apple-style: touched point stays under finger (no edge attraction).
+  /// - `1` → ref-style: max edge attraction (taps near the edge snap the
+  ///   rect's matching edge against the container edge).
+  /// - In between: blended. Clamp is always applied so the rect can't slide
+  ///   past cover bounds (would expose container background).
+  Rect fitCoverRect(
+    Rect baseRect,
+    Offset touchGlobalPosition, {
+    double pullFactor = 0.4,
+  }) {
+    final coverScale = area / baseRect.area;
+    final coverWidth = baseRect.width * coverScale;
+    final coverHeight = baseRect.height * coverScale;
+    // "fit by width" = base spans the full container width (height has slack);
+    // in cover state, width overflows, so we pan along x. Height-fit is the
+    // mirror case.
+    final fitByW = (baseRect.width - width).abs() < 0.5;
+    final touchPoint = center - touchGlobalPosition;
+    // k bridges Apple (coverScale - 1) and ref (coverScale).
+    final k = (coverScale - 1) + pullFactor;
+    final dxLimit = center.dx * (coverScale - 1);
+    final dyLimit = center.dy * (coverScale - 1);
+    return Rect.fromCenter(
+      center: center.translate(
+        fitByW ? (touchPoint.dx * k).clamp(-dxLimit, dxLimit) : 0,
+        fitByW ? 0 : (touchPoint.dy * k).clamp(-dyLimit, dyLimit),
+      ),
+      width: coverWidth,
+      height: coverHeight,
+    );
+  }
+
   /// Computes the "viewport-correct" end rect for a release-while-displayed.
   /// Mirrors the imagineai `interactionEndRect`:
   /// - Zoomed (scale > 1.02) past [maxScale]: clamp scale to maxScale,

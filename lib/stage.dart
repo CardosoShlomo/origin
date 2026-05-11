@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ui';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'rect_ext.dart';
 import 'gestures.dart';
@@ -47,6 +48,10 @@ class Stage extends StatefulWidget {
     this.scale,
     this.constraints,
     this.onRelease,
+    this.onDoubleTap,
+    this.doubleTapPullFactor,
+    this.dragPromote,
+    this.scaleVelocityCancel,
     this.overrides,
     this.dragHybridFromStage,
     this.scaleHybridFromStage,
@@ -67,6 +72,25 @@ class Stage extends StatefulWidget {
   /// Top-level onRelease fallback. Resolved last in both Stage and Origin
   /// gesture-end cascades.
   final OnRelease? onRelease;
+
+  /// Stage-level fallback for displayed-state double-tap. Resolved as:
+  /// [DisplayConfig.onDoubleTap] → this → package default. The package
+  /// default toggles between baseRect and fit-cover-at-focal.
+  final OnDoubleTap? onDoubleTap;
+
+  /// Stage-level fallback for the at-base double-tap pan tuning. Cascade:
+  /// [DisplayConfig.doubleTapPullFactor] → this → package default (0.4).
+  final double? doubleTapPullFactor;
+
+  /// Stage-level fallback for displayed-state drag→scale promotion when a
+  /// 2nd pointer is added. Cascade: per-gesture > displayConfig > this >
+  /// [DragPromote.scale] default.
+  final DragPromote? dragPromote;
+
+  /// Stage-level strength of scale-velocity-based translation cancellation
+  /// in `[0, 1]`. Threaded into [ReleaseContext.scaleVelocityCancel] by
+  /// the package's built-in release paths. Default `0.8`.
+  final double? scaleVelocityCancel;
 
   /// Top-level escape hatches for advanced behavioral customization.
   /// Resolved last in the per-field overrides cascade (gesture-context-
@@ -171,6 +195,18 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   final _centerYTween = Tween<double>(begin: 0, end: 0);
   final _widthTween = Tween<double>(begin: 0, end: 0);
 
+  // Decomposed-release state. When true, [_updateRect] computes the rect's
+  // center as `proportional(W) + offset` instead of treating X/Y tweens as
+  // absolute positions. Lets the three axes animate with their own curves
+  // and durations while still preserving the display-center invariant
+  // mid-frame: as scale changes, X/Y are pulled proportionally; on top of
+  // that, the X/Y tweens contribute any intended translation as an offset.
+  bool _releaseDecomposed = false;
+  double _releaseInitialX = 0;
+  double _releaseInitialY = 0;
+  double _releaseInitialWidth = 1;
+  Offset _releaseDisplayCenter = Offset.zero;
+
   // --- Gesture state for displayed-rect interaction ---
   Rect _startRect = .zero;
   Offset _startFocalPoint = .zero;
@@ -216,8 +252,19 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     // of the interaction; adding more pointers doesn't reassess.
     if (_active?.gesture case ScaleGesture _) return;
 
-    // Pointer added while idle or in drag: clear so the resolver re-runs
-    // with the new pointer count (will commit scale on the next pinch).
+    // Drag→scale promotion cascade: per-gesture > displayConfig > stage >
+    // [DragPromote.scale] default. When locked, keep the active drag.
+    if (_active?.gesture case DragGesture drag) {
+      final promote = drag.promote
+          ?? _displayConfig?.dragPromote
+          ?? widget.dragPromote
+          ?? DragPromote.scale;
+      if (promote == DragPromote.lock) return;
+    }
+
+    // Pointer added while idle or in drag (promote=scale): clear so the
+    // resolver re-runs with the new pointer count (will commit scale on
+    // the next pinch).
     _active = null;
     _totalDelta = .zero;
   }
@@ -371,16 +418,26 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     }
 
     // Hybrid release path: origin's pointers are also gone (or the gesture
-    // was hybrid-driven). Fire release using stage's velocity, drawing the
-    // gesture from the stored origin gesture.
+    // was hybrid-driven). Prefer the merger's combined velocity if it's
+    // fresh (captures simultaneous-lift case across both recognizers);
+    // otherwise fall back to stage's own ScaleEndDetails.
     final og = _originGesture;
     if (og != null) {
+      // Zero translation if scale velocity exceeds cutoff. Cascade:
+      // gesture > Origin (via OriginGesture) > Stage > 0.8.
+      details = details.cancelTranslation(
+        og.active.gesture.scaleVelocityCancel
+            ?? og.scaleVelocityCancel
+            ?? widget.scaleVelocityCancel
+            ?? 0.8,
+      );
+      final merged = _hybridReleaseVelocity();
       final data = ReleaseContext(
         currentRect: _rect.value,
         displayRect: _display.rect,
         aspectRatio: _aspectRatio,
-        velocity: details.velocity,
-        scaleVelocity: details.scaleVelocity,
+        velocity: merged?.velocity ?? details.velocity,
+        scaleVelocity: merged?.scaleVelocity ?? details.scaleVelocity,
         gesture: og.active.gesture,
       );
       _setOriginGesture(null);
@@ -390,14 +447,18 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       _totalDelta = .zero;
       _prevPointerCount = 0;
 
+      // Cascade mirrors Origin's own release cascade (gesture → Origin →
+      // Stage → package default) — not the displayed-state cascade
+      // (which goes through displayConfig), since hybrid runs while origin
+      // is un-displayed. _displayConfig is null in this state anyway.
       final handler = data.gesture.onRelease
-          ?? _displayConfig?.onRelease
+          ?? og.onRelease
           ?? widget.onRelease;
       if (handler != null) {
         handler(context, data);
         return;
       }
-      await Stage.of(context).release(.toDisplay(data));
+      await Stage.of(context).backToOrigin(data);
       return;
     }
 
@@ -407,6 +468,15 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     // lifted).
     final active = _active ?? _lastActive;
     if (active == null) return;
+
+    // Zero translation if scale velocity exceeds cutoff. Cascade:
+    // gesture > DisplayConfig > Stage > 0.8. Displayed-state path.
+    details = details.cancelTranslation(
+      active.gesture.scaleVelocityCancel
+          ?? _displayConfig?.scaleVelocityCancel
+          ?? widget.scaleVelocityCancel
+          ?? 0.8,
+    );
 
     final data = ReleaseContext(
       currentRect: _rect.value,
@@ -459,12 +529,30 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   // used to read its [pointerPositions] for the hybrid merger.
   StageScaleRecognizer? _stageRecognizer;
 
-  // Hybrid merger state — captured at first hybrid update or when pointer
-  // count changes. Used as the reference frame for subsequent merged updates.
-  Offset? _hybridStartFocal;
-  double? _hybridStartSpread;
-  Rect? _hybridStartRect;
+  // Hybrid merger state — last focal/spread sample, used to compute per-frame
+  // deltas (so friction/bounds compose with the same physics as Origin's and
+  // Stage's normal scale-update paths). Refreshed every update, re-baselined
+  // on pointer-count change.
+  Offset? _hybridLastFocal;
+  double? _hybridLastSpread;
   int _hybridLastCount = 0;
+  // Spread snapshot at the moment we entered 2-pointer mode while Origin's
+  // drag was still active under [DragHybrid.asScale]. Used as the baseline
+  // for `resolveScaleArena` to decide if the cumulative pinch crossed the
+  // commit threshold. Null while not in a promotion-candidate state, or
+  // after promotion has fired.
+  double? _hybridPromotionBaselineSpread;
+  // Per-update merger samples (focal + spread + timestamp). Used to compute
+  // a finite-difference velocity across the last two same-count frames.
+  // `_hybridPrevSample` is cleared on re-baseline so velocity is never
+  // computed across a pointer-count change.
+  ({Offset focal, double spread, int timeMicros})? _hybridSample;
+  ({Offset focal, double spread, int timeMicros})? _hybridPrevSample;
+  // Last valid same-count velocity. Persists through re-baselines and the
+  // final reset, so release fired after a simultaneous lift (a 1-pointer
+  // gap between the two recognizers' onEnds) still sees the 2-pointer-era
+  // velocity. Staleness checked at read time (100ms window).
+  ({Velocity velocity, double scaleVelocity, int timeMicros})? _lastMergerVelocity;
   // True while Stage's hybrid merger is driving the rect — Origin reads this
   // and silences its own rect manipulation when set.
   bool _isHybridDriving = false;
@@ -474,11 +562,50 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     setState(() => _isHybridDriving = v);
   }
 
+  // Cached down-position for the upcoming double-tap callback (the recognizer
+  // delivers position in onDoubleTapDown but not in onDoubleTap).
+  Offset _doubleTapLocal = .zero;
+  Offset _doubleTapGlobal = .zero;
+
+  /// Package default: toggle between baseRect (when zoomed/translated) and
+  /// fit-cover-at-focal (when at base). Pan tuning via cascaded pullFactor.
+  void _defaultOnDoubleTap(BuildContext context, DoubleTapEvent e) {
+    final atBase = (e.currentRect.center - e.baseRect.center).distance < 1.0
+        && (e.currentRect.width - e.baseRect.width).abs() < 1.0;
+    final pullFactor = _displayConfig?.doubleTapPullFactor
+        ?? widget.doubleTapPullFactor
+        ?? 0.4;
+    final target = atBase
+        ? e.displayRect.fitCoverRect(
+            e.baseRect,
+            e.globalPosition,
+            pullFactor: pullFactor,
+          )
+        : e.baseRect;
+    Stage.of(context).animateRect(to: target, curve: Curves.easeOut);
+  }
+
+  void _onDoubleTap(BuildContext context) {
+    final baseRect = _display.rect.baseRect(_aspectRatio);
+    final event = DoubleTapEvent(
+      localPosition: _doubleTapLocal,
+      globalPosition: _doubleTapGlobal,
+      currentRect: _rect.value,
+      displayRect: _display.rect,
+      baseRect: baseRect,
+      aspectRatio: _aspectRatio,
+    );
+    final handler = _displayConfig?.onDoubleTap
+        ?? widget.onDoubleTap
+        ?? _defaultOnDoubleTap;
+    handler(context, event);
+  }
+
   void _resetHybridMerger() {
-    _hybridStartFocal = null;
-    _hybridStartSpread = null;
-    _hybridStartRect = null;
+    _hybridLastFocal = null;
+    _hybridLastSpread = null;
     _hybridLastCount = 0;
+    _hybridPromotionBaselineSpread = null;
     _setIsHybridDriving(false);
   }
 
@@ -500,9 +627,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   /// Triggered whenever pointer positions change on either recognizer (origin
   /// forwards via [_setOriginPointers]; stage's own via the recognizer's
   /// `onPointersChanged`). Combines both pointer sets into a unified focal /
-  /// spread / scale, and drives the rect from a captured reference frame.
-  /// Re-baselines the reference frame whenever the pointer count changes so
-  /// drop-to-1 / re-add transitions stay smooth.
+  /// spread, computes a per-frame delta against the last sample, and applies
+  /// the active gesture's friction/bounds the same way Origin's and Stage's
+  /// normal `_onScaleUpdate` paths do. Re-baselines on pointer-count change
+  /// so drop-to-1 / re-add transitions stay smooth.
   void _onHybridPointersChanged() {
     final og = _originGesture;
     if (og == null) {
@@ -527,31 +655,167 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     final focal = _meanOffset(all.values);
     final spread = _meanDistance(all.values, focal);
 
-    // First activation OR pointer count change ⇒ re-baseline the merger
-    // reference frame to the current rect/focal/spread.
-    if (_hybridStartFocal == null || all.length != _hybridLastCount) {
-      _hybridStartFocal = focal;
-      _hybridStartSpread = spread;
-      _hybridStartRect = _rect.value;
+    // First activation OR pointer count change ⇒ re-baseline last samples;
+    // no rect update this frame (the focal/spread "shift" from the count
+    // change isn't real finger motion). Drop the prev sample so the next
+    // frame's velocity isn't computed across the pointer-count jump, but
+    // keep `_lastMergerVelocity` so a release fired before the next valid
+    // sample (e.g. simultaneous lift) still has access to the most recent
+    // same-count velocity.
+    if (_hybridLastFocal == null || all.length != _hybridLastCount) {
+      _hybridLastFocal = focal;
+      _hybridLastSpread = spread;
       _hybridLastCount = all.length;
+      _hybridPrevSample = null;
+      _hybridSample = (
+        focal: focal,
+        spread: spread,
+        timeMicros: DateTime.now().microsecondsSinceEpoch,
+      );
+      // Track promotion baseline only while we have 2 pointers AND origin
+      // is still in drag AND mode is asScale; reset otherwise.
+      if (all.length >= 2
+          && hybrid.drag == DragHybrid.asScale
+          && og.active.gesture is DragGesture) {
+        _hybridPromotionBaselineSpread = spread;
+      } else {
+        _hybridPromotionBaselineSpread = null;
+      }
       _setIsHybridDriving(true);
       return;
     }
 
-    final delta = focal - _hybridStartFocal!;
-    final start = _hybridStartRect!;
-    final newCenter = start.center + delta;
-    final scale = (hybrid.drag == DragHybrid.asDrag ||
-            all.length < 2 ||
-            _hybridStartSpread! <= 0)
+    final frameDelta = focal - _hybridLastFocal!;
+    final scaleRatio = (hybrid.drag == DragHybrid.asDrag
+            || all.length < 2
+            || _hybridLastSpread! <= 0)
         ? 1.0
-        : spread / _hybridStartSpread!;
-    final newWidth = start.width * scale;
+        : spread / _hybridLastSpread!;
+
+    // asScale promotion: when the cumulative pinch from the 2-pointer
+    // baseline crosses the scale-arena commit threshold, swap the active
+    // gesture to the matched ScaleGesture (with ScaleHybrid.merge) so the
+    // rest of the gesture — and the eventual release — use scale config
+    // (shrink/expand bounds, scale-axis onRelease, etc.).
+    Gesture activeGesture = og.active.gesture;
+    final promotionBaseline = _hybridPromotionBaselineSpread;
+    if (promotionBaseline != null
+        && hybrid.drag == DragHybrid.asScale
+        && activeGesture is DragGesture
+        && og.scale != null
+        && og.scale!.isNotEmpty
+        && promotionBaseline > 0) {
+      final cumulative = spread / promotionBaseline;
+      final resolved = resolveScaleArena(
+        scale: cumulative,
+        registered: og.scale!,
+      );
+      if (resolved != null) {
+        _setOriginGesture((
+          active: resolved,
+          dragHybrid: null,
+          scaleHybrid: ScaleHybrid.merge,
+          scale: og.scale,
+          onRelease: og.onRelease,
+          scaleVelocityCancel: og.scaleVelocityCancel,
+        ));
+        _hybridPromotionBaselineSpread = null;
+        activeGesture = resolved.gesture;
+      }
+    }
+
+    // Pick bounds from the currently-active gesture so the merger respects
+    // the same friction/limits as a non-hybrid update would.
+    final Map<DragBound, DragBounds> bounds;
+    final ShrinkBounds? shrink;
+    final ExpandBounds? expand;
+    switch (activeGesture) {
+      case DragGesture g:
+        bounds = g.bounds;
+        shrink = null;
+        expand = null;
+      case ScaleGesture g:
+        bounds = g.bounds;
+        shrink = g.shrink;
+        expand = g.expand;
+    }
+
+    final currentRect = _rect.value;
+    final originRect = _origin.rect;
+    final displayRect = _display.rect;
+    final baseWidth = displayRect.baseWidth(_aspectRatio);
+
+    // Translation: per-axis friction against bounds (same as Origin/Stage
+    // normal scale-update paths).
+    final dx = frictionFromState(
+      state: axisStateX(frameDelta.dx, currentRect, originRect, displayRect),
+      bounds: bounds,
+      delta: frameDelta.dx,
+    );
+    final dy = frictionFromState(
+      state: axisStateY(frameDelta.dy, currentRect, originRect, displayRect),
+      bounds: bounds,
+      delta: frameDelta.dy,
+    );
+
+    // Scale: friction against shrink/expand. For DragGesture (no shrink/
+    // expand), this passes through; future `asScale` re-resolution will
+    // swap to a ScaleGesture so scale-axis bounds also apply.
+    final intendedWidth = currentRect.width * scaleRatio;
+    final dw = intendedWidth - currentRect.width;
+    final scaledDw = frictionFromScaleState(
+      state: axisStateScale(dw, currentRect.width, baseWidth, shrink, expand),
+      shrink: shrink,
+      expand: expand,
+      delta: dw,
+    );
+    final newWidth = currentRect.width + scaledDw;
+    final widthRatio = currentRect.width == 0 ? 1.0 : newWidth / currentRect.width;
+    final newHeight = currentRect.height * widthRatio;
+    final newCenter = (currentRect.center - focal) * widthRatio
+        + focal
+        + Offset(dx, dy);
+
     _rect.value = Rect.fromCenter(
       center: newCenter,
       width: newWidth,
-      height: newWidth / _aspectRatio,
+      height: newHeight,
     );
+
+    _hybridLastFocal = focal;
+    _hybridLastSpread = spread;
+    // Capture velocity from prev → current (same pointer count). Update
+    // [_lastMergerVelocity] only when prev exists so we never measure
+    // across a re-baseline.
+    final nowMicros = DateTime.now().microsecondsSinceEpoch;
+    final prev = _hybridPrevSample;
+    if (prev != null) {
+      final dtSec = (nowMicros - prev.timeMicros) / 1e6;
+      if (dtSec > 0) {
+        final scaleVel = prev.spread > 0
+            ? (spread - prev.spread) / (prev.spread * dtSec)
+            : 0.0;
+        _lastMergerVelocity = (
+          velocity: Velocity(pixelsPerSecond: (focal - prev.focal) / dtSec),
+          scaleVelocity: scaleVel,
+          timeMicros: nowMicros,
+        );
+      }
+    }
+    _hybridPrevSample = _hybridSample;
+    _hybridSample = (focal: focal, spread: spread, timeMicros: nowMicros);
+  }
+
+  /// Returns the merger's last valid same-count velocity if it's recent
+  /// (≤ 100ms old). Returns null when the merger didn't run or its last
+  /// sample is stale — callers should fall back to the firing recognizer's
+  /// own `ScaleEndDetails.velocity`.
+  ({Velocity velocity, double scaleVelocity})? _hybridReleaseVelocity() {
+    final last = _lastMergerVelocity;
+    if (last == null) return null;
+    final nowMicros = DateTime.now().microsecondsSinceEpoch;
+    if (nowMicros - last.timeMicros > 100000) return null;
+    return (velocity: last.velocity, scaleVelocity: last.scaleVelocity);
   }
 
   static Offset _meanOffset(Iterable<Offset> positions) {
@@ -683,12 +947,15 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       );
     }
     curved.addListener(update);
-    await _effect.forward();
-    await _effect.reverse();
-    curved.removeListener(update);
-    curved.dispose();
-    _rotation.value = null;
-    reset();
+    try {
+      await _effect.forward();
+      await _effect.reverse();
+    } finally {
+      curved.removeListener(update);
+      curved.dispose();
+      _rotation.value = null;
+      reset();
+    }
   }
 
   Future<void> dismiss({Object? tag, Object? except}) async {
@@ -701,9 +968,12 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       _setTagState(tag, .returning);
     }
     _setDismissing(true);
-    await animateRect(to: _origin.rect, curve: Curves.easeOut);
-    await _onEnd?.call();
-    reset();
+    try {
+      await animateRect(to: _origin.rect, curve: Curves.easeOut);
+      await _onEnd?.call();
+    } finally {
+      reset();
+    }
   }
 
   Future<void> animateToBase() async {
@@ -719,10 +989,34 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   void _updateRect() {
+    final w = _widthTween.evaluate(_width);
+    if (_releaseDecomposed) {
+      // Decomposed mode: X/Y tweens store *offsets* relative to the
+      // proportional position. Displayed center = proportional(W) + offset.
+      // Holds the display-center invariant for the no-offset case at every
+      // frame, regardless of curve / duration mismatch between axes.
+      final scaleRatio =
+          _releaseInitialWidth == 0 ? 1.0 : w / _releaseInitialWidth;
+      final xProp = _releaseDisplayCenter.dx
+          + (_releaseInitialX - _releaseDisplayCenter.dx) * scaleRatio;
+      final yProp = _releaseDisplayCenter.dy
+          + (_releaseInitialY - _releaseDisplayCenter.dy) * scaleRatio;
+      final xOffset = _centerXTween.evaluate(_centerX);
+      final yOffset = _centerYTween.evaluate(_centerY);
+      _rect.value = Rect.fromCenter(
+        center: Offset(xProp + xOffset, yProp + yOffset),
+        width: w,
+        height: w / _aspectRatio,
+      );
+      return;
+    }
     final cx = _centerXTween.evaluate(_centerX);
     final cy = _centerYTween.evaluate(_centerY);
-    final w = _widthTween.evaluate(_width);
-    _rect.value = Rect.fromCenter(center: Offset(cx, cy), width: w, height: w / _aspectRatio);
+    _rect.value = Rect.fromCenter(
+      center: Offset(cx, cy),
+      width: w,
+      height: w / _aspectRatio,
+    );
   }
 
   void _updateProgress() {
@@ -740,14 +1034,22 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   Future<void> animateCenterX({required double to, Duration? duration, Curve curve = Curves.easeIn}) {
-    _centerXTween.begin = _rect.value.center.dx;
+    // In decomposed-release mode the tween stores an *offset* relative to
+    // the proportional position (which scale drives), not an absolute X.
+    // Seed from the tween's current evaluated value so multi-phase chains
+    // pick up where the previous phase left off.
+    _centerXTween.begin = _releaseDecomposed
+        ? _centerXTween.evaluate(_centerX)
+        : _rect.value.center.dx;
     _centerXTween.end = to;
     _safeReset(_centerX);
     return _centerX.animateTo(1, duration: duration, curve: curve);
   }
 
   Future<void> animateCenterY({required double to, Duration? duration, Curve curve = Curves.easeIn}) {
-    _centerYTween.begin = _rect.value.center.dy;
+    _centerYTween.begin = _releaseDecomposed
+        ? _centerYTween.evaluate(_centerY)
+        : _rect.value.center.dy;
     _centerYTween.end = to;
     _safeReset(_centerY);
     return _centerY.animateTo(1, duration: duration, curve: curve);
@@ -766,6 +1068,33 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       animateCenterY(to: to.center.dy, duration: duration, curve: curve),
       animateWidth(to: to.width, duration: duration, curve: curve),
     ]);
+  }
+
+  /// Enters decomposed-release mode (see [_releaseDecomposed]). Captures the
+  /// initial rect / display state and resets the X/Y tweens to zero offset,
+  /// the width tween to current width. Callers are responsible for pairing
+  /// this with [_clearReleaseDecomposed] after the release completes.
+  void _setReleaseDecomposed({
+    required double initialX,
+    required double initialY,
+    required double initialWidth,
+    required Offset displayCenter,
+  }) {
+    _releaseInitialX = initialX;
+    _releaseInitialY = initialY;
+    _releaseInitialWidth = initialWidth;
+    _releaseDisplayCenter = displayCenter;
+    _centerXTween.begin = 0;
+    _centerXTween.end = 0;
+    _centerYTween.begin = 0;
+    _centerYTween.end = 0;
+    _widthTween.begin = initialWidth;
+    _widthTween.end = initialWidth;
+    _releaseDecomposed = true;
+  }
+
+  void _clearReleaseDecomposed() {
+    _releaseDecomposed = false;
   }
 
   // --- Registry ---
@@ -860,6 +1189,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       setOriginPointers: _setOriginPointers,
       isHybridDriving: () => _isHybridDriving,
       stagePointerCount: () => _stageRecognizer?.pointerPositions.length ?? 0,
+      hybridReleaseVelocity: _hybridReleaseVelocity,
+      scaleVelocityCancel: () => widget.scaleVelocityCancel,
       onEnd: _onEnd,
       tag: _tag,
       locked: _locked,
@@ -883,6 +1214,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       animateCenterX: animateCenterX,
       animateCenterY: animateCenterY,
       animateWidth: animateWidth,
+      setReleaseDecomposed: _setReleaseDecomposed,
+      clearReleaseDecomposed: _clearReleaseDecomposed,
       reset: reset,
       animateToBase: animateToBase,
       dismiss: dismiss,
@@ -917,8 +1250,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
             //    on stage join the Origin's gesture per its hybrid mode.
             final og = _originGesture;
             final hybridActive = og != null && _resolveHybrid(og) != null;
-            final active =
-                (Stage.hasWidgetOf(context) && !_locked) || hybridActive;
+            final displayed = Stage.hasWidgetOf(context) && !_locked;
+            final active = displayed || hybridActive;
             return RawGestureDetector(
               behavior: active ? .opaque : .translucent,
               gestures: {
@@ -933,6 +1266,20 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                       r.onUpdate = _onScaleUpdate;
                       r.onEnd = (details) => _onScaleEnd(details, context);
                       r.onPointersChanged = _onHybridPointersChanged;
+                    },
+                  ),
+                // Double-tap only runs in pure displayed state — hybrid is
+                // about pointer-merging during an Origin-driven gesture, not
+                // a separate tap surface.
+                if (displayed)
+                  DoubleTapGestureRecognizer: GestureRecognizerFactoryWithHandlers<DoubleTapGestureRecognizer>(
+                    DoubleTapGestureRecognizer.new,
+                    (r) {
+                      r.onDoubleTapDown = (d) {
+                        _doubleTapLocal = d.localPosition;
+                        _doubleTapGlobal = d.globalPosition;
+                      };
+                      r.onDoubleTap = () => _onDoubleTap(context);
                     },
                   ),
               },
@@ -969,6 +1316,8 @@ class StageData extends InheritedModel<Object> {
     required this.setOriginPointers,
     required this.isHybridDriving,
     required this.stagePointerCount,
+    required this.hybridReleaseVelocity,
+    required this.scaleVelocityCancel,
     required this.onEnd,
     required this.tag,
     required this.locked,
@@ -992,6 +1341,8 @@ class StageData extends InheritedModel<Object> {
     required this.animateCenterX,
     required this.animateCenterY,
     required this.animateWidth,
+    required this.setReleaseDecomposed,
+    required this.clearReleaseDecomposed,
     required this.reset,
     required this.animateToBase,
     required this.dismiss,
@@ -1054,6 +1405,18 @@ class StageData extends InheritedModel<Object> {
   /// decide whether to defer release until stage's pointers also leave.
   final int Function() stagePointerCount;
 
+  /// Live reader: the hybrid merger's combined release velocity computed
+  /// from its last two focal/spread samples. Returns null if the merger
+  /// didn't run recently — callers should fall back to the firing
+  /// recognizer's own `ScaleEndDetails.velocity`.
+  final ({Velocity velocity, double scaleVelocity})? Function()
+      hybridReleaseVelocity;
+
+  /// Live reader: Stage-level `scaleVelocityCancel` (raw nullable), the
+  /// bottom of the cascade before the package default of `0.5`. Callers
+  /// resolve `gesture > Origin/DisplayConfig > this > 0.5`.
+  final double? Function() scaleVelocityCancel;
+
   final FutureOr<void> Function()? onEnd;
   final Object? tag;
   final bool locked;
@@ -1079,6 +1442,17 @@ class StageData extends InheritedModel<Object> {
   final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterX;
   final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterY;
   final Future<void> Function({required double to, Duration? duration, Curve curve}) animateWidth;
+  /// Enters decomposed-release mode: while active, the X/Y tweens are
+  /// interpreted as *offsets* from the proportional scale-driven position.
+  /// Lets the three axes animate with independent curves/durations while
+  /// the displayed center stays consistent mid-frame.
+  final void Function({
+    required double initialX,
+    required double initialY,
+    required double initialWidth,
+    required Offset displayCenter,
+  }) setReleaseDecomposed;
+  final VoidCallback clearReleaseDecomposed;
   final VoidCallback reset;
   final Future<void> Function() animateToBase;
   final Future<void> Function({Object? tag, Object? except}) dismiss;
@@ -1100,15 +1474,59 @@ class StageData extends InheritedModel<Object> {
   final Future<void> Function(Object tag) openEntry;
   final Future<void> Function(Object tag, Rect Function(Rect), {VoidCallback? onEnd}) sendEntry;
 
-  Future<void> release(Release plan) {
-    // Sync all tweens to the current rect so non-animating axes don't pull
-    // stale tween values when _updateRect fires on the first tick.
-    setRect(rect.value);
-    return Future.wait([
-      _runAxis(plan.x, animateCenterX),
-      _runAxis(plan.y, animateCenterY),
-      _runAxis(plan.scale, animateWidth),
-    ]);
+  Future<void> release(Release plan) async {
+    final scaleHasMotion =
+        plan.scale.decay.isNotEmpty || plan.scale.settle != null;
+    if (!scaleHasMotion) {
+      // No scale animation → axes are independent.
+      setRect(rect.value);
+      await Future.wait([
+        _runAxis(plan.x, animateCenterX),
+        _runAxis(plan.y, animateCenterY),
+        _runAxis(plan.scale, animateWidth),
+      ]);
+      return;
+    }
+    // Decomposed-release: scale drives the proportional center; X/Y add a
+    // translation offset on top. Each axis keeps its own curve/duration and
+    // the displayed center stays consistent mid-frame.
+    final initialRect = rect.value;
+    final wFinal = plan.scale.settle?.to ?? plan.scale.decay.last.to;
+    final scaleRatio = initialRect.width == 0 ? 1.0 : wFinal / initialRect.width;
+    final xPropFinal = display.rect.center.dx
+        + (initialRect.center.dx - display.rect.center.dx) * scaleRatio;
+    final yPropFinal = display.rect.center.dy
+        + (initialRect.center.dy - display.rect.center.dy) * scaleRatio;
+    final xAbsTarget = plan.x.settle?.to
+        ?? (plan.x.decay.isNotEmpty ? plan.x.decay.last.to : initialRect.center.dx);
+    final yAbsTarget = plan.y.settle?.to
+        ?? (plan.y.decay.isNotEmpty ? plan.y.decay.last.to : initialRect.center.dy);
+    final xOffsetTarget = xAbsTarget - xPropFinal;
+    final yOffsetTarget = yAbsTarget - yPropFinal;
+
+    setReleaseDecomposed(
+      initialX: initialRect.center.dx,
+      initialY: initialRect.center.dy,
+      initialWidth: initialRect.width,
+      displayCenter: display.rect.center,
+    );
+    try {
+      await Future.wait([
+        animateCenterX(
+          to: xOffsetTarget,
+          duration: plan.x.settle?.duration,
+          curve: plan.x.settle?.curve ?? Curves.easeOut,
+        ),
+        animateCenterY(
+          to: yOffsetTarget,
+          duration: plan.y.settle?.duration,
+          curve: plan.y.settle?.curve ?? Curves.easeOut,
+        ),
+        _runAxis(plan.scale, animateWidth),
+      ]);
+    } finally {
+      clearReleaseDecomposed();
+    }
   }
 
   Future<void> run({

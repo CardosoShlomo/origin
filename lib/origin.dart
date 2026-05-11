@@ -29,6 +29,8 @@ class Origin extends StatefulWidget {
     super.key,
     required this.tag,
     this.onTap,
+    this.onDoubleTap,
+    this.onLongPress,
     this.borderRadius = .zero,
     this.containerTag,
     this.originContainer,
@@ -48,11 +50,21 @@ class Origin extends StatefulWidget {
     this.builder,
     this.dragHybridFromStage,
     this.scaleHybridFromStage,
+    this.scaleVelocityCancel,
     required this.child,
   });
 
   final Object tag;
   final StageTap? onTap;
+
+  /// Optional double-tap handler. Mirrors [onTap] — same [TapEvent] shape,
+  /// consumer decides what to do (open, run effect, etc.). Registering this
+  /// adds a [DoubleTapGestureRecognizer] alongside the tap recognizer, so
+  /// single-tap resolution incurs the standard double-tap timeout (~300ms).
+  final StageTap? onDoubleTap;
+
+  /// Optional long-press handler. Mirrors [onTap].
+  final StageTap? onLongPress;
   final BorderRadius borderRadius;
   final Object? containerTag;
   final OriginRect? originContainer;
@@ -80,10 +92,17 @@ class Origin extends StatefulWidget {
   final DragHybrid? dragHybridFromStage;
   final ScaleHybrid? scaleHybridFromStage;
 
+  /// Origin-level cascade fallback for scale-velocity-based translation
+  /// cancellation. Resolved between [Gesture.scaleVelocityCancel] /
+  /// [DisplayConfig.scaleVelocityCancel] and [Stage.scaleVelocityCancel].
+  final double? scaleVelocityCancel;
+
   final Widget child;
 
   bool get _isItem =>
       onTap != null ||
+      onDoubleTap != null ||
+      onLongPress != null ||
       (drag?.isNotEmpty ?? false) ||
       (scale?.isNotEmpty ?? false);
 
@@ -223,6 +242,12 @@ class _OriginState extends State<Origin> {
   Rect _startRect = .zero;
   Offset _startFocalPoint = .zero;
   Offset _totalDelta = .zero;
+  /// Tracks whether Stage's merger drove the rect on the previous update.
+  /// On a true→false transition (stage's pointers left mid-gesture), Origin
+  /// re-baselines [_startRect] / [_startFocalPoint] to current state so its
+  /// scale formula (`_startRect.width × details.scale`) doesn't undo the
+  /// merger's changes.
+  bool _wasHybridDriving = false;
 
   void _onScaleStart(ScaleStartDetails details) {
     // onStart fires on every pointer-count change. Once committed, refresh
@@ -238,10 +263,28 @@ class _OriginState extends State<Origin> {
   void _onScaleUpdate(ScaleUpdateDetails details) {
     _totalDelta += details.focalPointDelta;
 
+    // Hybrid → non-hybrid transition: rebaseline reference frame so the
+    // merger's modifications stick. _startRect.width is set so that
+    // `_startRect.width × details.scale` equals the current (merger-driven)
+    // rect width — letting Origin's scale formula resume from here without
+    // a snap-back.
+    final isHybrid = _stage.isHybridDriving();
+    if (_wasHybridDriving && !isHybrid) {
+      final currentRect = _stage.rect.value;
+      final scale = details.scale == 0 ? 1.0 : details.scale;
+      _startRect = Rect.fromCenter(
+        center: currentRect.center,
+        width: currentRect.width / scale,
+        height: currentRect.height / scale,
+      );
+      _startFocalPoint = details.focalPoint;
+    }
+    _wasHybridDriving = isHybrid;
+
     // While Stage's hybrid merger owns the rect, Origin stops manipulating
     // it directly — pointer positions are still being forwarded via the
     // recognizer's `onPointersChanged` so Stage has live data.
-    if (_stage.isHybridDriving()) return;
+    if (isHybrid) return;
 
     switch (_active?.gesture) {
       case null: {
@@ -409,17 +452,27 @@ class _OriginState extends State<Origin> {
 
   /// Builds an [OriginGesture] for [_active] with hybrid mode resolved
   /// through gesture-level → Origin-level. Stage finishes the cascade.
+  /// Origin's `scale` map is forwarded so Stage's merger can re-resolve
+  /// drag → scale on [DragHybrid.asScale] promotion. Origin's `onRelease`
+  /// is forwarded so the hybrid release cascade (gesture → Origin → Stage
+  /// → package default) matches Origin's own release cascade.
   OriginGesture _toOriginGesture(ActiveGesture active) {
     return switch (active.gesture) {
       DragGesture g => (
           active: active,
           dragHybrid: g.hybridFromStage ?? widget.dragHybridFromStage,
           scaleHybrid: null,
+          scale: widget.scale,
+          onRelease: widget.onRelease,
+          scaleVelocityCancel: widget.scaleVelocityCancel,
         ),
       ScaleGesture g => (
           active: active,
           dragHybrid: null,
           scaleHybrid: g.hybridFromStage ?? widget.scaleHybridFromStage,
+          scale: widget.scale,
+          onRelease: widget.onRelease,
+          scaleVelocityCancel: widget.scaleVelocityCancel,
         ),
     };
   }
@@ -435,6 +488,16 @@ class _OriginState extends State<Origin> {
     final active = _active;
     if (active == null) return;
 
+    // Zero translation velocity if scale velocity exceeds the configured
+    // cutoff. Cascade: per-gesture > Origin > Stage > 0.8. From here the
+    // rest of the release uses [details] as if it were the user's gesture.
+    details = details.cancelTranslation(
+      active.gesture.scaleVelocityCancel
+          ?? widget.scaleVelocityCancel
+          ?? _stage.scaleVelocityCancel()
+          ?? 0.8,
+    );
+
     _active = null;
     _totalDelta = .zero;
     _stopSwapListening();
@@ -449,15 +512,27 @@ class _OriginState extends State<Origin> {
     // Stage has no pointers either. If a previous release path already fired
     // (clearing _originGesture), skip — this happens on simultaneous lift
     // when Stage's onScaleEnd ran first.
-    if (_stage.originGesture() == null) return;
+    final stageOg = _stage.originGesture();
+    if (stageOg == null) return;
 
+    // Use Stage's view of the active gesture rather than Origin's local
+    // [_active] — they diverge after a [DragHybrid.asScale] promotion
+    // (Origin still holds the original DragGesture; Stage swapped it to a
+    // resolved ScaleGesture). Release should reflect the final gesture so
+    // shrink/expand bounds and the onRelease cascade are correct.
+    //
+    // Prefer the merger's combined velocity if it's still fresh — covers
+    // the case where Origin lifts last after a hybrid session, so the
+    // release reflects the merger's actual focal/spread motion across
+    // both recognizers rather than just Origin's own ScaleEndDetails.
+    final merged = _stage.hybridReleaseVelocity();
     final data = ReleaseContext(
       currentRect: _stage.rect.value,
       displayRect: _stage.display.rect,
       aspectRatio: _stage.aspectRatio,
-      velocity: details.velocity,
-      scaleVelocity: details.scaleVelocity,
-      gesture: active.gesture,
+      velocity: merged?.velocity ?? details.velocity,
+      scaleVelocity: merged?.scaleVelocity ?? details.scaleVelocity,
+      gesture: stageOg.active.gesture,
     );
     _stage.setOriginGesture(null);
 
@@ -507,10 +582,10 @@ class _OriginState extends State<Origin> {
     return data.dismiss();
   }
 
-  void _onTapUp(TapUpDetails details) {
-    widget.onTap!(TapEvent(
-      localPosition: details.localPosition,
-      globalPosition: details.globalPosition,
+  TapEvent _buildTapEvent(Offset localPosition, Offset globalPosition) {
+    return TapEvent(
+      localPosition: localPosition,
+      globalPosition: globalPosition,
       animateToBase: _open,
       runEffect: ({
         double? rotateX,
@@ -529,8 +604,17 @@ class _OriginState extends State<Origin> {
           curve: curve,
         );
       },
-    ));
+    );
   }
+
+  void _onTapUp(TapUpDetails details) {
+    widget.onTap!(_buildTapEvent(details.localPosition, details.globalPosition));
+  }
+
+  // Double-tap recognizer fires onDoubleTap without position info; we cache
+  // the position from onDoubleTapDown.
+  Offset _doubleTapLocal = .zero;
+  Offset _doubleTapGlobal = .zero;
 
   @override
   Widget build(BuildContext context) {
@@ -550,6 +634,26 @@ class _OriginState extends State<Origin> {
             TapGestureRecognizer: GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
               TapGestureRecognizer.new,
               (r) => r.onTapUp = _onTapUp,
+            ),
+          if (widget.onDoubleTap != null)
+            DoubleTapGestureRecognizer: GestureRecognizerFactoryWithHandlers<DoubleTapGestureRecognizer>(
+              DoubleTapGestureRecognizer.new,
+              (r) {
+                r.onDoubleTapDown = (d) {
+                  _doubleTapLocal = d.localPosition;
+                  _doubleTapGlobal = d.globalPosition;
+                };
+                r.onDoubleTap = () => widget.onDoubleTap!(
+                  _buildTapEvent(_doubleTapLocal, _doubleTapGlobal),
+                );
+              },
+            ),
+          if (widget.onLongPress != null)
+            LongPressGestureRecognizer: GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
+              LongPressGestureRecognizer.new,
+              (r) => r.onLongPressStart = (d) => widget.onLongPress!(
+                _buildTapEvent(d.localPosition, d.globalPosition),
+              ),
             ),
           if (hasGestures)
             StageScaleRecognizer: GestureRecognizerFactoryWithHandlers<StageScaleRecognizer>(

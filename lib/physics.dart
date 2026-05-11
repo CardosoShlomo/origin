@@ -508,11 +508,25 @@ HorizontalRelease releaseFromStateX({
 
   final fitWidth = projectedRect?.width ?? currentRect.width;
   final fitHeight = projectedRect?.height ?? currentRect.height;
-  double fitAt(double cx) => Rect.fromCenter(
-        center: Offset(cx, currentRect.center.dy),
-        width: fitWidth,
-        height: fitHeight,
-      ).getLimitedCenterXInside(displayRect);
+  // Scale-aware center adjustment: as the rect shrinks from
+  // currentRect.width to fitWidth (during scale settle), the point currently
+  // at displayRect.center should stay at displayRect.center. That means the
+  // rect's new center is the proportional position between displayRect.center
+  // and the current center, with the width-ratio as the proportion. Then
+  // the cover-clamp (`getLimitedCenterXInside`) is applied as a safety so
+  // the rect never exposes a display edge.
+  final widthRatio = currentRect.width == 0 ? 1.0 : fitWidth / currentRect.width;
+  // Same scale-aware adjustment used by both decay phases and the settle
+  // target — keeps the display-center point stable as the rect shrinks.
+  double scaleAwareCenter(double cx) =>
+      displayRect.center.dx + (cx - displayRect.center.dx) * widthRatio;
+  double fitAt(double cx) {
+    return Rect.fromCenter(
+      center: Offset(scaleAwareCenter(cx), currentRect.center.dy),
+      width: fitWidth,
+      height: fitHeight,
+    ).getLimitedCenterXInside(displayRect);
+  }
   final fit = fitAt(pos);
 
   HorizontalZone zoneOf(double p) {
@@ -652,11 +666,19 @@ VerticalRelease releaseFromStateY({
 
   final fitWidth = projectedRect?.width ?? currentRect.width;
   final fitHeight = projectedRect?.height ?? currentRect.height;
-  double fitAt(double cy) => Rect.fromCenter(
-        center: Offset(currentRect.center.dx, cy),
-        width: fitWidth,
-        height: fitHeight,
-      ).getLimitedCenterYInside(displayRect);
+  // Scale-aware center adjustment — see [releaseFromStateX] for the
+  // rationale. Keeps the display-center point under display-center after
+  // the scale settles, with cover-clamp applied as a safety.
+  final heightRatio = currentRect.height == 0 ? 1.0 : fitHeight / currentRect.height;
+  double scaleAwareCenter(double cy) =>
+      displayRect.center.dy + (cy - displayRect.center.dy) * heightRatio;
+  double fitAt(double cy) {
+    return Rect.fromCenter(
+      center: Offset(currentRect.center.dx, scaleAwareCenter(cy)),
+      width: fitWidth,
+      height: fitHeight,
+    ).getLimitedCenterYInside(displayRect);
+  }
   final fit = fitAt(pos);
 
   VerticalZone zoneOf(double p) {
