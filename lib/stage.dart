@@ -53,6 +53,7 @@ class Stage extends StatefulWidget {
     this.dragPromote,
     this.scaleVelocityCancel,
     this.overrides,
+    this.overlay,
     this.dragHybridFromStage,
     this.scaleHybridFromStage,
   });
@@ -96,6 +97,14 @@ class Stage extends StatefulWidget {
   /// Resolved last in the per-field overrides cascade (gesture-context-
   /// specific levels first, Stage as final fallback).
   final Overrides? overrides;
+
+  /// Builder for an optional consumer-provided overlay rendered *above*
+  /// the displayed origin and Stage's own overlay/scrim. Use it to add
+  /// mode-aware UI (e.g., a crop tool's appbar). Read [Stage.of] to
+  /// inspect `displayConfig()` and decide what to render. The builder
+  /// is invoked on every Stage rebuild — consumer owns any animations
+  /// (e.g. `AnimatedSwitcher` / `AnimatedOpacity`) around its output.
+  final WidgetBuilder? overlay;
 
   /// Stage-level cascade fallback for how new pointers are handled during
   /// an active gesture (see [DragGesture.hybridFromStage] /
@@ -233,7 +242,55 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         ...?_displayConfig?.scale,
       };
 
-  void _setDisplayConfig(DisplayConfig? v) => _displayConfig = v;
+  void _setDisplayConfig(DisplayConfig? v) => setState(() => _displayConfig = v);
+
+  // Backing for [Stage.setMode]: at origin setup we store the origin's
+  // default config and modes map so [_setMode] can resolve a key later.
+  DisplayConfig? _originDefaultConfig;
+  Map<Object, DisplayConfig>? _originModes;
+
+  void _setOriginConfig({
+    DisplayConfig? defaults,
+    Map<Object, DisplayConfig>? modes,
+    WidgetBuilder? overlay,
+    OriginRect? display,
+    OriginRect? displayContainer,
+    OriginRect? screen,
+  }) {
+    _originDefaultConfig = defaults;
+    _originModes = modes;
+    _originOverlay = overlay;
+    _originDisplay = display;
+    _originDisplayContainer = displayContainer;
+    _originScreen = screen;
+  }
+
+  // The currently-displayed origin's overlay/display/displayContainer/screen,
+  // used as fallbacks when the active [DisplayConfig] doesn't override them.
+  WidgetBuilder? _originOverlay;
+  OriginRect? _originDisplay;
+  OriginRect? _originDisplayContainer;
+  OriginRect? _originScreen;
+
+  /// Swaps the active [DisplayConfig] to the mode-resolved variant and
+  /// re-applies any display/displayContainer overrides the new config
+  /// carries. Null key = back to the origin's default (no-mode) config.
+  ///
+  /// Re-uses the same merge semantics as [Origin.modes]: non-null fields
+  /// in the mode override the default; null fields inherit.
+  void _setMode(Object? key) {
+    final modeConfig = key == null ? null : _originModes?[key];
+    final effective = _originDefaultConfig?.merge(modeConfig) ?? modeConfig;
+    setState(() {
+      _displayConfig = effective;
+      _displayContainer = effective?.displayContainer ?? _originDisplayContainer;
+      _display = effective?.display
+          ?? _originDisplay
+          ?? _displayContainer
+          ?? _originScreen
+          ?? _defaultOriginRect;
+    });
+  }
 
   void _onScaleStart(ScaleStartDetails details) {
     // Hybrid: merger owns the rect; skip stage's local resolver.
@@ -921,6 +978,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _setBackgroundColor(null);
     _setGestureBuilder(null);
     _setDisplayConfig(null);
+    _setOriginConfig();
     _setOnEnd(null);
     _setTag(null);
     _setLocked(true);
@@ -1187,6 +1245,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       originGesture: () => _originGesture,
       setOriginGesture: _setOriginGesture,
       setOriginPointers: _setOriginPointers,
+      displayConfig: () => _displayConfig,
       isHybridDriving: () => _isHybridDriving,
       stagePointerCount: () => _stageRecognizer?.pointerPositions.length ?? 0,
       hybridReleaseVelocity: _hybridReleaseVelocity,
@@ -1206,6 +1265,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       setBackgroundColor: _setBackgroundColor,
       setGestureBuilder: _setGestureBuilder,
       setDisplayConfig: _setDisplayConfig,
+      setOriginConfig: _setOriginConfig,
+      setMode: _setMode,
       setOnEnd: _setOnEnd,
       setTag: _setTag,
       setLocked: _setLocked,
@@ -1285,6 +1346,14 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
               },
             );
           }),
+          // Overlay slot is last → painted on top, hit-tested first. Cascade:
+          // active DisplayConfig.overlay > Origin.overlay > Stage.overlay.
+          // Tools that own gestures (e.g. Cropper) live here so their
+          // detectors take priority over Stage's recognizer; 2-finger
+          // gestures fall through to Stage via translucent hit-test.
+          if ((_displayConfig?.overlay ?? _originOverlay ?? widget.overlay)
+              case final overlay?)
+            Builder(builder: overlay),
         ],
       ),
     );
@@ -1314,6 +1383,7 @@ class StageData extends InheritedModel<Object> {
     required this.originGesture,
     required this.setOriginGesture,
     required this.setOriginPointers,
+    required this.displayConfig,
     required this.isHybridDriving,
     required this.stagePointerCount,
     required this.hybridReleaseVelocity,
@@ -1333,6 +1403,8 @@ class StageData extends InheritedModel<Object> {
     required this.setBackgroundColor,
     required this.setGestureBuilder,
     required this.setDisplayConfig,
+    required this.setOriginConfig,
+    required this.setMode,
     required this.setOnEnd,
     required this.setTag,
     required this.setLocked,
@@ -1396,6 +1468,12 @@ class StageData extends InheritedModel<Object> {
   /// hybrid gesture math.
   final ValueSetter<Map<int, Offset>> setOriginPointers;
 
+  /// Live reader: the currently-active [DisplayConfig] (the displayed
+  /// origin's, merged with any active mode override). Null when no origin
+  /// is displayed. Tools (e.g., [Cropper]) read this to check whether they
+  /// should be active in the current state.
+  final DisplayConfig? Function() displayConfig;
+
   /// Live reader: true while Stage's hybrid merger is driving the rect.
   /// Origin reads this to silence its own rect manipulation while Stage is
   /// in control.
@@ -1434,6 +1512,28 @@ class StageData extends InheritedModel<Object> {
   final ValueSetter<Color?> setBackgroundColor;
   final ValueSetter<StageBuilder?> setGestureBuilder;
   final ValueSetter<DisplayConfig?> setDisplayConfig;
+
+  /// Registers the active origin's mode lookup so [setMode] can resolve a
+  /// key into a merged [DisplayConfig]. Origin calls this in its `_setup`.
+  /// Also carries Origin-level cascade fallbacks (e.g. `overlay`, display
+  /// rect overrides) that Stage merges with the active DisplayConfig.
+  final void Function({
+    DisplayConfig? defaults,
+    Map<Object, DisplayConfig>? modes,
+    WidgetBuilder? overlay,
+    OriginRect? display,
+    OriginRect? displayContainer,
+    OriginRect? screen,
+  }) setOriginConfig;
+
+  /// Switches the active mode for the currently-displayed origin. Looks
+  /// the key up in the origin's modes map (registered via
+  /// [setOriginConfig]), merges with the origin's default config, and
+  /// swaps [displayConfig]. Passing `null` returns to the default config.
+  ///
+  /// Useful for letting consumer-side UI (e.g., an appbar's Back button)
+  /// exit a tool mode without dismissing the displayed origin.
+  final ValueSetter<Object?> setMode;
   final ValueSetter<FutureOr<void> Function()?> setOnEnd;
   final ValueSetter<Object?> setTag;
   final ValueSetter<bool> setLocked;

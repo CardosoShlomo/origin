@@ -27,6 +27,38 @@ extension RectExt on Rect {
     return Rect.fromCenter(center: center, width: width, height: height);
   }
 
+  /// Clamps `this` (a crop rect) to stay inside [boundaries], optionally
+  /// honoring a fixed aspect [ratio]. When a part of the rect spills past
+  /// an edge, it's pushed back; if [ratio] is set, the resulting rect is
+  /// resized on its center to keep the locked aspect.
+  ///
+  /// Used by the [Cropper] tool whenever the user drags the crop rect or
+  /// the underlying image transforms — keeps the crop rect inside the
+  /// image's intersected viewport.
+  Rect cropBoundaries(Rect boundaries, Ratio? ratio) {
+    if (top >= boundaries.top &&
+        left >= boundaries.left &&
+        bottom <= boundaries.bottom &&
+        right <= boundaries.right) {
+      return this;
+    }
+    final w = min(width, boundaries.width);
+    final h = min(height, boundaries.height);
+    final result = Rect.fromLTRB(
+      right >= boundaries.right ? boundaries.right - w : max(boundaries.left, left),
+      bottom >= boundaries.bottom ? boundaries.bottom - h : max(boundaries.top, top),
+      left <= boundaries.left ? boundaries.left + w : min(boundaries.right, right),
+      top <= boundaries.top ? boundaries.top + h : min(boundaries.bottom, bottom),
+    );
+    if (ratio != null) {
+      return result.resizeOnCenter(
+        min(w, h * ratio.aspectRatio),
+        min(h, w / ratio.aspectRatio),
+      );
+    }
+    return result;
+  }
+
   /// Computes the fit-cover end rect for a double-tap on a displayed
   /// (at-base) view. Scales the rect from BoxFit.contain to BoxFit.cover
   /// (so it fills the display), then pans toward [touchGlobalPosition] on

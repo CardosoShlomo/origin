@@ -1,6 +1,7 @@
 import 'dart:async';
 
 export 'corner.dart';
+export 'cropper.dart';
 export 'physics.dart';
 export 'rect_ext.dart';
 export 'ext.dart';
@@ -40,6 +41,7 @@ class Origin extends StatefulWidget {
     this.scale,
     this.constraints,
     this.displayConfig,
+    this.modes,
     this.aspectRatio,
     this.backgroundColor,
     this.onRelease,
@@ -51,6 +53,7 @@ class Origin extends StatefulWidget {
     this.dragHybridFromStage,
     this.scaleHybridFromStage,
     this.scaleVelocityCancel,
+    this.overlay,
     required this.child,
   });
 
@@ -74,6 +77,20 @@ class Origin extends StatefulWidget {
   final Map<ScaleStart, ScaleGesture>? scale;
   final GestureConstraints? constraints;
   final DisplayConfig? displayConfig;
+
+  /// Mode-specific [DisplayConfig] variants, looked up by key when
+  /// `event.animateToBase(modeKey)` is called.
+  ///
+  /// Each mode's DisplayConfig is merged into [displayConfig] field-by-field:
+  /// non-null fields in the mode override the default; null fields inherit.
+  /// `Map`-typed fields (`drag`, `scale`) follow the same rule — an empty
+  /// `{}` explicitly disables (vs `null` which inherits the default's map).
+  ///
+  /// Modes are how the same Origin can open with different rules per tap
+  /// (e.g., `'crop_square'` vs `'crop_free'`). Tools (cropper, eraser) are
+  /// configured *inside* a mode's DisplayConfig via fields like
+  /// [DisplayConfig.crop].
+  final Map<Object, DisplayConfig>? modes;
   final double? aspectRatio;
   final Color? backgroundColor;
   final OnRelease? onRelease;
@@ -96,6 +113,11 @@ class Origin extends StatefulWidget {
   /// cancellation. Resolved between [Gesture.scaleVelocityCancel] /
   /// [DisplayConfig.scaleVelocityCancel] and [Stage.scaleVelocityCancel].
   final double? scaleVelocityCancel;
+
+  /// Origin-level overlay builder. Resolved in the cascade
+  /// mode > displayConfig > this > [Stage.overlay]. Only rendered while
+  /// this Origin is the displayed one on Stage.
+  final WidgetBuilder? overlay;
 
   final Widget child;
 
@@ -545,19 +567,28 @@ class _OriginState extends State<Origin> {
     await _stage.backToOrigin(data, except: _swapDisplaced);
   }
 
-  StageData _setup() {
+  StageData _setup({Object? mode}) {
     final data = _stage;
     final origin = _measureOrigin();
     final screen = OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context));
 
     data.setOrigin(origin);
-    data.setDisplayContainer(widget.displayContainer);
     data.setOriginContainer(widget.originContainer ?? (widget.containerTag != null ? data.measureEntry(widget.containerTag!) : null));
-    data.setDisplay(widget.display ?? widget.displayContainer ?? screen);
     data.setAspectRatio(widget.aspectRatio ?? context.size!.aspectRatio);
     data.setWidget(_OriginData(tag: widget.tag, child: KeyedSubtree(key: _childKey, child: widget.child)));
     if (widget.builder != null) data.setGestureBuilder(widget.builder);
-    data.setDisplayConfig(widget.displayConfig);
+    // Register the origin's default config + modes map + display fallbacks
+    // so Stage can resolve [setMode] calls later (including re-applying
+    // display/displayContainer per the active mode's overrides).
+    data.setOriginConfig(
+      defaults: widget.displayConfig,
+      modes: widget.modes,
+      overlay: widget.overlay,
+      display: widget.display,
+      displayContainer: widget.displayContainer,
+      screen: screen,
+    );
+    data.setMode(mode);
     data.setPerspective(widget.constraints?.perspective);
     data.setBackgroundColor(widget.backgroundColor);
     final onEnd = widget.onEnd;
@@ -570,8 +601,8 @@ class _OriginState extends State<Origin> {
     return data;
   }
 
-  Future<void> _open() {
-    return _setup().animateToBase();
+  Future<void> _open([Object? mode]) {
+    return _setup(mode: mode).animateToBase();
   }
 
   Future<void> _send(Rect Function(Rect) send, {VoidCallback? onEnd}) {

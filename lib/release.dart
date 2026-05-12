@@ -21,14 +21,21 @@ import 'rect_ext.dart';
 /// - `k = 0.8, threshold = 0.1`: scaleVel 0.1 → 24%; 0.5 → 37%; 1.0 → 89%.
 /// - `k = 1.0, threshold = 0.1`: scaleVel 0.1 → 30%; 0.5 → 46%; 1.0 → full.
 extension ScaleEndDetailsCancel on ScaleEndDetails {
-  static const _threshold = 0.1;
+  /// `|scaleVelocity|` below this is treated as no-pinch — no cancellation.
+  static const double cancelTranslationThreshold = 0.1;
+
+  /// Cancellation amount applied the moment `|scaleVelocity|` crosses
+  /// [cancelTranslationThreshold] (before the quadratic growth term),
+  /// scaled by `k`.
+  static const double cancelTranslationBaseline = 0.3;
 
   ScaleEndDetails cancelTranslation(double k) {
     if (k <= 0) return this;
     final scaleVel = scaleVelocity.abs();
-    if (scaleVel < _threshold) return this;
-    final excess = scaleVel - _threshold;
-    final amount = (k * (0.3 + excess * excess)).clamp(0.0, 1.0);
+    if (scaleVel < cancelTranslationThreshold) return this;
+    final excess = scaleVel - cancelTranslationThreshold;
+    final amount = (k * (cancelTranslationBaseline + excess * excess))
+        .clamp(0.0, 1.0);
     final factor = 1.0 - amount;
     if (factor == 1.0) return this;
     return ScaleEndDetails(

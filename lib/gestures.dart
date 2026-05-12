@@ -1,5 +1,7 @@
 import 'package:flutter/widgets.dart';
 
+import 'origin_rect.dart';
+import 'ratio.dart';
 import 'release.dart';
 
 typedef StageBuilder = Widget Function(BuildContext context, Widget child);
@@ -16,7 +18,11 @@ class TapEvent {
 
   final Offset localPosition;
   final Offset globalPosition;
-  final Future<void> Function() animateToBase;
+  /// Opens the Origin onto the Stage. Optional [mode] is a key into the
+  /// Origin's [Origin.modes] map — when set, that mode's DisplayConfig is
+  /// merged onto the default before animating. Use this to open with
+  /// tool-specific configuration (e.g. `event.animateToBase('crop_square')`).
+  final Future<void> Function([Object? mode]) animateToBase;
   final Future<void> Function({
     double? rotateX,
     double? rotateY,
@@ -420,6 +426,10 @@ class DisplayConfig {
     this.doubleTapPullFactor,
     this.dragPromote,
     this.scaleVelocityCancel,
+    this.crop,
+    this.overlay,
+    this.display,
+    this.displayContainer,
     this.overrides,
   });
 
@@ -448,9 +458,100 @@ class DisplayConfig {
   /// `[0, 1]`. Resolved as: gesture > displayConfig > stage > 0.5 default.
   final double? scaleVelocityCancel;
 
+  /// Cropper tool configuration. When non-null and a `Cropper` widget is
+  /// present in the displayed view's tree, the cropper renders its UI and
+  /// owns 1-finger gestures. Different modes can have different `CropConfig`s
+  /// (e.g., `'crop_square'` locks aspect ratio, `'crop_free'` allows any).
+  final CropConfig? crop;
+
+  /// Optional overlay builder for this DisplayConfig. Resolved in the
+  /// cascade: mode > displayConfig > [Origin.overlay] > [Stage.overlay].
+  /// Set on a mode to swap in a tool-specific appbar (e.g., crop toolbar)
+  /// only when that mode is active.
+  final WidgetBuilder? overlay;
+
+  /// Optional display rect override. Resolved in the cascade
+  /// mode > displayConfig > [Origin.display]. Use this on a mode to
+  /// constrain the displayed item's rect (e.g., shrink so it doesn't run
+  /// under an appbar that's only present in this mode).
+  final OriginRect? display;
+
+  /// Optional display container override. Resolved in the cascade
+  /// mode > displayConfig > [Origin.displayContainer].
+  final OriginRect? displayContainer;
+
   /// Cascade fallback for [Stage.overrides]/[Origin.overrides] while the
   /// origin is displayed.
   final Overrides? overrides;
+
+  /// Returns a new [DisplayConfig] where each non-null field of [override]
+  /// replaces the corresponding field of `this`. Null fields in [override]
+  /// keep the value from `this`. Used to apply mode-specific configs on top
+  /// of the default `DisplayConfig` — see [Origin.modes].
+  ///
+  /// Note: Map fields (`drag`, `scale`) follow the same "non-null wins" rule,
+  /// so passing an empty `{}` in [override] explicitly disables (vs `null`
+  /// which inherits).
+  DisplayConfig merge(DisplayConfig? override) {
+    if (override == null) return this;
+    return DisplayConfig(
+      drag: override.drag ?? drag,
+      scale: override.scale ?? scale,
+      constraints: override.constraints ?? constraints,
+      onRelease: override.onRelease ?? onRelease,
+      onDoubleTap: override.onDoubleTap ?? onDoubleTap,
+      doubleTapPullFactor: override.doubleTapPullFactor ?? doubleTapPullFactor,
+      dragPromote: override.dragPromote ?? dragPromote,
+      scaleVelocityCancel: override.scaleVelocityCancel ?? scaleVelocityCancel,
+      crop: override.crop ?? crop,
+      overlay: override.overlay ?? overlay,
+      display: override.display ?? display,
+      displayContainer: override.displayContainer ?? displayContainer,
+      overrides: override.overrides ?? overrides,
+    );
+  }
+}
+
+/// Cropper tool configuration. Attached to a [DisplayConfig] via
+/// [DisplayConfig.crop]. When non-null in the active mode's DisplayConfig,
+/// the [Cropper] widget renders crop UI and applies these constraints when
+/// the user manipulates the crop rect.
+class CropConfig {
+  const CropConfig({
+    this.ratio,
+    this.shortest,
+    this.longest,
+    this.smallest,
+    this.largest,
+    this.initialRect,
+    this.borderRadius,
+  });
+
+  /// Locked aspect ratio. Null = free aspect.
+  final Ratio? ratio;
+
+  /// Minimum dimensions. Null = no minimum.
+  final Size? shortest;
+
+  /// Maximum dimensions. Null = no maximum.
+  final Size? longest;
+
+  /// Minimum area (e.g. `width × height` floor). Null = no area floor.
+  final double? smallest;
+
+  /// Maximum area (e.g. `width × height` cap). Null = no area limit.
+  final double? largest;
+
+  /// Computes the initial crop rect given the base rect. Null = default
+  /// to the base rect itself.
+  final Rect Function(Rect baseRect)? initialRect;
+
+  /// Computes the visual border radius from the current crop rect.
+  /// Lets the radius scale with the rect's dimensions — e.g.,
+  /// `(r) => BorderRadius.circular(r.shortestSide / 2)` for a circular
+  /// preview, `(r) => BorderRadius.circular(r.shortestSide / 8)` for a
+  /// soft-rounded square. Null = rectangular preview.
+  final BorderRadius Function(Rect cropRect)? borderRadius;
 }
 
 /// Inputs supplied to [Overrides.anchor] when computing the rect's center
