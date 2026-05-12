@@ -1,6 +1,7 @@
 import 'dart:async';
 
 export 'corner.dart';
+export 'crop_image.dart';
 export 'cropper.dart';
 export 'physics.dart';
 export 'rect_ext.dart';
