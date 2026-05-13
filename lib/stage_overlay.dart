@@ -53,7 +53,14 @@ class StageOverlay extends StatelessWidget {
       child: ValueListenableBuilder<double>(
         valueListenable: data.originToBaseProgress,
         builder: (context, p, child) {
-          final br = BorderRadius.lerp(data.origin.borderRadius, data.display.borderRadius, p)!;
+          // Crop mode locks the clip to [display.borderRadius] — no lerp.
+          // The image stays rectangular while shrinking back to a circular
+          // origin (e.g., circular avatar), since the crop result is a
+          // rectangle and a curved clip would chop the corners.
+          final inCrop = data.displayConfig()?.crop != null;
+          final br = inCrop
+              ? data.display.borderRadius
+              : BorderRadius.lerp(data.origin.borderRadius, data.display.borderRadius, p)!;
           final clipped = ClipRRect(borderRadius: br, child: child);
           return data.gestureBuilder?.call(context, clipped) ?? clipped;
         },
@@ -86,6 +93,16 @@ class _Scrim extends StatelessWidget {
     final data = Stage.of(context);
     final color = data.backgroundColor;
     if (color == null) return const SizedBox.shrink();
+
+    // Crop mode keeps the scrim at full opacity *except* during a real
+    // open/dismiss animation. [openingOrDismissing] is explicitly set in
+    // [animateToBase] / [dismiss] and cleared in their finally blocks;
+    // release settle / rubber-back paths don't touch it, so the scrim
+    // stays solid through pinch → release as the rect bounces back.
+    final inCrop = data.displayConfig()?.crop != null;
+    if (inCrop && !data.openingOrDismissing) {
+      return ColoredBox(color: color, child: const SizedBox.expand());
+    }
 
     return ValueListenableBuilder<double>(
       valueListenable: data.originToBaseProgress,

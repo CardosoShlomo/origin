@@ -20,19 +20,25 @@ extension ScaleExt on ScaleUpdateDetails {
     );
   }
 
+  /// Computes the image rect after a crop-rect drag step. When the crop rect
+  /// is pinned against the image edge in the drag direction, the image is
+  /// pulled along with the finger by an asymmetric amount based on the
+  /// focal point's distance to each edge of the crop. [overdragMax] caps the
+  /// per-frame catch-up; configurable via [CropConfig.overdragMax].
   Rect imageRectOnDragCropRect({
     required Rect container,
     required Rect imageRect,
     required Rect cropRect,
+    double overdragMax = 3.0,
   }) {
     double dx = -focalPointDelta.dx;
     if ((cropRect.width - container.width).abs() > 1) {
       final leftToFocalDistance = max(0.1, focalPoint.dx - cropRect.left);
       final rightToFocalDistance = max(0.1, cropRect.right - focalPoint.dx);
       if (focalPointDelta.dx < 0 && (cropRect.left - container.left).abs() < 1) {
-        dx += 3 - min(3, leftToFocalDistance/rightToFocalDistance);
+        dx += overdragMax - min(overdragMax, leftToFocalDistance / rightToFocalDistance);
       } else if (focalPointDelta.dx > 0 && (cropRect.right - container.right).abs() < 1) {
-        dx -= 3 - min(3, rightToFocalDistance/leftToFocalDistance);
+        dx -= overdragMax - min(overdragMax, rightToFocalDistance / leftToFocalDistance);
       } else {
         dx = 0;
       }
@@ -43,9 +49,9 @@ extension ScaleExt on ScaleUpdateDetails {
       final topToFocalDistance = max(0.1, focalPoint.dy - cropRect.top);
       final bottomToFocalDistance = max(0.1, cropRect.bottom - focalPoint.dy);
       if (focalPointDelta.dy < 0 && (cropRect.top - container.top).abs() < 1) {
-        dy += 3 - min(3, topToFocalDistance/bottomToFocalDistance);
+        dy += overdragMax - min(overdragMax, topToFocalDistance / bottomToFocalDistance);
       } else if (focalPointDelta.dy > 0 && (cropRect.bottom - container.bottom).abs() < 1) {
-        dy -= 3 - min(3, bottomToFocalDistance/topToFocalDistance);
+        dy -= overdragMax - min(overdragMax, bottomToFocalDistance / topToFocalDistance);
       } else {
         dy = 0;
       }

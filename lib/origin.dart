@@ -138,6 +138,15 @@ class Origin extends StatefulWidget {
     return tag != null && Stage.isActiveOf(context, tag);
   }
 
+  /// True iff the enclosing Origin's tag is currently active on stage *and*
+  /// Stage's recognizer has at least one pointer down. Child widgets that
+  /// live in the Origin's subtree can read this without knowing their tag.
+  /// Resolves to false when no [_OriginData] is in scope.
+  static bool isInteractingOf(BuildContext context) {
+    final tag = context.dependOnInheritedWidgetOfExactType<_OriginData>()?.tag;
+    return tag != null && Stage.isInteractingOf(context, tag);
+  }
+
   static OriginRect? measureOf(BuildContext context) {
     final tag = context.dependOnInheritedWidgetOfExactType<_OriginData>()?.tag;
     if (tag == null) return null;

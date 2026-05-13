@@ -33,19 +33,26 @@ class TapEvent {
   }) runEffect;
 }
 
-/// Signature for a displayed-state double-tap handler.
+/// Signature for displayed-state tap/double-tap handlers — both carry the
+/// same [StageTapEvent] payload.
 ///
-/// Distinct from Origin's [onDoubleTap] (which is a [StageTap], mirroring
-/// [onTap]) — this one runs on the displayed view, carries rect info, and
-/// has a package default. Cascade: [DisplayConfig.onDoubleTap] →
-/// [Stage.onDoubleTap] → package default (toggle baseRect ↔ fit-cover-at-focal).
-typedef OnDoubleTap = void Function(BuildContext context, DoubleTapEvent event);
+/// Distinct from Origin's [Origin.onTap] (which is a [StageTap], used to open
+/// the un-displayed item onto the Stage). This one runs while the item is
+/// already on stage and resolves through the cascade [DisplayConfig.onTap] /
+/// [DisplayConfig.onDoubleTap] → [Stage.onTap] / [Stage.onDoubleTap] →
+/// package default (no-op for [onTap]; toggle baseRect ↔ fit-cover-at-focal
+/// for [onDoubleTap]).
+///
+/// The handler does not receive a [BuildContext] — consumers typically
+/// define these callbacks in a `build` body where they already have one in
+/// scope and can call `Stage.of(context).dismiss()` etc. directly.
+typedef OnStageTap = void Function(StageTapEvent event);
 
-/// Inputs passed to [OnDoubleTap] when the displayed view receives a
-/// double-tap. Carries the tap position plus the current/base/display rects
-/// so handlers can compute a target without re-reading [StageData].
-class DoubleTapEvent {
-  const DoubleTapEvent({
+/// Inputs passed to [OnStageTap] when the displayed view receives a single-
+/// or double-tap. Carries the tap position plus the current/base/display
+/// rects at the moment of the tap.
+class StageTapEvent {
+  const StageTapEvent({
     required this.localPosition,
     required this.globalPosition,
     required this.currentRect,
@@ -60,6 +67,9 @@ class DoubleTapEvent {
   final Rect displayRect;
   final Rect baseRect;
   final double aspectRatio;
+
+  /// True if the tap landed inside the currently-displayed rect.
+  bool get insideRect => currentRect.contains(globalPosition);
 }
 
 /// Sealed parent for gesture-start enums. Pattern-match exhaustiveness on
@@ -422,6 +432,7 @@ class DisplayConfig {
     this.scale,
     this.constraints,
     this.onRelease,
+    this.onTap,
     this.onDoubleTap,
     this.doubleTapPullFactor,
     this.dragPromote,
@@ -441,9 +452,15 @@ class DisplayConfig {
   /// Resolved as: gesture > displayConfig > stage > package default.
   final OnRelease? onRelease;
 
+  /// Cascade fallback for displayed-state single-tap. Resolved as:
+  /// displayConfig > stage > package default (no-op). Use this to react to
+  /// taps on the displayed view — e.g. toggle a chrome overlay when the tap
+  /// is [StageTapEvent.insideRect], dismiss otherwise.
+  final OnStageTap? onTap;
+
   /// Cascade fallback for displayed-state double-tap. Resolved as:
   /// displayConfig > stage > package default (toggle baseRect ↔ fit-cover).
-  final OnDoubleTap? onDoubleTap;
+  final OnStageTap? onDoubleTap;
 
   /// Tunes the panning behavior of the default at-base double-tap (passed to
   /// [RectExt.fitCoverRect] as `pullFactor`). `0` = under-finger, `1` = max
@@ -499,6 +516,7 @@ class DisplayConfig {
       scale: override.scale ?? scale,
       constraints: override.constraints ?? constraints,
       onRelease: override.onRelease ?? onRelease,
+      onTap: override.onTap ?? onTap,
       onDoubleTap: override.onDoubleTap ?? onDoubleTap,
       doubleTapPullFactor: override.doubleTapPullFactor ?? doubleTapPullFactor,
       dragPromote: override.dragPromote ?? dragPromote,
@@ -525,6 +543,7 @@ class CropConfig {
     this.largest,
     this.initialRect,
     this.borderRadius,
+    this.overdragMax = 3.0,
   });
 
   /// Locked aspect ratio. Null = free aspect.
@@ -552,6 +571,14 @@ class CropConfig {
   /// preview, `(r) => BorderRadius.circular(r.shortestSide / 8)` for a
   /// soft-rounded square. Null = rectangular preview.
   final BorderRadius Function(Rect cropRect)? borderRadius;
+
+  /// Caps the per-frame image shift applied when the crop rect is being
+  /// dragged into the edge of the image (see
+  /// [ScaleExt.imageRectOnDragCropRect]). Higher values let the image catch
+  /// up to the finger more aggressively when the crop is pinned against an
+  /// edge; lower values keep the image steadier. Default `3.0`, matching
+  /// imagineai's original tuning.
+  final double overdragMax;
 }
 
 /// Inputs supplied to [Overrides.anchor] when computing the rect's center

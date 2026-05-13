@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
+import 'ext.dart';
 import 'rect_ext.dart';
 import 'gestures.dart';
 import 'origin_rect.dart';
@@ -39,6 +41,7 @@ const _tagAspect = #_stageTag;
 const _widgetAspect = #_stageWidget;
 const _hasWidgetAspect = #_stageHasWidget;
 const _dismissingAspect = #_stageDismissing;
+const _interactingAspect = #interacting;
 
 class Stage extends StatefulWidget {
   const Stage({
@@ -48,6 +51,7 @@ class Stage extends StatefulWidget {
     this.scale,
     this.constraints,
     this.onRelease,
+    this.onTap,
     this.onDoubleTap,
     this.doubleTapPullFactor,
     this.dragPromote,
@@ -74,10 +78,16 @@ class Stage extends StatefulWidget {
   /// gesture-end cascades.
   final OnRelease? onRelease;
 
+  /// Stage-level fallback for displayed-state single-tap. Resolved as:
+  /// [DisplayConfig.onTap] → this → package default (no-op). Use this for
+  /// global tap behavior (e.g. dismiss-on-outside) that all displayed
+  /// configs inherit unless they override.
+  final OnStageTap? onTap;
+
   /// Stage-level fallback for displayed-state double-tap. Resolved as:
   /// [DisplayConfig.onDoubleTap] → this → package default. The package
   /// default toggles between baseRect and fit-cover-at-focal.
-  final OnDoubleTap? onDoubleTap;
+  final OnStageTap? onDoubleTap;
 
   /// Stage-level fallback for the at-base double-tap pan tuning. Cascade:
   /// [DisplayConfig.doubleTapPullFactor] → this → package default (0.4).
@@ -135,6 +145,26 @@ class Stage extends StatefulWidget {
     return data.tag == tag;
   }
 
+  /// Coarse "is the user touching the stage right now?" signal.
+  ///
+  /// When [tag] is omitted, returns true if Stage's recognizer has any
+  /// pointer down — untagged, fires for any interaction. Suitable for
+  /// callers guaranteed to be mounted only while their tag is active (e.g.
+  /// overlay-slot builders) or for any caller that doesn't care which origin
+  /// is being touched.
+  ///
+  /// When [tag] is provided, returns true iff [tag] is the active stage tag
+  /// *and* there's at least one pointer down. The aspect is tag-scoped, so
+  /// consumers in unrelated origin subtrees don't rebuild on peer-origin
+  /// interactions.
+  static bool isInteractingOf(BuildContext context, [Object? tag]) {
+    if (tag == null) {
+      return InheritedModel.inheritFrom<StageData>(context, aspect: _interactingAspect)!.interacting;
+    }
+    final data = InheritedModel.inheritFrom<StageData>(context, aspect: (#interacting, tag))!;
+    return data.tag == tag && data.interacting;
+  }
+
 
   static Widget? widgetOf(BuildContext context) {
     return InheritedModel.inheritFrom<StageData>(context, aspect: _widgetAspect)!.widget;
@@ -158,6 +188,32 @@ class Stage extends StatefulWidget {
 
 class _StageState extends State<Stage> with TickerProviderStateMixin {
   final _rect = ValueNotifier(Rect.zero);
+  // True while Stage's recognizer holds &gt; 0 pointers — a coarse "is the user
+  // touching the displayed area right now?" signal. Consumers read it via
+  // [Stage.isInteractingOf] (tag-aware: returns true iff the queried tag is
+  // currently the active stage tag *and* there's at least one pointer down).
+  // Independent of which gesture (drag/scale) has committed in arena.
+  bool _interacting = false;
+
+  /// The active crop rect, owned by Stage just like [_rect]. Initialized
+  /// from [CropConfig.initialRect] when a crop mode activates; mutated by
+  /// the recognizer (1-pointer drag inside the rect) and by the [Cropper]
+  /// widget's handles. Consumers read it via [StageData.crop] when they
+  /// need the result. Reset to [Rect.zero] on dismiss.
+  final _crop = ValueNotifier<Rect>(.zero);
+
+  /// Reference equality marker for the last [CropConfig] applied — used by
+  /// [_setMode] to decide whether to re-seed [_crop] from
+  /// [CropConfig.initialRect]. Switching from one crop config to another
+  /// (e.g. free → square) re-seeds; leaving the same config alone preserves
+  /// in-flight edits.
+  CropConfig? _lastCrop;
+
+  /// True while the active gesture is a crop-rect drag (single pointer that
+  /// landed inside the crop rect). Flipped in [_onScaleStart], read in
+  /// [_onScaleUpdate], cleared in [_onScaleEnd] or when a second pointer
+  /// arrives (so pinch always takes over to image scale).
+  bool _cropDrag = false;
 
   static const _defaultOriginRect = OriginRect(rect: .zero);
 
@@ -187,6 +243,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   late final AnimationController _centerY;
   late final AnimationController _width;
   late final AnimationController _effect;
+  late final AnimationController _cropAnim;
   final _rotation = ValueNotifier<Rotation?>(null);
 
   @override
@@ -196,13 +253,104 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _centerY = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateRect);
     _width = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateRect);
     _effect = AnimationController(vsync: this, duration: _defaultDuration);
+    _cropAnim = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateCrop);
     _rect.addListener(_updateProgress);
     _rect.addListener(_updateContainer);
+  }
+
+  /// Hard package floor for both the image rect and the crop rect while in
+  /// crop mode (in logical pixels). Mirrors `_CropperState._minCropSide`.
+  static const _kCropMinSide = 80.0;
+
+  /// Final clamp applied at the end of [_onScaleUpdate] in crop mode. Three
+  /// invariants — package-level, independent of any consumer-set drag bounds
+  /// or release physics:
+  ///
+  /// 1. Crop rect width/height >= [_kCropMinSide].
+  /// 2. Image rect width/height >= max(crop's width/height, [_kCropMinSide])
+  ///    — the image must be at least as big as the crop on each axis,
+  ///    otherwise it can't cover it.
+  /// 3. Image rect contains the crop rect — pan it back if a gesture moved
+  ///    the image off such that part of the crop fell outside the image.
+  ///
+  /// Consumer-set bounds / friction still own everything else (rubber to
+  /// display, decay, etc.) — these only enforce the image/crop relationship
+  /// so the cropper never ends up with no image under it.
+  void _clampCropMins() {
+    // 1. Crop min size first — the image size invariant depends on the
+    // post-clamp crop size.
+    final c0 = _crop.value;
+    var c = c0;
+    if (c.width > 0 && c.height > 0
+        && (c.width < _kCropMinSide || c.height < _kCropMinSide)) {
+      final scale = math.max(_kCropMinSide / c.width, _kCropMinSide / c.height);
+      c = Rect.fromCenter(
+        center: c.center,
+        width: c.width * scale,
+        height: c.height * scale,
+      );
+      _crop.value = c;
+    }
+
+    // 2. Image rect must be at least as big as the crop.
+    final r0 = _rect.value;
+    var r = r0;
+    final minW = math.max(_kCropMinSide, c.width);
+    final minH = math.max(_kCropMinSide, c.height);
+    if (r.width > 0 && r.height > 0
+        && (r.width < minW || r.height < minH)) {
+      final scale = math.max(minW / r.width, minH / r.height);
+      r = Rect.fromCenter(
+        center: r.center,
+        width: r.width * scale,
+        height: r.height * scale,
+      );
+    }
+
+    // 3. Image must contain crop — push image back if a gesture put part of
+    // the crop outside.
+    var left = r.left;
+    var top = r.top;
+    if (r.left > c.left) left = c.left;
+    if (r.right < c.right) left = c.right - r.width;
+    if (r.top > c.top) top = c.top;
+    if (r.bottom < c.bottom) top = c.bottom - r.height;
+    if (left != r.left || top != r.top) {
+      r = Rect.fromLTWH(left, top, r.width, r.height);
+    }
+    if (r != r0) _rect.value = r;
   }
 
   final _centerXTween = Tween<double>(begin: 0, end: 0);
   final _centerYTween = Tween<double>(begin: 0, end: 0);
   final _widthTween = Tween<double>(begin: 0, end: 0);
+  final _cropTween = RectTween(begin: Rect.zero, end: Rect.zero);
+
+  void _updateCrop() {
+    _crop.value = _cropTween.evaluate(_cropAnim)!;
+  }
+
+  /// Animates [crop] from its current value to [to]. Mirrors the rect-animation
+  /// path used for [_rect] but for the crop rect — used for the reset action
+  /// (snap-back to [CropConfig.initialRect]) and any other place that wants
+  /// to programmatically transition the crop rect smoothly instead of
+  /// instantly assigning to `stage.crop.value`.
+  Future<void> animateCrop({required Rect to, Duration? duration, Curve curve = Curves.easeOut}) {
+    _cropTween.begin = _crop.value;
+    _cropTween.end = to;
+    _safeReset(_cropAnim);
+    return _cropAnim.animateTo(1, duration: duration, curve: curve);
+  }
+
+  /// True during an open animation ([animateToBase]) or a dismiss animation
+  /// ([dismiss]). Cleared in the finally blocks of both. Release rubber-back
+  /// / settle paths don't touch this. Consumers (e.g. crop-mode scrim) use
+  /// it to fade only during real open/dismiss and stay solid through
+  /// interaction + settle.
+  bool _openingOrDismissing = false;
+  void _setOpeningOrDismissing(bool v) {
+    if (_openingOrDismissing != v) setState(() => _openingOrDismissing = v);
+  }
 
   // Decomposed-release state. When true, [_updateRect] computes the rect's
   // center as `proportional(W) + offset` instead of treating X/Y tweens as
@@ -281,15 +429,35 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   void _setMode(Object? key) {
     final modeConfig = key == null ? null : _originModes?[key];
     final effective = _originDefaultConfig?.merge(modeConfig) ?? modeConfig;
+    final prevDisplay = _display;
+    final newDisplay = effective?.display
+        ?? _originDisplay
+        ?? (effective?.displayContainer ?? _originDisplayContainer)
+        ?? _originScreen
+        ?? _defaultOriginRect;
     setState(() {
       _displayConfig = effective;
       _displayContainer = effective?.displayContainer ?? _originDisplayContainer;
-      _display = effective?.display
-          ?? _originDisplay
-          ?? _displayContainer
-          ?? _originScreen
-          ?? _defaultOriginRect;
+      _display = newDisplay;
     });
+    // Seed the crop rect when entering a new crop config (by identity) so
+    // switching configs (e.g. free → square) re-anchors to the configured
+    // initial rect, but in-flight edits within the same config aren't lost.
+    final crop = effective?.crop;
+    if (crop != null && !identical(crop, _lastCrop)) {
+      _lastCrop = crop;
+      final base = newDisplay.rect.baseRect(_aspectRatio);
+      _crop.value = crop.initialRect?.call(base) ?? base;
+    } else if (crop == null) {
+      _lastCrop = null;
+    }
+    // When the active mode changes the display rect (e.g. crop mode
+    // constrains the display to exclude an appbar), animate the live rect
+    // to the new base — otherwise the image would jump or sit at a stale
+    // position relative to the new container.
+    if (newDisplay.rect != prevDisplay.rect && _rect.value != .zero) {
+      animateRect(to: newDisplay.rect.baseRect(_aspectRatio), curve: Curves.easeOut);
+    }
   }
 
   void _onScaleStart(ScaleStartDetails details) {
@@ -301,6 +469,21 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     final added = details.pointerCount > _prevPointerCount;
     _prevPointerCount = details.pointerCount;
+
+    // Crop-drag detection: 1-pointer gesture starting inside the active crop
+    // rect → drag the crop rect (image follows at edges). 2+ pointers always
+    // mean image scale — so we exit crop-drag mode the moment a 2nd finger
+    // arrives. This is the entry side; [_onScaleUpdate] consumes the flag.
+    if (details.pointerCount == 1
+        && _displayConfig?.crop != null
+        && _crop.value.contains(details.focalPoint)) {
+      _cropDrag = true;
+      // No drag/scale resolver — we hijack the gesture.
+      return;
+    }
+    if (_cropDrag && details.pointerCount > 1) {
+      _cropDrag = false;
+    }
 
     // Pointer removed (count went down): keep current gesture. The real end
     // is when all pointers leave — that's the recognizer's onEnd.
@@ -327,8 +510,40 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
+    // First update of a gesture = user is actually manipulating (vs. just
+    // touching). Promote [_interacting] here, not on pointer-down, so a
+    // plain tap never briefly flips it true.
+    if (!_interacting) setState(() => _interacting = true);
     // Hybrid: merger owns the rect; skip stage's local update logic.
     if (_isHybridDriving) return;
+
+    // Crop-drag path: hijacked gesture, no resolver, no totalDelta. Move
+    // the crop rect by the focal delta (clamped to the image-intersect-
+    // display boundary) and shift the image when the crop is pinned to an
+    // edge in the drag direction (catch-up capped by overdragMax).
+    final cropConfig = _displayConfig?.crop;
+    if (_cropDrag) {
+      if (details.pointerCount > 1) {
+        // 2nd finger arrived mid-gesture — exit crop drag, fall into normal
+        // scale flow so the pinch zooms the image.
+        _cropDrag = false;
+      } else if (cropConfig != null) {
+        final boundaries = _rect.value.intersect(_display.rect);
+        final newCrop = _crop.value
+            .shift(details.focalPointDelta)
+            .cropBoundaries(boundaries, cropConfig.ratio);
+        _crop.value = newCrop;
+        _rect.value = details.imageRectOnDragCropRect(
+          container: _display.rect,
+          imageRect: _rect.value,
+          cropRect: newCrop,
+          overdragMax: cropConfig.overdragMax,
+        );
+        _clampCropMins();
+        return;
+      }
+    }
+
     _totalDelta += details.focalPointDelta;
 
     switch (_active?.gesture) {
@@ -461,9 +676,26 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         _rect.value = Rect.fromCenter(center: center, width: newWidth, height: newHeight);
       }
     }
+    // Final clamp: at the very end of crop-mode gesture updates, ensure
+    // neither rect dropped below the floor. One pass, no listeners.
+    if (_displayConfig?.crop != null) _clampCropMins();
   }
 
   Future<void> _onScaleEnd(ScaleEndDetails details, BuildContext context) async {
+    // All stage pointers up → end of any manipulation. Clear interacting
+    // immediately so overlay chrome can fade back in while the release
+    // physics still run.
+    if (_interacting) setState(() => _interacting = false);
+    // Crop-drag end: no release physics — the crop rect was set live each
+    // frame and the image is already positioned to match.
+    if (_cropDrag) {
+      _cropDrag = false;
+      _active = null;
+      _lastActive = null;
+      _totalDelta = .zero;
+      _prevPointerCount = 0;
+      return;
+    }
     // If origin is still gesturing (its recognizer has pointers), defer —
     // origin's onScaleEnd will fire the release when its last pointer leaves.
     if (_originPointers.isNotEmpty) {
@@ -626,7 +858,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
   /// Package default: toggle between baseRect (when zoomed/translated) and
   /// fit-cover-at-focal (when at base). Pan tuning via cascaded pullFactor.
-  void _defaultOnDoubleTap(BuildContext context, DoubleTapEvent e) {
+  void _defaultOnDoubleTap(StageTapEvent e) {
     final atBase = (e.currentRect.center - e.baseRect.center).distance < 1.0
         && (e.currentRect.width - e.baseRect.width).abs() < 1.0;
     final pullFactor = _displayConfig?.doubleTapPullFactor
@@ -639,23 +871,41 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
             pullFactor: pullFactor,
           )
         : e.baseRect;
-    Stage.of(context).animateRect(to: target, curve: Curves.easeOut);
+    animateRect(to: target, curve: Curves.easeOut);
   }
 
-  void _onDoubleTap(BuildContext context) {
-    final baseRect = _display.rect.baseRect(_aspectRatio);
-    final event = DoubleTapEvent(
+  void _onDoubleTap() {
+    final event = StageTapEvent(
       localPosition: _doubleTapLocal,
       globalPosition: _doubleTapGlobal,
       currentRect: _rect.value,
       displayRect: _display.rect,
-      baseRect: baseRect,
+      baseRect: _display.rect.baseRect(_aspectRatio),
       aspectRatio: _aspectRatio,
     );
     final handler = _displayConfig?.onDoubleTap
         ?? widget.onDoubleTap
         ?? _defaultOnDoubleTap;
-    handler(context, event);
+    handler(event);
+  }
+
+  // Single-tap recognizer fires onTapUp with position info — capture here so
+  // we can build a [StageTapEvent] with the rect snapshot at tap time.
+  Offset _tapLocal = .zero;
+  Offset _tapGlobal = .zero;
+
+  void _onTap() {
+    final handler = _displayConfig?.onTap ?? widget.onTap;
+    if (handler == null) return;
+    final event = StageTapEvent(
+      localPosition: _tapLocal,
+      globalPosition: _tapGlobal,
+      currentRect: _rect.value,
+      displayRect: _display.rect,
+      baseRect: _display.rect.baseRect(_aspectRatio),
+      aspectRatio: _aspectRatio,
+    );
+    handler(event);
   }
 
   void _resetHybridMerger() {
@@ -983,6 +1233,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _setTag(null);
     _setLocked(true);
     _setDismissing(false);
+    if (_interacting) setState(() => _interacting = false);
+    _crop.value = .zero;
+    _lastCrop = null;
+    _cropDrag = false;
   }
 
   Future<void> runEffect({
@@ -1026,16 +1280,23 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       _setTagState(tag, .returning);
     }
     _setDismissing(true);
+    _setOpeningOrDismissing(true);
     try {
       await animateRect(to: _origin.rect, curve: Curves.easeOut);
       await _onEnd?.call();
     } finally {
+      _setOpeningOrDismissing(false);
       reset();
     }
   }
 
   Future<void> animateToBase() async {
-    await animateRect(to: _display.rect.baseRect(_aspectRatio), curve: Curves.easeOut);
+    _setOpeningOrDismissing(true);
+    try {
+      await animateRect(to: _display.rect.baseRect(_aspectRatio), curve: Curves.easeOut);
+    } finally {
+      _setOpeningOrDismissing(false);
+    }
     _setLocked(false);
   }
 
@@ -1212,6 +1473,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   @override
   void dispose() {
     _rect.dispose();
+    _crop.dispose();
+    _cropAnim.dispose();
     _container.dispose();
     _originToBaseProgress.dispose();
     _centerX.dispose();
@@ -1231,6 +1494,9 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       displayContainer: _displayContainer,
       aspectRatio: _aspectRatio,
       rect: _rect,
+      crop: _crop,
+      interacting: _interacting,
+      openingOrDismissing: _openingOrDismissing,
       rotation: _rotation,
       originToBaseProgress: _originToBaseProgress,
       widget: _widget,
@@ -1272,6 +1538,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       setLocked: _setLocked,
       setRect: setRect,
       animateRect: animateRect,
+      animateCrop: animateCrop,
       animateCenterX: animateCenterX,
       animateCenterY: animateCenterY,
       animateWidth: animateWidth,
@@ -1329,9 +1596,18 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                       r.onPointersChanged = _onHybridPointersChanged;
                     },
                   ),
-                // Double-tap only runs in pure displayed state — hybrid is
-                // about pointer-merging during an Origin-driven gesture, not
-                // a separate tap surface.
+                // Tap and double-tap only run in pure displayed state —
+                // hybrid is about pointer-merging during an Origin-driven
+                // gesture, not a separate tap surface.
+                if (displayed)
+                  TapGestureRecognizer: GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
+                    TapGestureRecognizer.new,
+                    (r) => r.onTapUp = (d) {
+                      _tapLocal = d.localPosition;
+                      _tapGlobal = d.globalPosition;
+                      _onTap();
+                    },
+                  ),
                 if (displayed)
                   DoubleTapGestureRecognizer: GestureRecognizerFactoryWithHandlers<DoubleTapGestureRecognizer>(
                     DoubleTapGestureRecognizer.new,
@@ -1340,7 +1616,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                         _doubleTapLocal = d.localPosition;
                         _doubleTapGlobal = d.globalPosition;
                       };
-                      r.onDoubleTap = () => _onDoubleTap(context);
+                      r.onDoubleTap = _onDoubleTap;
                     },
                   ),
               },
@@ -1369,6 +1645,9 @@ class StageData extends InheritedModel<Object> {
     required this.displayContainer,
     required this.aspectRatio,
     required this.rect,
+    required this.crop,
+    required this.interacting,
+    required this.openingOrDismissing,
     required this.rotation,
     required this.originToBaseProgress,
     required this.widget,
@@ -1410,6 +1689,7 @@ class StageData extends InheritedModel<Object> {
     required this.setLocked,
     required this.setRect,
     required this.animateRect,
+    required this.animateCrop,
     required this.animateCenterX,
     required this.animateCenterY,
     required this.animateWidth,
@@ -1437,6 +1717,23 @@ class StageData extends InheritedModel<Object> {
 
   final double aspectRatio;
   final ValueNotifier<Rect> rect;
+  /// Live crop rect, seeded from [CropConfig.initialRect] when a crop mode
+  /// activates and mutated by Stage's recognizer (1-pointer drag inside the
+  /// rect) or the [Cropper] widget's handles. Consumers read it (e.g. on
+  /// apply) via `Stage.of(context).crop.value`. Reset to [Rect.zero] when
+  /// no crop mode is active.
+  final ValueNotifier<Rect> crop;
+  /// True while Stage's recognizer holds &gt; 0 pointers. A coarse `x vs 0
+  /// pointers` signal — read via [Stage.isInteractingOf] for tag-aware access
+  /// (which folds in a check that the queried tag is the active stage tag).
+  /// Independent of which gesture committed in arena.
+  final bool interacting;
+
+  /// True during an open ([Stage.animateToBase]) or dismiss ([Stage.dismiss])
+  /// animation. Release rubber-back / settle paths don't touch this. Used
+  /// by crop-mode chrome to fade only during real open/dismiss and stay
+  /// solid through interaction + settle.
+  final bool openingOrDismissing;
   final ValueNotifier<Rotation?> rotation;
   final ValueNotifier<double> originToBaseProgress;
   final Widget? widget;
@@ -1539,6 +1836,10 @@ class StageData extends InheritedModel<Object> {
   final ValueSetter<bool> setLocked;
   final ValueSetter<Rect> setRect;
   final AnimateRect animateRect;
+  /// Animates [crop] from its current value to the given rect. Used for
+  /// reset transitions and other places that want a smooth crop-rect change
+  /// instead of an instant `stage.crop.value = newRect` assignment.
+  final AnimateRect animateCrop;
   final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterX;
   final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterY;
   final Future<void> Function({required double to, Duration? duration, Curve curve}) animateWidth;
@@ -1695,6 +1996,8 @@ class StageData extends InheritedModel<Object> {
           if ((widget != null) != (oldWidget.widget != null)) return true;
         case _dismissingAspect:
           if (dismissing != oldWidget.dismissing) return true;
+        case _interactingAspect:
+          if (interacting != oldWidget.interacting) return true;
         case (#tag, final Object t):
           final was = oldWidget.tag == t || oldWidget.tagStates.containsKey(t);
           final now = tag == t || tagStates.containsKey(t);
@@ -1703,6 +2006,10 @@ class StageData extends InheritedModel<Object> {
           if ((tag == t) != (oldWidget.tag == t)) return true;
         case (#state, final Object t):
           if (tagStates[t] != oldWidget.tagStates[t]) return true;
+        case (#interacting, final Object t):
+          final was = oldWidget.tag == t && oldWidget.interacting;
+          final now = tag == t && interacting;
+          if (was != now) return true;
       }
     }
     return false;

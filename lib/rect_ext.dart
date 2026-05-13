@@ -464,7 +464,12 @@ extension RectExt on Rect {
           } else {
             boundaryX = left + shortest.width;
             boundaryY = top + shortest.height;
-            overflowX = r - boundaryX;
+            // Sign was flipped here vs. the other three corners — shrinking
+            // overflows when r drops *below* the min, which is `boundaryX -
+            // r`, not `r - boundaryX`. With the wrong sign, every shrink
+            // step fired the bound-by-X branch and snapped the rect to its
+            // minimum width.
+            overflowX = boundaryX - r;
             overflowY = boundaryY - b;
           }
           boundByX = () {

@@ -9,45 +9,29 @@ import 'rect_ext.dart';
 import 'side.dart';
 import 'stage.dart';
 
-/// Holds the live crop rect for a [Cropper] instance and exposes basic
-/// imperative controls. Consumer creates one and passes it into the
-/// `Cropper`. After the user has manipulated the rect, the consumer reads
-/// `value` to get the final crop rect and applies it however the host app
-/// needs (typically cropping the source image and producing a new asset).
-class CropController extends ValueNotifier<Rect> {
-  CropController({Rect initial = Rect.zero}) : super(initial);
-
-  void setRect(Rect rect) {
-    value = rect;
-  }
-
-  void reset(Rect rect) {
-    value = rect;
-  }
-}
-
 /// Image-coupled cropper tool. Designed to live in Stage's overlay slot
-/// (typically via `DisplayConfig.overlay`) so its gesture detectors render
+/// (typically via [DisplayConfig.overlay]) so its handle detectors render
 /// *above* Stage's own recognizer in the hit-test order.
 ///
-/// Reads `Stage.of(context).displayConfig()?.crop` for its constraints
-/// ([CropConfig]). The widget renders:
-/// - Dim overlay outside the crop rect.
-/// - Rule-of-thirds grid inside.
-/// - Corner / side resize handles (opaque hit-test, claim 1-finger pans).
-/// - An inner pan detector covering the crop rect interior (translucent
-///   hit-test so 2-finger pinch falls through to Stage's scale recognizer).
+/// Reads [StageData.crop] for the live crop rect (owned by Stage, seeded
+/// from [CropConfig.initialRect] when a crop mode activates) and renders:
+/// - Dim overlay outside the crop rect (shaped by [CropConfig.borderRadius]).
+/// - Rule-of-thirds grid inside (always rectangular).
+/// - Corner / side resize handles.
 ///
-/// Gesture model (matches imagineai):
-/// - 1-finger drag *on a handle* — resizes via [RectExt.moveCorner] /
-///   [RectExt.moveSide], honoring `CropConfig` constraints.
-/// - 1-finger drag *inside the crop rect* — pans the crop rect; the image
-///   follows when the crop is at an edge (via [imageRectOnDragCropRect]).
-/// - 2-finger pinch — falls through to Stage's scale gesture on the image.
+/// Gesture model:
+/// - 1-finger drag *on a handle* — resizes the crop rect via
+///   [RectExt.moveCorner] / [RectExt.moveSide], honoring [CropConfig]
+///   constraints.
+/// - 1-finger drag *inside the crop rect* — handled by Stage's recognizer:
+///   pans the crop rect, with the image coupling at edges via
+///   [ScaleExt.imageRectOnDragCropRect] (cap configurable via
+///   [CropConfig.overdragMax]).
+/// - Pinch / drag *outside the crop rect* — falls through to Stage's
+///   normal scale/drag gestures on the image.
 class Cropper extends StatefulWidget {
   const Cropper({
     super.key,
-    required this.controller,
     this.dimColor = const Color(0x88000000),
     this.handleColor = const Color(0xFFFFFFFF),
     this.gridColor = const Color(0xFFFFFFFF),
@@ -59,7 +43,6 @@ class Cropper extends StatefulWidget {
     this.minHandleDimension = 24,
   });
 
-  final CropController controller;
   final Color dimColor;
   final Color handleColor;
   /// Color of the interior grid lines (and the border by default).
@@ -83,7 +66,6 @@ class Cropper extends StatefulWidget {
 
 class _CropperState extends State<Cropper> {
   StageData? _stage;
-  CropConfig? _lastCrop;
 
   @override
   void didChangeDependencies() {
@@ -93,20 +75,6 @@ class _CropperState extends State<Cropper> {
       _stage?.rect.removeListener(_onImageRectChanged);
       _stage = newStage;
       _stage!.rect.addListener(_onImageRectChanged);
-    }
-    // First activation of a CropConfig → seed the crop rect via
-    // [CropConfig.initialRect] if provided. Re-init on each config change
-    // (e.g., switching from `'crop_square'` to `'crop_free'`).
-    final crop = newStage.displayConfig()?.crop;
-    if (crop != null && !identical(crop, _lastCrop)) {
-      _lastCrop = crop;
-      final init = crop.initialRect;
-      if (init != null) {
-        final base = newStage.display.rect.baseRect(newStage.aspectRatio);
-        widget.controller.value = init(base);
-      }
-    } else if (crop == null) {
-      _lastCrop = null;
     }
   }
 
@@ -124,54 +92,54 @@ class _CropperState extends State<Cropper> {
     if (stage == null) return;
     final crop = stage.displayConfig()?.crop;
     if (crop == null) return;
-    final clamped = widget.controller.value
-        .cropBoundaries(_boundaries(stage), crop.ratio);
-    if (clamped != widget.controller.value) {
-      widget.controller.value = clamped;
+    final clamped = stage.crop.value.cropBoundaries(_boundaries(stage), crop.ratio);
+    if (clamped != stage.crop.value) {
+      stage.crop.value = clamped;
     }
   }
 
   Rect _boundaries(StageData stage) =>
       stage.rect.value.intersect(stage.display.rect);
 
-  void _moveCorner(Corner corner, Offset delta, Rect boundaries, CropConfig c) {
-    widget.controller.value = widget.controller.value.moveCorner(
+  /// Hard package floor for crop rect dimensions (in logical pixels).
+  /// Combined with [CropConfig.shortest] via max-component, so consumers
+  /// can raise it but not lower it — a too-tiny crop rect is meaningless
+  /// and un-grabbable.
+  static const _minCropSide = 80.0;
+
+  Size _effectiveMinSize(CropConfig c) {
+    final consumer = c.shortest ?? Size.zero;
+    return Size(
+      math.max(consumer.width, _minCropSide),
+      math.max(consumer.height, _minCropSide),
+    );
+  }
+
+  void _moveCorner(Corner corner, Offset delta, CropConfig c, StageData stage) {
+    // Boundaries computed fresh each update — `stage.rect` can be mid-
+    // animation (e.g., setMode rect-rebase) and the captured outer-build
+    // boundaries would go stale, causing [_onImageRectChanged] to clamp
+    // the rect back the next frame.
+    stage.crop.value = stage.crop.value.moveCorner(
       delta: delta,
       corner: corner,
-      shortest: c.shortest ?? Size.zero,
+      shortest: _effectiveMinSize(c),
       longest: c.longest,
       largest: c.largest,
-      boundaries: boundaries,
+      boundaries: _boundaries(stage),
       ratio: c.ratio,
     );
   }
 
-  void _moveSide(Side side, double delta, Rect boundaries, CropConfig c) {
-    widget.controller.value = widget.controller.value.moveSide(
+  void _moveSide(Side side, double delta, CropConfig c, StageData stage) {
+    stage.crop.value = stage.crop.value.moveSide(
       delta: delta,
       side: side,
-      shortest: c.shortest ?? Size.zero,
+      shortest: _effectiveMinSize(c),
       longest: c.longest,
       largest: c.largest,
-      boundaries: boundaries,
+      boundaries: _boundaries(stage),
       ratio: c.ratio,
-    );
-  }
-
-  void _onInnerPanUpdate(DragUpdateDetails details, CropConfig c, StageData stage) {
-    final newCrop = widget.controller.value
-        .shift(details.delta)
-        .cropBoundaries(_boundaries(stage), c.ratio);
-    widget.controller.value = newCrop;
-    // Image follows when crop reaches an edge — mirrors imagineai's coupling.
-    stage.rect.value = ScaleUpdateDetails(
-      focalPoint: details.globalPosition,
-      focalPointDelta: details.delta,
-      localFocalPoint: details.localPosition,
-    ).imageRectOnDragCropRect(
-      container: stage.display.rect,
-      imageRect: stage.rect.value,
-      cropRect: newCrop,
     );
   }
 
@@ -181,56 +149,71 @@ class _CropperState extends State<Cropper> {
     final crop = stage.displayConfig()?.crop;
     if (crop == null) return const SizedBox.shrink();
 
-    final boundaries = _boundaries(stage);
-
     return ValueListenableBuilder<Rect>(
-      valueListenable: widget.controller,
+      valueListenable: stage.crop,
       builder: (context, cropRect, _) {
         final borderRadius = crop.borderRadius?.call(cropRect);
-        return Stack(
-          fit: .expand,
-          children: [
-            // Dim overlay outside crop rect (visual only — no hit test).
-            _DimOverlay(
-              cropRect: cropRect,
-              color: widget.dimColor,
-              borderRadius: borderRadius,
-            ),
-            // Inner-area drag detector: 1-finger pan moves the crop rect.
-            // Translucent so 2-finger pinch falls through to Stage.
-            Positioned.fromRect(
-              rect: cropRect,
-              child: GestureDetector(
-                behavior: .translucent,
-                onPanUpdate: (d) => _onInnerPanUpdate(d, crop, stage),
-                child: _CropGrid(
-                  color: widget.gridColor,
-                  lineWidth: widget.gridLineWidth,
-                  borderColor: widget.gridBorderColor ?? widget.gridColor,
-                  borderWidth: widget.gridBorderWidth,
-                  divisions: widget.gridDivisions,
-                  handleColor: widget.handleColor,
-                  handleThickness: widget.handleThickness,
+        // Cropper chrome (dim + grid) fades out during a real dismiss only.
+        // Interaction + settle keep it solid. We multiply by
+        // [originToBaseProgress] (which goes 1 → 0 as the rect heads back
+        // to origin during dismiss).
+        return ValueListenableBuilder<double>(
+          valueListenable: stage.originToBaseProgress,
+          builder: (context, p, _) {
+            final chromeAlpha = stage.dismissing ? p : 1.0;
+            final dimColor = widget.dimColor.withValues(
+              alpha: widget.dimColor.a * chromeAlpha,
+            );
+            return Stack(
+              fit: .expand,
+              children: [
+                // Dim overlay outside crop rect (visual only — no hit test).
+                _DimOverlay(
+                  cropRect: cropRect,
+                  color: dimColor,
                   borderRadius: borderRadius,
                 ),
-              ),
-            ),
-            // Corner / side handles — extend a bit beyond the crop rect.
-            Positioned.fromRect(
-              rect: cropRect.resizeOnCenter(
-                math.max(cropRect.width * 1.15, stage.display.rect.shortestSide / 3.5),
-                math.max(cropRect.height * 1.15, stage.display.rect.shortestSide / 3.5),
-              ),
-              child: _CropHandles(
-                cropRect: cropRect,
-                minDimension: widget.minHandleDimension,
-                onMoveCorner: (corner, delta) =>
-                    _moveCorner(corner, delta, boundaries, crop),
-                onMoveSide: (side, delta) =>
-                    _moveSide(side, delta, boundaries, crop),
-              ),
-            ),
-          ],
+                // Grid visual only (no gesture detector) — Stage's
+                // recognizer owns 1-finger drags inside the crop rect.
+                Positioned.fromRect(
+                  rect: cropRect,
+                  child: IgnorePointer(
+                    child: Opacity(
+                      opacity: chromeAlpha,
+                      child: _CropGrid(
+                        color: widget.gridColor,
+                        lineWidth: widget.gridLineWidth,
+                        borderColor: widget.gridBorderColor ?? widget.gridColor,
+                        borderWidth: widget.gridBorderWidth,
+                        divisions: widget.gridDivisions,
+                        handleColor: widget.handleColor,
+                        handleThickness: widget.handleThickness,
+                      ),
+                    ),
+                  ),
+                ),
+                // Corner / side handles — extend a bit beyond the crop
+                // rect. Fade with chrome during dismiss too.
+                Positioned.fromRect(
+                  rect: cropRect.resizeOnCenter(
+                    math.max(cropRect.width * 1.15, stage.display.rect.shortestSide / 3.5),
+                    math.max(cropRect.height * 1.15, stage.display.rect.shortestSide / 3.5),
+                  ),
+                  child: Opacity(
+                    opacity: chromeAlpha,
+                    child: _CropHandles(
+                      cropRect: cropRect,
+                      minDimension: widget.minHandleDimension,
+                      onMoveCorner: (corner, delta) =>
+                          _moveCorner(corner, delta, crop, stage),
+                      onMoveSide: (side, delta) =>
+                          _moveSide(side, delta, crop, stage),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
         );
       },
     );
@@ -280,13 +263,11 @@ class _DimOverlay extends StatelessWidget {
 }
 
 /// Renders the interior grid lines, outer border, and corner/side handle
-/// marks. Visual only — gestures are handled by [_CropHandles] outside.
-///
-/// When [borderRadius] is non-null:
-/// - Outer border becomes a rounded rect.
-/// - Interior wires are clipped to the rounded shape.
-/// - Linear corner/side handle marks are suppressed (they wouldn't align
-///   with curved corners). Users still grab via the bigger touch areas.
+/// marks. Always rectangular — even when a [CropConfig.borderRadius] is set,
+/// only the dim layer adopts the rounded shape (so e.g. for a circular
+/// avatar preview the grid stays a square frame and the dim covers the rect
+/// corners outside the circle). Visual only — gestures are handled by
+/// [_CropHandles] outside.
 class _CropGrid extends StatelessWidget {
   const _CropGrid({
     required this.color,
@@ -296,7 +277,6 @@ class _CropGrid extends StatelessWidget {
     required this.divisions,
     required this.handleColor,
     required this.handleThickness,
-    required this.borderRadius,
   });
 
   final Color color;
@@ -306,7 +286,6 @@ class _CropGrid extends StatelessWidget {
   final int divisions;
   final Color handleColor;
   final double handleThickness;
-  final BorderRadius? borderRadius;
 
   @override
   Widget build(BuildContext context) {
@@ -332,17 +311,11 @@ class _CropGrid extends StatelessWidget {
       ));
     }
 
-    Widget interior = Stack(fit: .expand, children: wires);
-    if (borderRadius case final br?) {
-      interior = ClipRRect(borderRadius: br, child: interior);
-    }
-
     final border = DecoratedBox(
       decoration: BoxDecoration(
         border: borderWidth > 0
             ? Border.all(color: borderColor, width: borderWidth)
             : null,
-        borderRadius: borderRadius,
       ),
     );
 
@@ -350,20 +323,15 @@ class _CropGrid extends StatelessWidget {
       child: Stack(
         fit: .expand,
         children: [
-          interior,
-          // Linear handle marks (corner L-shapes + side mid-bars). Hidden
-          // when a non-null borderRadius is in play because they'd visually
-          // misalign with curved corners.
-          if (borderRadius == null) ...[
-            _HandleMark(color: handleColor, thickness: handleThickness),
-            RotatedBox(
-              quarterTurns: 1,
-              child: _HandleMark(
-                color: handleColor,
-                thickness: handleThickness,
-              ),
+          Stack(fit: .expand, children: wires),
+          _HandleMark(color: handleColor, thickness: handleThickness),
+          RotatedBox(
+            quarterTurns: 1,
+            child: _HandleMark(
+              color: handleColor,
+              thickness: handleThickness,
             ),
-          ],
+          ),
           border,
         ],
       ),
