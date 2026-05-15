@@ -175,19 +175,29 @@ class _CropperState extends State<Cropper> {
                 ),
                 // Grid visual only (no gesture detector) — Stage's
                 // recognizer owns 1-finger drags inside the crop rect.
+                // During dismiss, the grid clips to the configured
+                // borderRadius (e.g. circular for an avatar preview) so
+                // its rectangular frame morphs in lockstep with the
+                // image's clip lerp instead of sticking out as a
+                // rectangle over the now-circular target.
                 Positioned.fromRect(
                   rect: cropRect,
                   child: IgnorePointer(
                     child: Opacity(
                       opacity: chromeAlpha,
-                      child: _CropGrid(
-                        color: widget.gridColor,
-                        lineWidth: widget.gridLineWidth,
-                        borderColor: widget.gridBorderColor ?? widget.gridColor,
-                        borderWidth: widget.gridBorderWidth,
-                        divisions: widget.gridDivisions,
-                        handleColor: widget.handleColor,
-                        handleThickness: widget.handleThickness,
+                      child: ClipRRect(
+                        borderRadius: stage.dismissing
+                            ? borderRadius ?? .zero
+                            : .zero,
+                        child: _CropGrid(
+                          color: widget.gridColor,
+                          lineWidth: widget.gridLineWidth,
+                          borderColor: widget.gridBorderColor ?? widget.gridColor,
+                          borderWidth: widget.gridBorderWidth,
+                          divisions: widget.gridDivisions,
+                          handleColor: widget.handleColor,
+                          handleThickness: widget.handleThickness,
+                        ),
                       ),
                     ),
                   ),

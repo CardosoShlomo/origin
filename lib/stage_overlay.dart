@@ -53,12 +53,13 @@ class StageOverlay extends StatelessWidget {
       child: ValueListenableBuilder<double>(
         valueListenable: data.originToBaseProgress,
         builder: (context, p, child) {
-          // Crop mode locks the clip to [display.borderRadius] — no lerp.
-          // The image stays rectangular while shrinking back to a circular
-          // origin (e.g., circular avatar), since the crop result is a
-          // rectangle and a curved clip would chop the corners.
+          // Crop mode locks the clip to [display.borderRadius] *during
+          // interaction / settle* so pinching or panning the image doesn't
+          // chop corners with a curved clip. Open / dismiss animations
+          // resume the lerp so the rect smoothly returns to the origin's
+          // shape (e.g., a circular avatar).
           final inCrop = data.displayConfig()?.crop != null;
-          final br = inCrop
+          final br = (inCrop && !data.openingOrDismissing)
               ? data.display.borderRadius
               : BorderRadius.lerp(data.origin.borderRadius, data.display.borderRadius, p)!;
           final clipped = ClipRRect(borderRadius: br, child: child);

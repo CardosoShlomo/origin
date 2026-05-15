@@ -471,10 +471,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _prevPointerCount = details.pointerCount;
 
     // Crop-drag detection: 1-pointer gesture starting inside the active crop
-    // rect → drag the crop rect (image follows at edges). 2+ pointers always
-    // mean image scale — so we exit crop-drag mode the moment a 2nd finger
-    // arrives. This is the entry side; [_onScaleUpdate] consumes the flag.
-    if (details.pointerCount == 1
+    // rect → drag the crop rect (image follows at edges). Gated on
+    // [_active] being null — once a resolver has committed (drag or scale),
+    // the gesture stays as image manipulation. Pinch-then-release-1-finger
+    // leaves [_active] set to a ScaleGesture, so this won't re-enter crop
+    // drag and swallow the image's release physics.
+    if (_active == null
+        && details.pointerCount == 1
         && _displayConfig?.crop != null
         && _crop.value.contains(details.focalPoint)) {
       _cropDrag = true;
@@ -1282,7 +1285,28 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _setDismissing(true);
     _setOpeningOrDismissing(true);
     try {
-      await animateRect(to: _origin.rect, curve: Curves.easeOut);
+      // Smart duration: time the dismiss to the actual trajectory length
+      // (current → origin), not to the off-base offset. An at-base dismiss
+      // is the reference (1× [_defaultDuration]); a rect already close to
+      // origin uses less time, and a rect panned/scaled far from origin
+      // uses more. Clamped to 0.3× / 2× so neither extreme feels jarring.
+      final base = _display.rect.baseRect(_aspectRatio);
+      final origin = _origin.rect;
+      final ref = math.max(
+        (base.center - origin.center).distance,
+        (base.width - origin.width).abs(),
+      );
+      final actual = math.max(
+        (_rect.value.center - origin.center).distance,
+        (_rect.value.width - origin.width).abs(),
+      );
+      final ratio = ref > 0 ? (actual / ref).clamp(0.3, 2.0) : 1.0;
+      final ms = (_defaultDuration.inMilliseconds * ratio).round();
+      await animateRect(
+        to: _origin.rect,
+        duration: Duration(milliseconds: ms),
+        curve: Curves.easeOut,
+      );
       await _onEnd?.call();
     } finally {
       _setOpeningOrDismissing(false);
