@@ -275,10 +275,54 @@ class ExpandBounds extends Bounds {
   final double? maxScale;
 }
 
+/// Per-direction container of [DragBounds] for a gesture's four sides.
+/// Replaces the old `Map<DragBound, DragBounds>` so the API stays
+/// const-constructible, type-safe, and ships named shortcuts for the
+/// common shapes. Use [at] for enum-keyed lookups inside physics code.
+///
+/// Convenience constructors cover the common shapes; for asymmetric
+/// configurations use the default constructor with named args.
+class GestureBounds {
+  const GestureBounds({this.top, this.bottom, this.left, this.right});
+
+  const GestureBounds.top(this.top) : bottom = null, left = null, right = null;
+  const GestureBounds.bottom(this.bottom) : top = null, left = null, right = null;
+  const GestureBounds.left(this.left) : top = null, bottom = null, right = null;
+  const GestureBounds.right(this.right) : top = null, bottom = null, left = null;
+
+  const GestureBounds.vertical(DragBounds bounds)
+      : top = bounds, bottom = bounds, left = null, right = null;
+  const GestureBounds.horizontal(DragBounds bounds)
+      : left = bounds, right = bounds, top = null, bottom = null;
+  const GestureBounds.symmetric({DragBounds? vertical, DragBounds? horizontal})
+      : top = vertical, bottom = vertical, left = horizontal, right = horizontal;
+
+  const GestureBounds.all([DragBounds bounds = const DragBounds()])
+      : top = bounds, bottom = bounds, left = bounds, right = bounds;
+
+  final DragBounds? top;
+  final DragBounds? bottom;
+  final DragBounds? left;
+  final DragBounds? right;
+
+  DragBounds? operator [](DragBound bound) => switch (bound) {
+        .top => top,
+        .bottom => bottom,
+        .left => left,
+        .right => right,
+      };
+
+  bool get hasScaleResponse =>
+      top?.scaleResponse != null ||
+      bottom?.scaleResponse != null ||
+      left?.scaleResponse != null ||
+      right?.scaleResponse != null;
+}
+
 /// Sealed parent for gesture kinds.
 sealed class Gesture {
   const Gesture({
-    this.bounds = const {},
+    this.bounds = const GestureBounds(),
     this.constraints,
     this.builder,
     this.onRelease,
@@ -287,7 +331,7 @@ sealed class Gesture {
 
   /// Directional bounds active during this gesture (drag) or directional
   /// overflow during scale (rect edges past container edges).
-  final Map<DragBound, DragBounds> bounds;
+  final GestureBounds bounds;
 
   final GestureConstraints? constraints;
   final StageBuilder? builder;
@@ -442,6 +486,8 @@ class DisplayConfig {
     this.display,
     this.displayContainer,
     this.overrides,
+    this.builder,
+    this.onTapOutside,
   });
 
   final Map<DragStart, DragGesture>? drag;
@@ -501,6 +547,23 @@ class DisplayConfig {
   /// origin is displayed.
   final Overrides? overrides;
 
+  /// Per-mode wrap of the captured widget. Resolved in the cascade
+  /// gesture.bounds.builder > gesture.builder > displayConfig > Origin.builder.
+  /// Use this to layer mode-specific visual content over the captured widget
+  /// (e.g. a picker chrome that crossfades between an icon and a button row
+  /// as the rect interpolates from origin to base). Taps inside the builder
+  /// are absorbed by Stage's gesture detector — interactive tap targets
+  /// belong in [overlay] or in a position-dispatching [onTap].
+  final StageBuilder? builder;
+
+  /// Fires when the user taps the scrim (the dim area outside the captured
+  /// rect). Lives on the scrim's own [GestureDetector], not Stage's
+  /// [TapGestureRecognizer], so it doesn't compete in the gesture arena
+  /// with [GestureDetector]s inside the captured widget tree. Pair this
+  /// with no [onTap] when the captured widget hosts its own interactive
+  /// children that need to win their taps.
+  final VoidCallback? onTapOutside;
+
   /// Returns a new [DisplayConfig] where each non-null field of [override]
   /// replaces the corresponding field of `this`. Null fields in [override]
   /// keep the value from `this`. Used to apply mode-specific configs on top
@@ -526,6 +589,8 @@ class DisplayConfig {
       display: override.display ?? display,
       displayContainer: override.displayContainer ?? displayContainer,
       overrides: override.overrides ?? overrides,
+      builder: override.builder ?? builder,
+      onTapOutside: override.onTapOutside ?? onTapOutside,
     );
   }
 }

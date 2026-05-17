@@ -21,6 +21,12 @@ class OriginEntry {
 
 enum TagState { idle, sending, parked, returning }
 
+/// Internal sentinel for [Stage.zoomToggleOnDoubleTap]. Stage detects this
+/// function by identity in `_onDoubleTap` and dispatches to the internal
+/// zoom-toggle implementation (which has access to the live Stage state).
+/// Invoking this directly is a no-op.
+void _zoomToggleSentinel(StageTapEvent _) {}
+
 class Rotation {
   const Rotation({this.x = 0, this.y = 0, this.z = 0, this.perspective});
   final double x, y, z;
@@ -85,13 +91,27 @@ class Stage extends StatefulWidget {
   final OnStageTap? onTap;
 
   /// Stage-level fallback for displayed-state double-tap. Resolved as:
-  /// [DisplayConfig.onDoubleTap] → this → package default. The package
-  /// default toggles between baseRect and fit-cover-at-focal.
+  /// [DisplayConfig.onDoubleTap] → this. Both null means no
+  /// [DoubleTapGestureRecognizer] is registered — so single-tap fires on
+  /// the up event without waiting for the double-tap timeout. Pass
+  /// [Stage.zoomToggleOnDoubleTap] explicitly to opt in to the
+  /// baseRect ↔ fit-cover-at-focal toggle.
   final OnStageTap? onDoubleTap;
 
-  /// Stage-level fallback for the at-base double-tap pan tuning. Cascade:
+  /// Pan tuning for the bundled [zoomToggleOnDoubleTap] handler when it
+  /// transitions from base to fit-cover-at-focal. Cascade:
   /// [DisplayConfig.doubleTapPullFactor] → this → package default (0.4).
+  /// Has no effect unless [zoomToggleOnDoubleTap] is wired in to
+  /// [onDoubleTap] on this stage or the active [DisplayConfig].
   final double? doubleTapPullFactor;
+
+  /// Sentinel handler — pass to [onDoubleTap] (here or on a
+  /// [DisplayConfig]) to opt in to the package's default zoom toggle
+  /// (baseRect ↔ fit-cover-at-focal at the tap position). Detected by
+  /// identity inside Stage so the implementation can use the live Stage
+  /// instance to animate the rect; invoking this function directly is a
+  /// no-op.
+  static const OnStageTap zoomToggleOnDoubleTap = _zoomToggleSentinel;
 
   /// Stage-level fallback for displayed-state drag→scale promotion when a
   /// 2nd pointer is added. Cascade: per-gesture > displayConfig > this >
@@ -404,6 +424,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     OriginRect? display,
     OriginRect? displayContainer,
     OriginRect? screen,
+    StageBuilder? builder,
   }) {
     _originDefaultConfig = defaults;
     _originModes = modes;
@@ -411,14 +432,17 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _originDisplay = display;
     _originDisplayContainer = displayContainer;
     _originScreen = screen;
+    _originBuilder = builder;
   }
 
-  // The currently-displayed origin's overlay/display/displayContainer/screen,
-  // used as fallbacks when the active [DisplayConfig] doesn't override them.
+  // The currently-displayed origin's overlay/display/displayContainer/screen
+  // /builder, used as fallbacks when the active [DisplayConfig] doesn't
+  // override them.
   WidgetBuilder? _originOverlay;
   OriginRect? _originDisplay;
   OriginRect? _originDisplayContainer;
   OriginRect? _originScreen;
+  StageBuilder? _originBuilder;
 
   /// Swaps the active [DisplayConfig] to the mode-resolved variant and
   /// re-applies any display/displayContainer overrides the new config
@@ -439,6 +463,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       _displayConfig = effective;
       _displayContainer = effective?.displayContainer ?? _originDisplayContainer;
       _display = newDisplay;
+      // Per-mode wrap of the captured widget: displayConfig.builder takes
+      // precedence over Origin.builder. A gesture commit can still override
+      // this temporarily via [_active.gesture.builder].
+      _gestureBuilder = effective?.builder ?? _originBuilder;
     });
     // Seed the crop rect when entering a new crop config (by identity) so
     // switching configs (e.g. free → square) re-anchors to the configured
@@ -585,8 +613,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       }
 
       case DragGesture drag: {
-        final hasScaleResponse =
-            drag.bounds.values.any((b) => b.scaleResponse != null);
+        final hasScaleResponse = drag.bounds.hasScaleResponse;
         final currentRect = _rect.value;
         final displayRect = _display.rect;
         // For displayed items, the natural rest is the base rect (centered in
@@ -859,9 +886,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   Offset _doubleTapLocal = .zero;
   Offset _doubleTapGlobal = .zero;
 
-  /// Package default: toggle between baseRect (when zoomed/translated) and
-  /// fit-cover-at-focal (when at base). Pan tuning via cascaded pullFactor.
-  void _defaultOnDoubleTap(StageTapEvent e) {
+  /// Implementation of [Stage.zoomToggleOnDoubleTap]. Toggles between
+  /// baseRect (when zoomed/translated) and fit-cover-at-focal (when at
+  /// base). Pan tuning via the [doubleTapPullFactor] cascade.
+  void _runZoomToggle(StageTapEvent e) {
     final atBase = (e.currentRect.center - e.baseRect.center).distance < 1.0
         && (e.currentRect.width - e.baseRect.width).abs() < 1.0;
     final pullFactor = _displayConfig?.doubleTapPullFactor
@@ -878,6 +906,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   void _onDoubleTap() {
+    final handler = _displayConfig?.onDoubleTap ?? widget.onDoubleTap;
+    if (handler == null) return;
     final event = StageTapEvent(
       localPosition: _doubleTapLocal,
       globalPosition: _doubleTapGlobal,
@@ -886,10 +916,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       baseRect: _display.rect.baseRect(_aspectRatio),
       aspectRatio: _aspectRatio,
     );
-    final handler = _displayConfig?.onDoubleTap
-        ?? widget.onDoubleTap
-        ?? _defaultOnDoubleTap;
-    handler(event);
+    if (identical(handler, Stage.zoomToggleOnDoubleTap)) {
+      _runZoomToggle(event);
+    } else {
+      handler(event);
+    }
   }
 
   // Single-tap recognizer fires onTapUp with position info — capture here so
@@ -1036,7 +1067,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     // Pick bounds from the currently-active gesture so the merger respects
     // the same friction/limits as a non-hybrid update would.
-    final Map<DragBound, DragBounds> bounds;
+    final GestureBounds bounds;
     final ShrinkBounds? shrink;
     final ExpandBounds? expand;
     switch (activeGesture) {
@@ -1604,8 +1635,14 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
             final hybridActive = og != null && _resolveHybrid(og) != null;
             final displayed = Stage.hasWidgetOf(context) && !_locked;
             final active = displayed || hybridActive;
+            // Always translucent so [GestureDetector]s inside the captured
+            // widget can win in the arena for taps on their own area
+            // (deepest wins). [_AbsorbLayer] above [widget.child] already
+            // blocks the underlying tree from receiving pointers while the
+            // stage is displayed — Stage's detector doesn't need to absorb
+            // on top of that.
             return RawGestureDetector(
-              behavior: active ? .opaque : .translucent,
+              behavior: .translucent,
               gestures: {
                 if (active)
                   StageScaleRecognizer: GestureRecognizerFactoryWithHandlers<StageScaleRecognizer>(
@@ -1622,8 +1659,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                   ),
                 // Tap and double-tap only run in pure displayed state —
                 // hybrid is about pointer-merging during an Origin-driven
-                // gesture, not a separate tap surface.
-                if (displayed)
+                // gesture, not a separate tap surface. Both are opt-in:
+                // without an explicit handler the recognizer isn't
+                // registered, so it can't claim victory over a deeper
+                // [GestureDetector] inside the captured widget tree
+                // (Flutter's arena sweeps to the first-added recognizer).
+                if (displayed
+                    && (_displayConfig?.onTap ?? widget.onTap) != null)
                   TapGestureRecognizer: GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
                     TapGestureRecognizer.new,
                     (r) => r.onTapUp = (d) {
@@ -1632,7 +1674,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                       _onTap();
                     },
                   ),
-                if (displayed)
+                // DoubleTap is opt-in — only registered when a handler is
+                // explicitly wired in. Without it, the [TapGestureRecognizer]
+                // resolves on the up event instead of waiting `kDoubleTapTimeout`.
+                if (displayed
+                    && (_displayConfig?.onDoubleTap ?? widget.onDoubleTap) != null)
                   DoubleTapGestureRecognizer: GestureRecognizerFactoryWithHandlers<DoubleTapGestureRecognizer>(
                     DoubleTapGestureRecognizer.new,
                     (r) {
@@ -1845,6 +1891,7 @@ class StageData extends InheritedModel<Object> {
     OriginRect? display,
     OriginRect? displayContainer,
     OriginRect? screen,
+    StageBuilder? builder,
   }) setOriginConfig;
 
   /// Switches the active mode for the currently-displayed origin. Looks

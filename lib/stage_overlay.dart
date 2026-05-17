@@ -101,18 +101,28 @@ class _Scrim extends StatelessWidget {
     // release settle / rubber-back paths don't touch it, so the scrim
     // stays solid through pinch → release as the rect bounces back.
     final inCrop = data.displayConfig()?.crop != null;
+    final Widget scrim;
     if (inCrop && !data.openingOrDismissing) {
-      return ColoredBox(color: color, child: const SizedBox.expand());
+      scrim = ColoredBox(color: color, child: const SizedBox.expand());
+    } else {
+      scrim = ValueListenableBuilder<double>(
+        valueListenable: data.originToBaseProgress,
+        builder: (context, p, _) {
+          return ColoredBox(
+            color: .lerp(color.withValues(alpha: 0), color, p)!,
+            child: const SizedBox.expand(),
+          );
+        },
+      );
     }
 
-    return ValueListenableBuilder<double>(
-      valueListenable: data.originToBaseProgress,
-      builder: (context, p, _) {
-        return ColoredBox(
-          color: .lerp(color.withValues(alpha: 0), color, p)!,
-          child: const SizedBox.expand(),
-        );
-      },
-    );
+    // [onTapOutside] fires from the scrim's own [GestureDetector] — it lives
+    // inside [StageOverlay], below Stage's [RawGestureDetector] in the main
+    // Stack, and its inner Stack puts the captured widget on top. So the
+    // scrim only receives taps that miss the captured rect, with no arena
+    // competition from interactive children inside the captured widget.
+    final onTapOutside = data.displayConfig()?.onTapOutside;
+    if (onTapOutside == null) return scrim;
+    return GestureDetector(onTap: onTapOutside, child: scrim);
   }
 }

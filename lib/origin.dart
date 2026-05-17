@@ -360,8 +360,7 @@ class _OriginState extends State<Origin> {
       }
 
       case DragGesture drag: {
-        final hasScaleResponse =
-            drag.bounds.values.any((b) => b.scaleResponse != null);
+        final hasScaleResponse = drag.bounds.hasScaleResponse;
         final currentRect = _stage.rect.value;
         final originRect = _stage.origin.rect;
         final displayRect = _stage.display.rect;
@@ -450,7 +449,7 @@ class _OriginState extends State<Origin> {
 
   double _frictionScaledX({
     required double delta,
-    required Map<DragBound, DragBounds> bounds,
+    required GestureBounds bounds,
     required Rect currentRect,
     required Rect originRect,
     required Rect displayRect,
@@ -463,7 +462,7 @@ class _OriginState extends State<Origin> {
 
   double _frictionScaledY({
     required double delta,
-    required Map<DragBound, DragBounds> bounds,
+    required GestureBounds bounds,
     required Rect currentRect,
     required Rect originRect,
     required Rect displayRect,
@@ -586,10 +585,11 @@ class _OriginState extends State<Origin> {
     data.setOriginContainer(widget.originContainer ?? (widget.containerTag != null ? data.measureEntry(widget.containerTag!) : null));
     data.setAspectRatio(widget.aspectRatio ?? context.size!.aspectRatio);
     data.setWidget(_OriginData(tag: widget.tag, child: KeyedSubtree(key: _childKey, child: widget.child)));
-    if (widget.builder != null) data.setGestureBuilder(widget.builder);
     // Register the origin's default config + modes map + display fallbacks
     // so Stage can resolve [setMode] calls later (including re-applying
-    // display/displayContainer per the active mode's overrides).
+    // display/displayContainer/builder per the active mode's overrides).
+    // [setMode] will seed the gesture builder from
+    // `effective.builder ?? widget.builder`, so we don't pre-set it here.
     data.setOriginConfig(
       defaults: widget.displayConfig,
       modes: widget.modes,
@@ -597,6 +597,7 @@ class _OriginState extends State<Origin> {
       display: widget.display,
       displayContainer: widget.displayContainer,
       screen: screen,
+      builder: widget.builder,
     );
     data.setMode(mode);
     data.setPerspective(widget.constraints?.perspective);

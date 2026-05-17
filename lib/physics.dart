@@ -87,7 +87,7 @@ AxisState axisStateY(
 /// Absent bound = blocked (returns 0). Absent friction = free (returns delta).
 double frictionFromState({
   required AxisState state,
-  required Map<DragBound, DragBounds> bounds,
+  required GestureBounds bounds,
   required double delta,
 }) {
   if (delta == 0) return 0;
@@ -182,18 +182,22 @@ double frictionFromScaleState({
 /// - Active bound = side of [baseRect.center] where [rawCenter] sits.
 /// - ScaleResponse comes from `bounds[activeBound].scaleResponse` (no
 ///   gesture-level fallback — bounds without scaleResponse contribute 1.0).
-/// - Progress evaluated against in-display / past-display ramps. The
-///   in-display zone uses the *actual* rect's half-dim (from [actualRect])
-///   for the past-edge threshold, so a shrinking rect keeps its in-display
-///   zone proportional to its current size — past-display only kicks in
-///   when the rect's real edge crosses the display edge.
+/// - The in-display / past-display branch boundary is fixed at the *base*
+///   rect's edge — it doesn't move as the live rect shrinks during drag.
+///   This is deliberate: [displayRect] defines the static physics zone, and
+///   a moving boundary would cause the formula to flip branches as the
+///   rect updates, producing rect bistability.
+/// - When [displayRect] equals [baseRect] (no in-display slack), the whole
+///   drag folds into the `inDisplay` ramp over `displayDim`, so a single
+///   ramp like `Friction(1.0, end: 0.2)` covers the full shrink without
+///   discontinuity.
 /// - Per-axis factors multiplied.
 double dragScaleFactor({
   required Offset rawCenter,
   required Rect actualRect,
   required Rect baseRect,
   required Rect displayRect,
-  required Map<DragBound, DragBounds> bounds,
+  required GestureBounds bounds,
 }) {
   final DragBound boundY = rawCenter.dy < baseRect.center.dy ? .top : .bottom;
   final factorY = _axisScaleFactor(
@@ -201,7 +205,7 @@ double dragScaleFactor({
     basePos: baseRect.center.dy,
     dispLow: displayRect.top,
     dispHigh: displayRect.bottom,
-    halfDim: actualRect.height / 2,
+    halfDim: baseRect.height / 2,
     displayDim: displayRect.height,
     response: bounds[boundY]?.scaleResponse,
   );
@@ -212,7 +216,7 @@ double dragScaleFactor({
     basePos: baseRect.center.dx,
     dispLow: displayRect.left,
     dispHigh: displayRect.right,
-    halfDim: actualRect.width / 2,
+    halfDim: baseRect.width / 2,
     displayDim: displayRect.width,
     response: bounds[boundX]?.scaleResponse,
   );
@@ -233,9 +237,17 @@ double _axisScaleFactor({
   final isHigh = rawPos >= basePos;
   if (isHigh) {
     final dispEdge = dispHigh - halfDim;
+    final span = dispEdge - basePos;
+    if (span <= 0) {
+      // No in-display slack (e.g. display == base). Fold the whole drag
+      // into the inDisplay ramp over [displayDim] so a single Friction
+      // ramp covers the full response without branch discontinuity.
+      final progress = ((rawPos - basePos) / displayDim).clamp(0.0, 1.0);
+      return response.inDisplay?.evaluate(progress)
+          ?? response.pastDisplay?.start
+          ?? 1.0;
+    }
     if (rawPos <= dispEdge) {
-      final span = dispEdge - basePos;
-      if (span <= 0) return response.inDisplay?.start ?? 1.0;
       final progress = ((rawPos - basePos) / span).clamp(0.0, 1.0);
       return response.inDisplay?.evaluate(progress) ?? 1.0;
     }
@@ -245,9 +257,14 @@ double _axisScaleFactor({
         ?? 1.0;
   } else {
     final dispEdge = dispLow + halfDim;
+    final span = basePos - dispEdge;
+    if (span <= 0) {
+      final progress = ((basePos - rawPos) / displayDim).clamp(0.0, 1.0);
+      return response.inDisplay?.evaluate(progress)
+          ?? response.pastDisplay?.start
+          ?? 1.0;
+    }
     if (rawPos >= dispEdge) {
-      final span = basePos - dispEdge;
-      if (span <= 0) return response.inDisplay?.start ?? 1.0;
       final progress = ((basePos - rawPos) / span).clamp(0.0, 1.0);
       return response.inDisplay?.evaluate(progress) ?? 1.0;
     }
@@ -485,7 +502,7 @@ AxisFling _rubberFling({
 HorizontalRelease releaseFromStateX({
   required Rect currentRect,
   required Rect displayRect,
-  required Map<DragBound, DragBounds> bounds,
+  required GestureBounds bounds,
   required double velocity,
   Rect? projectedRect,
 }) {
@@ -649,7 +666,7 @@ HorizontalRelease releaseFromStateX({
 VerticalRelease releaseFromStateY({
   required Rect currentRect,
   required Rect displayRect,
-  required Map<DragBound, DragBounds> bounds,
+  required GestureBounds bounds,
   required double velocity,
   Rect? projectedRect,
 }) {
