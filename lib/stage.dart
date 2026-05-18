@@ -344,6 +344,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   final _centerXTween = Tween<double>(begin: 0, end: 0);
   final _centerYTween = Tween<double>(begin: 0, end: 0);
   final _widthTween = Tween<double>(begin: 0, end: 0);
+  final _heightTween = Tween<double>(begin: 0, end: 0);
   final _cropTween = RectTween(begin: Rect.zero, end: Rect.zero);
 
   void _updateCrop() {
@@ -562,7 +563,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         final boundaries = _rect.value.intersect(_display.rect);
         final newCrop = _crop.value
             .shift(details.focalPointDelta)
-            .cropBoundaries(boundaries, cropConfig.ratio);
+            .cropBoundaries(
+              boundaries,
+              minAspectRatio: cropConfig.minAspectRatio,
+              maxAspectRatio: cropConfig.maxAspectRatio,
+            );
         _crop.value = newCrop;
         _rect.value = details.imageRectOnDragCropRect(
           container: _display.rect,
@@ -613,59 +618,24 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       }
 
       case DragGesture drag: {
-        final hasScaleResponse = drag.bounds.hasScaleResponse;
-        final currentRect = _rect.value;
+        // For displayed items, the natural rest is the base rect (centered
+        // in display), not the thumbnail. axisState's `originRect` is
+        // really "the reference rest" — pass base, not [_origin.rect].
         final displayRect = _display.rect;
-        // For displayed items, the natural rest is the base rect (centered in
-        // display), not the thumbnail. axisState's `originRect` parameter is
-        // really "the reference rest" — pass base, not _origin.
-        final originRect = displayRect.baseRect(_aspectRatio);
-
-        if (hasScaleResponse) {
-          // Scale-coupled drag: rect width follows scaleResponse, center is
-          // anchor-corrected so the finger stays at the same relative point.
-          final baseRect = displayRect.baseRect(_aspectRatio);
-          final anchor = _startFocalPoint - _startRect.center;
-          final rawCenter = details.focalPoint - anchor;
-          final factor = dragScaleFactor(
-            rawCenter: rawCenter,
-            actualRect: currentRect,
-            baseRect: baseRect,
-            displayRect: displayRect,
-            bounds: drag.bounds,
-          );
-          final newWidth = baseRect.width * factor;
-          final newHeight = newWidth / _aspectRatio;
-          final ctx = AnchorContext(
-            startFocalPoint: _startFocalPoint,
-            currentFocalPoint: details.focalPoint,
-            startRect: _startRect,
-            currentRect: currentRect,
-            scale: _startRect.width == 0 ? 1.0 : newWidth / _startRect.width,
-          );
-          final anchorFn = _displayConfig?.overrides?.anchor
+        _rect.value = computeDragRect(
+          bounds: drag.bounds,
+          currentRect: _rect.value,
+          originRect: displayRect.baseRect(_aspectRatio),
+          displayRect: displayRect,
+          aspectRatio: _aspectRatio,
+          focalPoint: details.focalPoint,
+          focalPointDelta: details.focalPointDelta,
+          startRect: _startRect,
+          startFocalPoint: _startFocalPoint,
+          anchorFn: _displayConfig?.overrides?.anchor
               ?? widget.overrides?.anchor
-              ?? defaultDragAnchor;
-          final newCenter = anchorFn(ctx);
-          _rect.value = Rect.fromCenter(
-            center: newCenter,
-            width: newWidth,
-            height: newHeight,
-          );
-        } else {
-          final delta = details.focalPointDelta;
-          final dx = frictionFromState(
-            state: axisStateX(delta.dx, currentRect, originRect, displayRect),
-            bounds: drag.bounds,
-            delta: delta.dx,
-          );
-          final dy = frictionFromState(
-            state: axisStateY(delta.dy, currentRect, originRect, displayRect),
-            bounds: drag.bounds,
-            delta: delta.dy,
-          );
-          _rect.value = currentRect.translate(dx, dy);
-        }
+              ?? defaultDragAnchor,
+        );
       }
 
       case ScaleGesture scale: {
@@ -1332,7 +1302,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         (_rect.value.width - origin.width).abs(),
       );
       final ratio = ref > 0 ? (actual / ref).clamp(0.3, 2.0) : 1.0;
-      final ms = (_defaultDuration.inMilliseconds * ratio).round();
+      final ms = (_defaultDuration.inMilliseconds * ratio).round().clamp(200, 1000);
       await animateRect(
         to: _origin.rect,
         duration: Duration(milliseconds: ms),
@@ -1359,11 +1329,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _centerXTween.begin = _centerXTween.end = rect.center.dx;
     _centerYTween.begin = _centerYTween.end = rect.center.dy;
     _widthTween.begin = _widthTween.end = rect.width;
+    _heightTween.begin = _heightTween.end = rect.height;
     _rect.value = rect;
   }
 
   void _updateRect() {
     final w = _widthTween.evaluate(_width);
+    final h = _heightTween.evaluate(_width);
     if (_releaseDecomposed) {
       // Decomposed mode: X/Y tweens store *offsets* relative to the
       // proportional position. Displayed center = proportional(W) + offset.
@@ -1380,7 +1352,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       _rect.value = Rect.fromCenter(
         center: Offset(xProp + xOffset, yProp + yOffset),
         width: w,
-        height: w / _aspectRatio,
+        height: h,
       );
       return;
     }
@@ -1389,7 +1361,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _rect.value = Rect.fromCenter(
       center: Offset(cx, cy),
       width: w,
-      height: w / _aspectRatio,
+      height: h,
     );
   }
 
@@ -1429,9 +1401,21 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     return _centerY.animateTo(1, duration: duration, curve: curve);
   }
 
-  Future<void> animateWidth({required double to, Duration? duration, Curve curve = Curves.easeIn}) {
+  /// Animates the rect's width to [to]. If [height] is provided, animates
+  /// height in lockstep on the same controller (so duration / curve are
+  /// shared by construction); otherwise the height tween targets
+  /// `to / _aspectRatio` to preserve the existing aspect-derived height
+  /// behavior.
+  Future<void> animateWidth({
+    required double to,
+    double? height,
+    Duration? duration,
+    Curve curve = Curves.easeIn,
+  }) {
     _widthTween.begin = _rect.value.width;
     _widthTween.end = to;
+    _heightTween.begin = _rect.value.height;
+    _heightTween.end = height ?? to / _aspectRatio;
     _safeReset(_width);
     return _width.animateTo(1, duration: duration, curve: curve);
   }
@@ -1440,7 +1424,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     return Future.wait([
       animateCenterX(to: to.center.dx, duration: duration, curve: curve),
       animateCenterY(to: to.center.dy, duration: duration, curve: curve),
-      animateWidth(to: to.width, duration: duration, curve: curve),
+      animateWidth(to: to.width, height: to.height, duration: duration, curve: curve),
     ]);
   }
 
@@ -1464,6 +1448,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _centerYTween.end = 0;
     _widthTween.begin = initialWidth;
     _widthTween.end = initialWidth;
+    _heightTween.begin = _rect.value.height;
+    _heightTween.end = _rect.value.height;
     _releaseDecomposed = true;
   }
 
@@ -1913,7 +1899,12 @@ class StageData extends InheritedModel<Object> {
   final AnimateRect animateCrop;
   final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterX;
   final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterY;
-  final Future<void> Function({required double to, Duration? duration, Curve curve}) animateWidth;
+  final Future<void> Function({
+    required double to,
+    double? height,
+    Duration? duration,
+    Curve curve,
+  }) animateWidth;
   /// Enters decomposed-release mode: while active, the X/Y tweens are
   /// interpreted as *offsets* from the proportional scale-driven position.
   /// Lets the three axes animate with independent curves/durations while

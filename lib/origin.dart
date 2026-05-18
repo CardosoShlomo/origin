@@ -360,52 +360,20 @@ class _OriginState extends State<Origin> {
       }
 
       case DragGesture drag: {
-        final hasScaleResponse = drag.bounds.hasScaleResponse;
-        final currentRect = _stage.rect.value;
-        final originRect = _stage.origin.rect;
-        final displayRect = _stage.display.rect;
-
-        if (hasScaleResponse) {
-          final baseRect = displayRect.baseRect(_stage.aspectRatio);
-          final anchor = _startFocalPoint - _startRect.center;
-          final rawCenter = details.focalPoint - anchor;
-          final factor = dragScaleFactor(
-            rawCenter: rawCenter,
-            actualRect: currentRect,
-            baseRect: baseRect,
-            displayRect: displayRect,
-            bounds: drag.bounds,
-          );
-          final newWidth = baseRect.width * factor;
-          final newHeight = newWidth / _stage.aspectRatio;
-          final ctx = AnchorContext(
-            startFocalPoint: _startFocalPoint,
-            currentFocalPoint: details.focalPoint,
-            startRect: _startRect,
-            currentRect: currentRect,
-            scale: _startRect.width == 0 ? 1.0 : newWidth / _startRect.width,
-          );
-          final anchorFn = widget.overrides?.anchor
+        _stage.rect.value = computeDragRect(
+          bounds: drag.bounds,
+          currentRect: _stage.rect.value,
+          originRect: _stage.origin.rect,
+          displayRect: _stage.display.rect,
+          aspectRatio: _stage.aspectRatio,
+          focalPoint: details.focalPoint,
+          focalPointDelta: details.focalPointDelta,
+          startRect: _startRect,
+          startFocalPoint: _startFocalPoint,
+          anchorFn: widget.overrides?.anchor
               ?? _stage.overrides?.anchor
-              ?? defaultDragAnchor;
-          final newCenter = anchorFn(ctx);
-          _stage.rect.value = Rect.fromCenter(
-            center: newCenter,
-            width: newWidth,
-            height: newHeight,
-          );
-        } else {
-          final delta = details.focalPointDelta;
-          final dx = _frictionScaledX(
-            delta: delta.dx, bounds: drag.bounds,
-            currentRect: currentRect, originRect: originRect, displayRect: displayRect,
-          );
-          final dy = _frictionScaledY(
-            delta: delta.dy, bounds: drag.bounds,
-            currentRect: currentRect, originRect: originRect, displayRect: displayRect,
-          );
-          _stage.rect.value = currentRect.translate(dx, dy);
-        }
+              ?? defaultDragAnchor,
+        );
       }
 
       case ScaleGesture scale: {

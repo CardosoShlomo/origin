@@ -1,7 +1,6 @@
 import 'package:flutter/widgets.dart';
 
 import 'origin_rect.dart';
-import 'ratio.dart';
 import 'release.dart';
 
 typedef StageBuilder = Widget Function(BuildContext context, Widget child);
@@ -142,6 +141,33 @@ class FrictionConfig {
     this.retractingPastDisplay,
   });
 
+  /// Same [Friction] for all four states.
+  const FrictionConfig.uniform(Friction friction)
+      : extending = friction,
+        extendingPastDisplay = friction,
+        retracting = friction,
+        retractingPastDisplay = friction;
+
+  /// Group by *direction*: [extending] applies to in-display and
+  /// past-display extending states; [retracting] applies to both
+  /// retracting states.
+  const FrictionConfig.byDirection({
+    required this.extending,
+    required this.retracting,
+  })  : extendingPastDisplay = extending,
+        retractingPastDisplay = retracting;
+
+  /// Group by *zone*: [inDisplay] applies to both extending and retracting
+  /// while the rect's edge is inside the display; [pastDisplay] applies to
+  /// both once the edge has crossed.
+  const FrictionConfig.byZone({
+    required Friction inDisplay,
+    required Friction pastDisplay,
+  })  : extending = inDisplay,
+        retracting = inDisplay,
+        extendingPastDisplay = pastDisplay,
+        retractingPastDisplay = pastDisplay;
+
   final Friction? extending;
   final Friction? extendingPastDisplay;
   final Friction? retracting;
@@ -164,6 +190,35 @@ class DecelerateConfig {
     this.retractingPastDisplay,
     this.settle,
   });
+
+  /// Same [Friction] for all four decay states. [settle] is independent.
+  const DecelerateConfig.uniform(Friction friction, {this.settle})
+      : extending = friction,
+        extendingPastDisplay = friction,
+        retracting = friction,
+        retractingPastDisplay = friction;
+
+  /// Group by *direction*: [extending] covers both in-display and
+  /// past-display extending decay; [retracting] covers both retracting
+  /// states. [settle] is independent.
+  const DecelerateConfig.byDirection({
+    required this.extending,
+    required this.retracting,
+    this.settle,
+  })  : extendingPastDisplay = extending,
+        retractingPastDisplay = retracting;
+
+  /// Group by *zone*: [inDisplay] covers both extending and retracting
+  /// while inside the display; [pastDisplay] covers both once the rect's
+  /// edge has crossed. [settle] is independent.
+  const DecelerateConfig.byZone({
+    required Friction inDisplay,
+    required Friction pastDisplay,
+    this.settle,
+  })  : extending = inDisplay,
+        retracting = inDisplay,
+        extendingPastDisplay = pastDisplay,
+        retractingPastDisplay = pastDisplay;
 
   final Friction? extending;
   final Friction? extendingPastDisplay;
@@ -213,41 +268,54 @@ class DragBounds extends Bounds {
   final ScaleResponse? scaleResponse;
 }
 
-/// Scale-as-function-of-drag-progress.
+/// One zone of a [ScaleResponse]. Maps a normalized progress (0..1
+/// across that zone's drag travel) to a scale factor that ends at
+/// [end] via [curve]. The zone's *start* value is implicit (taken
+/// from the prior zone's `end`, or `1.0` at base for the first zone)
+/// so consecutive ramps are guaranteed continuous.
 ///
-/// `inDisplay` ramp covers progress 0..1 from base to display edge.
-/// `pastDisplay` ramp covers progress 0..1 from display edge into past zone.
-/// Each [Friction] ramp's `start`/`end` are scale multipliers on baseWidth
-/// (e.g., `Friction(1.0, end: 0.6)` shrinks from full to 60%).
+/// **Reference frame:** [end] is *always relative to baseWidth*, never
+/// to the previous zone's end. So `pastDisplay: ScaleRamp(end: 0.2)`
+/// means "at full past-display, rect.width = 0.2 × baseWidth"
+/// regardless of what [inDisplay.end] was. This keeps the API
+/// declarative — each ramp's [end] is the absolute target the rect
+/// reaches at the end of that zone's drag.
+///
+/// Consequences:
+/// - `pastDisplay.end < inDisplay.end` → continued shrinking past edge
+///   (the usual case).
+/// - `pastDisplay.end > inDisplay.end` → rect grows back from edge
+///   state during past-display drag (valid; sometimes a useful effect).
+/// - `end > 1.0` → grows the rect; `end < 1.0` → shrinks. Both fine.
+class ScaleRamp {
+  const ScaleRamp({this.end = 0.5, this.curve = Curves.linear});
+
+  /// Scale factor at progress=1 of this zone — absolute multiplier on
+  /// baseWidth (not on the previous zone's end). See class doc.
+  final double end;
+
+  /// Shape of the ramp from the implicit start value to [end].
+  final Curve curve;
+}
+
+/// Scale-as-function-of-drag-progress, split into two zones:
+/// - [inDisplay]: covers the in-display drag zone (base position →
+///   rect's near edge touching display edge). Center lerps from
+///   baseCenter → near-edge-on-display center; scale lerps `1.0 →
+///   inDisplay.end` over the same curved progress.
+/// - [pastDisplay]: covers the past-display drag zone (rect at near
+///   edge → rect at far edge). End state = rect's *far* edge touching
+///   the display's edge with size `base * pastDisplay.end`. Scale
+///   lerps from `inDisplay.end` (or `1.0` if no inDisplay ramp) →
+///   `pastDisplay.end`.
+///
+/// Auto-stitched: each zone's start = previous zone's end, so the
+/// response can never be discontinuous at the geometric boundary.
 class ScaleResponse {
   const ScaleResponse({this.inDisplay, this.pastDisplay});
 
-  /// Smooth continuous shrink from 1.0 at base to [end] at full past.
-  /// Splits at the display edge so the in-display and past zones meet
-  /// at `(1.0 + end) / 2`.
-  factory ScaleResponse.smooth({
-    double end = 0.5,
-    Curve curve = Curves.linear,
-  }) {
-    final mid = (1.0 + end) / 2;
-    return ScaleResponse(
-      inDisplay: Friction(1.0, end: mid, curve: curve),
-      pastDisplay: Friction(mid, end: end, curve: curve),
-    );
-  }
-
-  /// Shrink only inside display. Past-display zone holds at `ramp.end`.
-  const ScaleResponse.inDisplayOnly(Friction ramp)
-      : inDisplay = ramp,
-        pastDisplay = null;
-
-  /// Hold flat in display. Shrink only when past edge.
-  const ScaleResponse.pastDisplayOnly(Friction ramp)
-      : inDisplay = null,
-        pastDisplay = ramp;
-
-  final Friction? inDisplay;
-  final Friction? pastDisplay;
+  final ScaleRamp? inDisplay;
+  final ScaleRamp? pastDisplay;
 }
 
 class ShrinkBounds extends Bounds {
@@ -313,10 +381,16 @@ class GestureBounds {
       };
 
   bool get hasScaleResponse =>
-      top?.scaleResponse != null ||
-      bottom?.scaleResponse != null ||
-      left?.scaleResponse != null ||
-      right?.scaleResponse != null;
+      hasVerticalScaleResponse || hasHorizontalScaleResponse;
+
+  bool get hasVerticalScaleResponse =>
+      top?.scaleResponse != null || bottom?.scaleResponse != null;
+
+  bool get hasHorizontalScaleResponse =>
+      left?.scaleResponse != null || right?.scaleResponse != null;
+
+  bool get hasVerticalBound => top != null || bottom != null;
+  bool get hasHorizontalBound => left != null || right != null;
 }
 
 /// Sealed parent for gesture kinds.
@@ -601,7 +675,8 @@ class DisplayConfig {
 /// the user manipulates the crop rect.
 class CropConfig {
   const CropConfig({
-    this.ratio,
+    this.minAspectRatio,
+    this.maxAspectRatio,
     this.shortest,
     this.longest,
     this.smallest,
@@ -609,10 +684,17 @@ class CropConfig {
     this.initialRect,
     this.borderRadius,
     this.overdragMax = 3.0,
-  });
+  }) : assert(
+          minAspectRatio == null ||
+              maxAspectRatio == null ||
+              maxAspectRatio >= minAspectRatio,
+          'maxAspectRatio must be >= minAspectRatio',
+        );
 
-  /// Locked aspect ratio. Null = free aspect.
-  final Ratio? ratio;
+  /// Allowed aspect-ratio range (width / height) for the crop rect.
+  /// Both null = free aspect. Equal min/max = locked aspect.
+  final double? minAspectRatio;
+  final double? maxAspectRatio;
 
   /// Minimum dimensions. Null = no minimum.
   final Size? shortest;

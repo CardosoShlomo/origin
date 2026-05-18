@@ -92,7 +92,11 @@ class _CropperState extends State<Cropper> {
     if (stage == null) return;
     final crop = stage.displayConfig()?.crop;
     if (crop == null) return;
-    final clamped = stage.crop.value.cropBoundaries(_boundaries(stage), crop.ratio);
+    final clamped = stage.crop.value.cropBoundaries(
+      _boundaries(stage),
+      minAspectRatio: crop.minAspectRatio,
+      maxAspectRatio: crop.maxAspectRatio,
+    );
     if (clamped != stage.crop.value) {
       stage.crop.value = clamped;
     }
@@ -120,27 +124,47 @@ class _CropperState extends State<Cropper> {
     // animation (e.g., setMode rect-rebase) and the captured outer-build
     // boundaries would go stale, causing [_onImageRectChanged] to clamp
     // the rect back the next frame.
-    stage.crop.value = stage.crop.value.moveCorner(
-      delta: delta,
-      corner: corner,
-      shortest: _effectiveMinSize(c),
-      longest: c.longest,
-      largest: c.largest,
-      boundaries: _boundaries(stage),
-      ratio: c.ratio,
-    );
+    stage.crop.value = _withAspectRange(c, (lock) {
+      return stage.crop.value.moveCorner(
+        delta: delta,
+        corner: corner,
+        shortest: _effectiveMinSize(c),
+        longest: c.longest,
+        largest: c.largest,
+        boundaries: _boundaries(stage),
+        aspectRatio: lock,
+      );
+    });
   }
 
   void _moveSide(Side side, double delta, CropConfig c, StageData stage) {
-    stage.crop.value = stage.crop.value.moveSide(
-      delta: delta,
-      side: side,
-      shortest: _effectiveMinSize(c),
-      longest: c.longest,
-      largest: c.largest,
-      boundaries: _boundaries(stage),
-      ratio: c.ratio,
-    );
+    stage.crop.value = _withAspectRange(c, (lock) {
+      return stage.crop.value.moveSide(
+        delta: delta,
+        side: side,
+        shortest: _effectiveMinSize(c),
+        longest: c.longest,
+        largest: c.largest,
+        boundaries: _boundaries(stage),
+        aspectRatio: lock,
+      );
+    });
+  }
+
+  /// Resolves the aspect-range policy for one resize step. Locked range
+  /// (min == max) always passes that lock. Free range (both null) passes
+  /// null. Otherwise computes the free result first; if its aspect spills
+  /// past min/max, redoes the move with the violated edge locked.
+  Rect _withAspectRange(CropConfig c, Rect Function(double? lock) move) {
+    final mn = c.minAspectRatio;
+    final mx = c.maxAspectRatio;
+    if (mn == null && mx == null) return move(null);
+    if (mn != null && mn == mx) return move(mn);
+    final free = move(null);
+    final ar = free.width / free.height;
+    if (mn != null && ar < mn) return move(mn);
+    if (mx != null && ar > mx) return move(mx);
+    return free;
   }
 
   @override
@@ -205,7 +229,7 @@ class _CropperState extends State<Cropper> {
                 // Corner / side handles — extend a bit beyond the crop
                 // rect. Fade with chrome during dismiss too.
                 Positioned.fromRect(
-                  rect: cropRect.resizeOnCenter(
+                  rect: cropRect.resize(
                     math.max(cropRect.width * 1.15, stage.display.rect.shortestSide / 3.5),
                     math.max(cropRect.height * 1.15, stage.display.rect.shortestSide / 3.5),
                   ),

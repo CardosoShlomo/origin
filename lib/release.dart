@@ -218,7 +218,7 @@ class Release {
             : scaleRelease.decay.last.to);
     // Rect at the post-scale-settle dims — used by per-axis helpers to
     // compute viewport-fit at gesture-end *and* decay-end positions.
-    final projectedRect = data.currentRect.resizeOnCenter(
+    final projectedRect = data.currentRect.resize(
       scaleTargetWidth,
       scaleTargetWidth / data.aspectRatio,
     );

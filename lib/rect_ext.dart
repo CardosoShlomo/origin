@@ -2,9 +2,13 @@ import 'dart:math';
 
 import 'package:flutter/widgets.dart';
 import 'corner.dart';
-import 'ratio.dart';
 import 'side.dart';
 
+/// Rect transformations in this package pivot on the *center* unless the
+/// method name says otherwise. That's the natural choice for animation /
+/// gesture math (the center is the point that stays put during scaling),
+/// in contrast to Flutter's layout-flavored topLeft convention on
+/// [Rect.fromLTRB] / [Rect.fromLTWH].
 extension RectExt on Rect {
   double get aspectRatio => width / height;
   double get area => width * height;
@@ -12,30 +16,40 @@ extension RectExt on Rect {
   double baseWidth(double aspectRatio) => min(width, height * aspectRatio);
   double baseHeight(double aspectRatio) => min(height, width / aspectRatio);
 
-  Rect baseRect(double aspectRatio) {
-    return resizeOnCenter(
-      baseWidth(aspectRatio),
-      baseHeight(aspectRatio),
-    );
-  }
+  Rect baseRect(double aspectRatio) =>
+      resize(baseWidth(aspectRatio), baseHeight(aspectRatio));
 
-  Rect copyWithCenter(Offset offset) {
-    return Rect.fromCenter(center: offset, width: width, height: height);
-  }
+  /// Same size, new center.
+  Rect copyWithCenter(Offset offset) =>
+      Rect.fromCenter(center: offset, width: width, height: height);
 
-  Rect resizeOnCenter(double width, double height) {
-    return Rect.fromCenter(center: center, width: width, height: height);
-  }
+  /// Same center, new size. Aspect may change.
+  Rect resize(double width, double height) =>
+      Rect.fromCenter(center: center, width: width, height: height);
+
+  /// Multiply both dimensions by [scale]; aspect preserved, center fixed.
+  Rect scale(double scale) => resize(width * scale, height * scale);
+
+  /// Scale so the new width equals [width]; aspect preserved, center fixed.
+  Rect scaleToWidth(double width) => scale(width / this.width);
+
+  /// Scale so the new height equals [height]; aspect preserved, center fixed.
+  Rect scaleToHeight(double height) => scale(height / this.height);
 
   /// Clamps `this` (a crop rect) to stay inside [boundaries], optionally
-  /// honoring a fixed aspect [ratio]. When a part of the rect spills past
-  /// an edge, it's pushed back; if [ratio] is set, the resulting rect is
-  /// resized on its center to keep the locked aspect.
+  /// honoring an aspect-ratio range. When a part of the rect spills past
+  /// an edge, it's pushed back; if the resulting aspect violates
+  /// [minAspectRatio] / [maxAspectRatio], it's resized on its center to
+  /// snap back into the allowed range.
   ///
   /// Used by the [Cropper] tool whenever the user drags the crop rect or
   /// the underlying image transforms — keeps the crop rect inside the
   /// image's intersected viewport.
-  Rect cropBoundaries(Rect boundaries, Ratio? ratio) {
+  Rect cropBoundaries(
+    Rect boundaries, {
+    double? minAspectRatio,
+    double? maxAspectRatio,
+  }) {
     if (top >= boundaries.top &&
         left >= boundaries.left &&
         bottom <= boundaries.bottom &&
@@ -50,10 +64,16 @@ extension RectExt on Rect {
       left <= boundaries.left ? boundaries.left + w : min(boundaries.right, right),
       top <= boundaries.top ? boundaries.top + h : min(boundaries.bottom, bottom),
     );
-    if (ratio != null) {
-      return result.resizeOnCenter(
-        min(w, h * ratio.aspectRatio),
-        min(h, w / ratio.aspectRatio),
+    final ar = result.width / result.height;
+    final lock = minAspectRatio != null && ar < minAspectRatio
+        ? minAspectRatio
+        : maxAspectRatio != null && ar > maxAspectRatio
+            ? maxAspectRatio
+            : null;
+    if (lock != null) {
+      return result.resize(
+        min(result.width, result.height * lock),
+        min(result.height, result.width / lock),
       );
     }
     return result;
@@ -116,7 +136,7 @@ extension RectExt on Rect {
       final ratio = (baseRect.width * maxScale) / width;
       final newCenter =
           (center - displayRect.center) * ratio + displayRect.center;
-      target = resizeOnCenter(
+      target = resize(
         baseRect.width * maxScale,
         baseRect.height * maxScale,
       ).copyWithCenter(newCenter);
@@ -180,7 +200,7 @@ extension RectExt on Rect {
     return translate(dx, dy);
   }
 
-  //todo: implement largest when ratio is not null and make it more responsive
+  //todo: implement largest when aspectRatio is not null and make it more responsive
   Rect moveSide({
     required double delta,
     required Side side,
@@ -188,7 +208,7 @@ extension RectExt on Rect {
     required Size? longest,
     required double? largest,
     required Rect boundaries,
-    required Ratio? ratio,
+    required double? aspectRatio,
   }) {
     double l = left, t = top, r = right, b = bottom;
     switch (side) {
@@ -196,12 +216,12 @@ extension RectExt on Rect {
         l = left + delta;
         if (delta < 0) {
           l = [l, boundaries.left, if (longest != null) right - longest.width, if (largest != null) right - largest/height].reduce(max);
-          if (ratio != null) {
+          if (aspectRatio != null) {
             final newWidthPrediction = width - l + left;
-            final newHeightPrediction = newWidthPrediction / ratio.aspectRatio;
+            final newHeightPrediction = newWidthPrediction / aspectRatio;
             final boundaryHeight = longest == null ? boundaries.height : min(boundaries.height, longest.height);
             if (newHeightPrediction > boundaryHeight) {
-              l = right - boundaryHeight * ratio.aspectRatio;
+              l = right - boundaryHeight * aspectRatio;
               t = boundaries.top;
               b = boundaries.bottom;
             } else {
@@ -218,11 +238,11 @@ extension RectExt on Rect {
           }
         } else {
           l = min(l, right - shortest.width);
-          if (ratio != null) {
+          if (aspectRatio != null) {
             final newWidthPrediction = width - l + left;
-            final newHeightPrediction = newWidthPrediction / ratio.aspectRatio;
+            final newHeightPrediction = newWidthPrediction / aspectRatio;
             if (newHeightPrediction < shortest.height) {
-              l = right - shortest.height * ratio.aspectRatio;
+              l = right - shortest.height * aspectRatio;
               t = center.dy - shortest.height/2;
               b = t + shortest.height;
             } else {
@@ -235,12 +255,12 @@ extension RectExt on Rect {
         t = top + delta;
         if (delta < 0) {
           t = [t, boundaries.top, if (longest != null) bottom - longest.height, if (largest != null) bottom - largest/width].reduce(max);
-          if (ratio != null) {
+          if (aspectRatio != null) {
             final newHeightPrediction = height - t + top;
-            final newWidthPrediction = newHeightPrediction * ratio.aspectRatio;
+            final newWidthPrediction = newHeightPrediction * aspectRatio;
             final boundaryWidth = longest == null ? boundaries.width : min(boundaries.width, longest.width);
             if (newWidthPrediction > boundaryWidth) {
-              t = bottom - boundaryWidth / ratio.aspectRatio;
+              t = bottom - boundaryWidth / aspectRatio;
               l = boundaries.left;
               r = boundaries.right;
             } else {
@@ -257,11 +277,11 @@ extension RectExt on Rect {
           }
         } else {
           t = min(t, bottom - shortest.height);
-          if (ratio != null) {
+          if (aspectRatio != null) {
             final newHeightPrediction = height - t + top;
-            final newWidthPrediction = newHeightPrediction * ratio.aspectRatio;
+            final newWidthPrediction = newHeightPrediction * aspectRatio;
             if (newWidthPrediction < shortest.width) {
-              t = bottom - shortest.width / ratio.aspectRatio;
+              t = bottom - shortest.width / aspectRatio;
               l = center.dx - shortest.width/2;
               r = l + shortest.width;
             } else {
@@ -274,12 +294,12 @@ extension RectExt on Rect {
         r = right + delta;
         if (delta > 0) {
           r = [r, boundaries.right, if (longest != null) left + longest.width, if (largest != null) left + largest/height].reduce(min);
-          if (ratio != null) {
+          if (aspectRatio != null) {
             final newWidthPrediction = width + r - right;
-            final newHeightPrediction = newWidthPrediction / ratio.aspectRatio;
+            final newHeightPrediction = newWidthPrediction / aspectRatio;
             final boundaryHeight = longest == null ? boundaries.height : min(boundaries.height, longest.height);
             if (newHeightPrediction > boundaryHeight) {
-              r = left + boundaryHeight * ratio.aspectRatio;
+              r = left + boundaryHeight * aspectRatio;
               t = boundaries.top;
               b = boundaries.bottom;
             } else {
@@ -296,11 +316,11 @@ extension RectExt on Rect {
           }
         } else {
           r = max(r, left + shortest.width);
-          if (ratio != null) {
+          if (aspectRatio != null) {
             final newWidthPrediction = width + r - right;
-            final newHeightPrediction = newWidthPrediction / ratio.aspectRatio;
+            final newHeightPrediction = newWidthPrediction / aspectRatio;
             if (newHeightPrediction < shortest.height) {
-              r = left + shortest.height * ratio.aspectRatio;
+              r = left + shortest.height * aspectRatio;
               t = center.dy - shortest.height/2;
               b = t + shortest.height;
             } else {
@@ -313,12 +333,12 @@ extension RectExt on Rect {
         b = bottom + delta;
         if (delta > 0) {
           b = [b, boundaries.bottom, if (longest != null) top + longest.height, if (largest != null) top + largest/width].reduce(min);
-          if (ratio != null) {
+          if (aspectRatio != null) {
             final newHeightPrediction = height + b - bottom;
-            final newWidthPrediction = newHeightPrediction * ratio.aspectRatio;
+            final newWidthPrediction = newHeightPrediction * aspectRatio;
             final boundaryWidth = longest == null ? boundaries.width : min(boundaries.width, longest.width);
             if (newWidthPrediction > boundaryWidth) {
-              b = top + boundaryWidth / ratio.aspectRatio;
+              b = top + boundaryWidth / aspectRatio;
               l = boundaries.left;
               r = boundaries.right;
             } else {
@@ -335,11 +355,11 @@ extension RectExt on Rect {
           }
         } else {
           b = max(b, top + shortest.height);
-          if (ratio != null) {
+          if (aspectRatio != null) {
             final newHeightPrediction = height + b - bottom;
-            final newWidthPrediction = newHeightPrediction * ratio.aspectRatio;
+            final newWidthPrediction = newHeightPrediction * aspectRatio;
             if (newWidthPrediction < shortest.width) {
-              b = top + shortest.width / ratio.aspectRatio;
+              b = top + shortest.width / aspectRatio;
               l = center.dx - shortest.width/2;
               r = l + shortest.width;
             } else {
@@ -352,7 +372,7 @@ extension RectExt on Rect {
     return Rect.fromLTRB(l, t, r, b);
   }
 
-  //todo: implement largest when ratio is not null and make it more responsive
+  //todo: implement largest when aspectRatio is not null and make it more responsive
   Rect moveCorner({
     required Offset delta,
     required Corner corner,
@@ -360,7 +380,7 @@ extension RectExt on Rect {
     required Size? longest,
     required double? largest,
     required Rect boundaries,
-    required Ratio? ratio,
+    required double? aspectRatio,
   }) {
     double l = left, t = top, r = right, b = bottom;
     lLarge([double? largest]) => [left + delta.dx, boundaries.left, if (longest != null) right - longest.width, ?largest].reduce(max);
@@ -379,14 +399,15 @@ extension RectExt on Rect {
     bEnlarge([double? largest]) => b = bLarge(largest);
     bShort() => max(bottom + delta.dy, top + shortest.height);
     bShorten() => b = bShort();
-    if (ratio != null) {
+    if (aspectRatio != null) {
       double boundaryX, boundaryY, overflowX, overflowY;
       Function() boundByX, boundByY;
+      final denom = aspectRatio + 1.0;
       switch (corner) {
         case Corner.topLeft:
-          final part = (delta.dx + delta.dy) / (ratio.x + ratio.y);
-          l = left + part * ratio.x;
-          t = top + part * ratio.y;
+          final part = (delta.dx + delta.dy) / denom;
+          l = left + part * aspectRatio;
+          t = top + part;
           if (t < top) {
             boundaryX = longest == null ? boundaries.left : max(boundaries.left, right - longest.width);
             boundaryY = longest == null ? boundaries.top : max(boundaries.top, bottom - longest.height);
@@ -400,16 +421,16 @@ extension RectExt on Rect {
           }
           boundByX = () {
             l = boundaryX;
-            t = bottom - (right - l) / ratio.aspectRatio;
+            t = bottom - (right - l) / aspectRatio;
           };
           boundByY = () {
             t = boundaryY;
-            l = right - (bottom - t) * ratio.aspectRatio;
+            l = right - (bottom - t) * aspectRatio;
           };
         case Corner.topRight:
-          final part = (-delta.dx + delta.dy) / (ratio.x + ratio.y);
-          t = top + part * ratio.y;
-          r = right - part * ratio.x;
+          final part = (-delta.dx + delta.dy) / denom;
+          t = top + part;
+          r = right - part * aspectRatio;
           if (t < top) {
             boundaryX = longest == null ? boundaries.right : min(boundaries.right, left + longest.width);
             boundaryY = longest == null ? boundaries.top : max(boundaries.top, bottom - longest.height);
@@ -423,16 +444,16 @@ extension RectExt on Rect {
           }
           boundByX = () {
             r = boundaryX;
-            t = bottom - (r - left) / ratio.aspectRatio;
+            t = bottom - (r - left) / aspectRatio;
           };
           boundByY = () {
             t = boundaryY;
-            r = left + (bottom - t) * ratio.aspectRatio;
+            r = left + (bottom - t) * aspectRatio;
           };
         case Corner.bottomLeft:
-          final part = (-delta.dx + delta.dy) / (ratio.x + ratio.y);
-          l = left - part * ratio.x;
-          b = bottom + part * ratio.y;
+          final part = (-delta.dx + delta.dy) / denom;
+          l = left - part * aspectRatio;
+          b = bottom + part;
           if (b > bottom) {
             boundaryX = longest == null ? boundaries.left : max(boundaries.left, right - longest.width);
             boundaryY = longest == null ? boundaries.bottom : min(boundaries.bottom, top + longest.height);
@@ -446,16 +467,16 @@ extension RectExt on Rect {
           }
           boundByX = () {
             l = boundaryX;
-            b = top + (right - l) / ratio.aspectRatio;
+            b = top + (right - l) / aspectRatio;
           };
           boundByY = () {
             b = boundaryY;
-            l = right - (b - top) * ratio.aspectRatio;
+            l = right - (b - top) * aspectRatio;
           };
         case Corner.bottomRight:
-          final part = (delta.dx + delta.dy) / (ratio.x + ratio.y);
-          b = bottom + part * ratio.y;
-          r = right + part * ratio.x;
+          final part = (delta.dx + delta.dy) / denom;
+          b = bottom + part;
+          r = right + part * aspectRatio;
           if (b > bottom) {
             boundaryX = longest == null ? boundaries.right : min(boundaries.right, left + longest.width);
             boundaryY = longest == null ? boundaries.bottom : min(boundaries.bottom, top + longest.height);
@@ -464,21 +485,16 @@ extension RectExt on Rect {
           } else {
             boundaryX = left + shortest.width;
             boundaryY = top + shortest.height;
-            // Sign was flipped here vs. the other three corners — shrinking
-            // overflows when r drops *below* the min, which is `boundaryX -
-            // r`, not `r - boundaryX`. With the wrong sign, every shrink
-            // step fired the bound-by-X branch and snapped the rect to its
-            // minimum width.
             overflowX = boundaryX - r;
             overflowY = boundaryY - b;
           }
           boundByX = () {
             r = boundaryX;
-            b = top + (r - left) / ratio.aspectRatio;
+            b = top + (r - left) / aspectRatio;
           };
           boundByY = () {
             b = boundaryY;
-            r = left + (b - top) * ratio.aspectRatio;
+            r = left + (b - top) * aspectRatio;
           };
       }
       if (overflowX > 0) {

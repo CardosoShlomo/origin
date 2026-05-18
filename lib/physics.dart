@@ -9,10 +9,79 @@ import 'release.dart';
 /// Per-axis classification used by friction / fling lookups.
 typedef AxisState = ({
   DragBound activeBound,
-  bool extending,
-  bool pastDisplay,
+  DragDirectionState directionState,
   double progress,
 });
+
+/// Discrete direction state for a per-axis drag/release. Four-value
+/// taxonomy that mirrors [FrictionConfig]'s slots: combines
+/// extending-vs-retracting (motion sign relative to base) with
+/// in-display-vs-past-display (rect's actual edge vs display edge).
+enum DragDirectionState {
+  extending,
+  extendingPast,
+  retracting,
+  retractingPast,
+}
+
+/// Which X-axis bound the rect is currently sitting on. If centered at
+/// base, [delta]'s sign decides (positive → right).
+DragBound boundForX({
+  required double delta,
+  required Rect currentRect,
+  required Rect baseRect,
+}) {
+  if (currentRect.center.dx > baseRect.center.dx) return .right;
+  if (currentRect.center.dx < baseRect.center.dx) return .left;
+  return delta >= 0 ? .right : .left;
+}
+
+/// Which Y-axis bound the rect is currently sitting on. If centered at
+/// base, [delta]'s sign decides (positive → bottom).
+DragBound boundForY({
+  required double delta,
+  required Rect currentRect,
+  required Rect baseRect,
+}) {
+  if (currentRect.center.dy > baseRect.center.dy) return .bottom;
+  if (currentRect.center.dy < baseRect.center.dy) return .top;
+  return delta >= 0 ? .bottom : .top;
+}
+
+/// Four-value X-axis direction state: combines the motion direction
+/// (extending vs retracting, decided by [delta]'s sign relative to
+/// [boundForX]) with whether the rect's relevant edge is past the
+/// display edge.
+DragDirectionState directionStateForX({
+  required double delta,
+  required Rect currentRect,
+  required Rect baseRect,
+  required Rect displayRect,
+}) {
+  final isRight = boundForX(delta: delta, currentRect: currentRect, baseRect: baseRect) == .right;
+  final pastDisplay = isRight
+      ? currentRect.right > displayRect.right
+      : currentRect.left < displayRect.left;
+  final extending = isRight ? delta > 0 : delta < 0;
+  if (extending) return pastDisplay ? .extendingPast : .extending;
+  return pastDisplay ? .retractingPast : .retracting;
+}
+
+/// Four-value Y-axis direction state — mirror of [directionStateForX].
+DragDirectionState directionStateForY({
+  required double delta,
+  required Rect currentRect,
+  required Rect baseRect,
+  required Rect displayRect,
+}) {
+  final isBottom = boundForY(delta: delta, currentRect: currentRect, baseRect: baseRect) == .bottom;
+  final pastDisplay = isBottom
+      ? currentRect.bottom > displayRect.bottom
+      : currentRect.top < displayRect.top;
+  final extending = isBottom ? delta > 0 : delta < 0;
+  if (extending) return pastDisplay ? .extendingPast : .extending;
+  return pastDisplay ? .retractingPast : .retracting;
+}
 
 /// Curve that exactly tracks a [FrictionSimulation]'s position over its
 /// duration. Maps normalized animation time `t ∈ [0, 1]` to normalized
@@ -42,21 +111,21 @@ AxisState axisStateX(
   Rect originRect,
   Rect displayRect,
 ) {
-  final inRight = currentRect.center.dx >= originRect.center.dx;
-  final pastDisplay = inRight
-      ? currentRect.right > displayRect.right
-      : currentRect.left < displayRect.left;
+  final bound = boundForX(delta: signedAmount, currentRect: currentRect, baseRect: originRect);
+  final direction = directionStateForX(
+    delta: signedAmount,
+    currentRect: currentRect,
+    baseRect: originRect,
+    displayRect: displayRect,
+  );
+  final isRight = bound == .right;
+  final pastDisplay = direction == .extendingPast || direction == .retractingPast;
   final progress = pastDisplay
-      ? ((inRight
+      ? ((isRight
               ? currentRect.right - displayRect.right
               : displayRect.left - currentRect.left) / displayRect.width).clamp(0.0, 1.0)
       : ((currentRect.center.dx - originRect.center.dx).abs() / (displayRect.width / 2)).clamp(0.0, 1.0);
-  return (
-    activeBound: inRight ? DragBound.right : DragBound.left,
-    extending: (inRight && signedAmount > 0) || (!inRight && signedAmount < 0),
-    pastDisplay: pastDisplay,
-    progress: progress,
-  );
+  return (activeBound: bound, directionState: direction, progress: progress);
 }
 
 /// Computes the Y-axis state.
@@ -66,21 +135,21 @@ AxisState axisStateY(
   Rect originRect,
   Rect displayRect,
 ) {
-  final inBottom = currentRect.center.dy >= originRect.center.dy;
-  final pastDisplay = inBottom
-      ? currentRect.bottom > displayRect.bottom
-      : currentRect.top < displayRect.top;
+  final bound = boundForY(delta: signedAmount, currentRect: currentRect, baseRect: originRect);
+  final direction = directionStateForY(
+    delta: signedAmount,
+    currentRect: currentRect,
+    baseRect: originRect,
+    displayRect: displayRect,
+  );
+  final isBottom = bound == .bottom;
+  final pastDisplay = direction == .extendingPast || direction == .retractingPast;
   final progress = pastDisplay
-      ? ((inBottom
+      ? ((isBottom
               ? currentRect.bottom - displayRect.bottom
               : displayRect.top - currentRect.top) / displayRect.height).clamp(0.0, 1.0)
       : ((currentRect.center.dy - originRect.center.dy).abs() / (displayRect.height / 2)).clamp(0.0, 1.0);
-  return (
-    activeBound: inBottom ? DragBound.bottom : DragBound.top,
-    extending: (inBottom && signedAmount > 0) || (!inBottom && signedAmount < 0),
-    pastDisplay: pastDisplay,
-    progress: progress,
-  );
+  return (activeBound: bound, directionState: direction, progress: progress);
 }
 
 /// Friction-scaled delta given a per-axis state.
@@ -95,11 +164,21 @@ double frictionFromState({
   if (boundConfig == null) return 0;
   final fc = boundConfig.friction;
   if (fc == null) return delta;
-  final friction = state.pastDisplay
-      ? (state.extending ? fc.extendingPastDisplay : fc.retractingPastDisplay)
-      : (state.extending ? fc.extending : fc.retracting);
+  final friction = fc.forDirection(state.directionState);
   if (friction == null) return delta;
   return delta * (1.0 - friction.evaluate(state.progress));
+}
+
+/// Picks the matching [Friction] ramp from a [FrictionConfig] for the
+/// given direction state. One-line mapping that mirrors the enum's
+/// shape to the config's four slots.
+extension FrictionConfigByDirection on FrictionConfig {
+  Friction? forDirection(DragDirectionState direction) => switch (direction) {
+        .extending => extending,
+        .extendingPast => extendingPastDisplay,
+        .retracting => retracting,
+        .retractingPast => retractingPastDisplay,
+      };
 }
 
 /// Side of the scale axis active at the given width.
@@ -192,87 +271,147 @@ double frictionFromScaleState({
 ///   ramp like `Friction(1.0, end: 0.2)` covers the full shrink without
 ///   discontinuity.
 /// - Per-axis factors multiplied.
-double dragScaleFactor({
-  required Offset rawCenter,
-  required Rect actualRect,
-  required Rect baseRect,
-  required Rect displayRect,
-  required GestureBounds bounds,
-}) {
-  final DragBound boundY = rawCenter.dy < baseRect.center.dy ? .top : .bottom;
-  final factorY = _axisScaleFactor(
-    rawPos: rawCenter.dy,
-    basePos: baseRect.center.dy,
-    dispLow: displayRect.top,
-    dispHigh: displayRect.bottom,
-    halfDim: baseRect.height / 2,
-    displayDim: displayRect.height,
-    response: bounds[boundY]?.scaleResponse,
-  );
-
-  final DragBound boundX = rawCenter.dx < baseRect.center.dx ? .left : .right;
-  final factorX = _axisScaleFactor(
-    rawPos: rawCenter.dx,
-    basePos: baseRect.center.dx,
-    dispLow: displayRect.left,
-    dispHigh: displayRect.right,
-    halfDim: baseRect.width / 2,
-    displayDim: displayRect.width,
-    response: bounds[boundX]?.scaleResponse,
-  );
-
-  return factorX * factorY;
-}
-
-double _axisScaleFactor({
-  required double rawPos,
+/// Per-axis scaleResponse: given the rect's *actual* center on the
+/// axis (whatever the friction-damped translation produced), returns
+/// the corresponding scale factor by reading the lerp between
+/// geometric endpoints. In-display zone end = "rect's near edge
+/// touches display edge, size = base*inDisplay.end"; past-display
+/// zone end = "rect's far edge touches display edge, size =
+/// base*pastDisplay.end".
+double scaleForCenter({
+  required double center,
   required double basePos,
-  required double dispLow,
-  required double dispHigh,
-  required double halfDim,
-  required double displayDim,
+  required double baseHalfDim,
+  required double displayLow,
+  required double displayHigh,
   required ScaleResponse? response,
 }) {
   if (response == null) return 1.0;
-  final isHigh = rawPos >= basePos;
-  if (isHigh) {
-    final dispEdge = dispHigh - halfDim;
-    final span = dispEdge - basePos;
-    if (span <= 0) {
-      // No in-display slack (e.g. display == base). Fold the whole drag
-      // into the inDisplay ramp over [displayDim] so a single Friction
-      // ramp covers the full response without branch discontinuity.
-      final progress = ((rawPos - basePos) / displayDim).clamp(0.0, 1.0);
-      return response.inDisplay?.evaluate(progress)
-          ?? response.pastDisplay?.start
-          ?? 1.0;
-    }
-    if (rawPos <= dispEdge) {
-      final progress = ((rawPos - basePos) / span).clamp(0.0, 1.0);
-      return response.inDisplay?.evaluate(progress) ?? 1.0;
-    }
-    final progress = ((rawPos - dispEdge) / displayDim).clamp(0.0, 1.0);
-    return response.pastDisplay?.evaluate(progress)
-        ?? response.inDisplay?.end
-        ?? 1.0;
-  } else {
-    final dispEdge = dispLow + halfDim;
-    final span = basePos - dispEdge;
-    if (span <= 0) {
-      final progress = ((basePos - rawPos) / displayDim).clamp(0.0, 1.0);
-      return response.inDisplay?.evaluate(progress)
-          ?? response.pastDisplay?.start
-          ?? 1.0;
-    }
-    if (rawPos >= dispEdge) {
-      final progress = ((basePos - rawPos) / span).clamp(0.0, 1.0);
-      return response.inDisplay?.evaluate(progress) ?? 1.0;
-    }
-    final progress = ((dispEdge - rawPos) / displayDim).clamp(0.0, 1.0);
-    return response.pastDisplay?.evaluate(progress)
-        ?? response.inDisplay?.end
-        ?? 1.0;
+  final isHigh = center >= basePos;
+  final dir = isHigh ? 1.0 : -1.0;
+  final dispEdge = isHigh ? displayHigh : displayLow;
+  final inEnd = response.inDisplay?.end ?? 1.0;
+  final inEndCenter = dispEdge - dir * baseHalfDim * inEnd;
+  final travel = (center - basePos) * dir;
+  final inTravel = (inEndCenter - basePos) * dir;
+  if (travel <= inTravel || response.pastDisplay == null) {
+    final p = inTravel > 0 ? (travel / inTravel).clamp(0.0, 1.0) : 0.0;
+    final curveP = response.inDisplay?.curve.transform(p) ?? 0.0;
+    return 1.0 + (inEnd - 1.0) * curveP;
   }
+  final pastEnd = response.pastDisplay!.end;
+  final pastEndCenter = dispEdge + dir * baseHalfDim * pastEnd;
+  final pastTravel = (pastEndCenter - inEndCenter) * dir;
+  final p = pastTravel > 0 ? ((travel - inTravel) / pastTravel).clamp(0.0, 1.0) : 1.0;
+  final curveP = response.pastDisplay!.curve.transform(p);
+  return inEnd + (pastEnd - inEnd) * curveP;
+}
+
+/// Convenience method on [GestureBounds] for the friction primitive.
+extension GestureBoundsPhysics on GestureBounds {
+  /// See [frictionFromState]. Returns the friction-scaled delta for the
+  /// given axis state under these bounds.
+  double friction(AxisState state, double delta) =>
+      frictionFromState(state: state, bounds: this, delta: delta);
+}
+
+/// Compute the new rect for a [DragGesture] update. Handles both branches:
+/// scaleResponse-driven (per-axis focal-preserving + width scaling, with
+/// non-scaleResponse axes still getting friction-scaled translation) and
+/// pure translation (friction-scaled deltas on both axes).
+Rect computeDragRect({
+  required GestureBounds bounds,
+  required Rect currentRect,
+  required Rect originRect,
+  required Rect displayRect,
+  required double aspectRatio,
+  required Offset focalPoint,
+  required Offset focalPointDelta,
+  required Rect startRect,
+  required Offset startFocalPoint,
+  required Offset Function(AnchorContext) anchorFn,
+}) {
+  final baseRect = displayRect.baseRect(aspectRatio);
+  // Pipeline:
+  //   1. Friction damps the per-axis focal motion.
+  //   2. effectiveFocal = prevEffectiveFocal + frictionedDelta. Prev
+  //      effective focal is back-derived from currentRect via the
+  //      anchor invariant `rect.center = focal − anchor*scale`.
+  //   3. scaleForCenter input: `effectiveFocal − anchor*prevScale`
+  //      (the rect's would-be center if scale hadn't changed yet).
+  //      This is "scale factor calculated with the anchor's offset".
+  //   4. newCenter = `effectiveFocal − anchor * factor` — anchor
+  //      offset implemented at the new scale. (focal − center) ∝
+  //      scale, so smaller rects ride closer to the pointer.
+  //   Without friction this reduces to the prior anchor-only model:
+  //   factor = scaleForCenter(focal − anchor); newCenter = focal −
+  //   anchor*factor.
+  final anchor = startFocalPoint - startRect.center;
+  final prevScale = startRect.width == 0 ? 1.0 : currentRect.width / startRect.width;
+  final prevEffectiveFocal = currentRect.center + anchor * prevScale;
+  final stateX = axisStateX(focalPointDelta.dx, currentRect, originRect, displayRect);
+  final stateY = axisStateY(focalPointDelta.dy, currentRect, originRect, displayRect);
+  final effectiveDeltaX = bounds.hasHorizontalBound
+      ? bounds.friction(stateX, focalPointDelta.dx)
+      : focalPointDelta.dx;
+  final effectiveDeltaY = bounds.hasVerticalBound
+      ? bounds.friction(stateY, focalPointDelta.dy)
+      : focalPointDelta.dy;
+  final effectiveFocal = prevEffectiveFocal + Offset(effectiveDeltaX, effectiveDeltaY);
+  // Anchor-adjusted input for the scale calc (anchor's offset baked in).
+  final scaleInputX = effectiveFocal.dx - anchor.dx * prevScale;
+  final scaleInputY = effectiveFocal.dy - anchor.dy * prevScale;
+  final factorX = bounds.hasHorizontalScaleResponse
+      ? scaleForCenter(
+          center: scaleInputX,
+          basePos: baseRect.center.dx,
+          baseHalfDim: baseRect.width / 2,
+          displayLow: displayRect.left,
+          displayHigh: displayRect.right,
+          response: bounds[stateX.activeBound]?.scaleResponse,
+        )
+      : 1.0;
+  final factorY = bounds.hasVerticalScaleResponse
+      ? scaleForCenter(
+          center: scaleInputY,
+          basePos: baseRect.center.dy,
+          baseHalfDim: baseRect.height / 2,
+          displayLow: displayRect.top,
+          displayHigh: displayRect.bottom,
+          response: bounds[stateY.activeBound]?.scaleResponse,
+        )
+      : 1.0;
+  final combinedFactor = factorX * factorY;
+  // New center: anchor offset implemented at the new scale.
+  final newCenterX = effectiveFocal.dx - anchor.dx * combinedFactor;
+  final newCenterY = effectiveFocal.dy - anchor.dy * combinedFactor;
+  return applyDragTransform(
+    newCenter: Offset(newCenterX, newCenterY),
+    baseRect: baseRect,
+    aspectRatio: aspectRatio,
+    scaleFactor: combinedFactor,
+  );
+}
+
+/// Pure rect-construction helper. Takes the final per-axis [newCenter]
+/// (already decided by the caller's routing — scaleResponse center,
+/// anchor center, or friction-translated current center) and the final
+/// [scaleFactor] (multiplier on [baseRect]'s width). Builds the new
+/// rect centered at [newCenter] with `newWidth = baseRect.width *
+/// scaleFactor`, `newHeight = newWidth / aspectRatio`.
+Rect applyDragTransform({
+  required Offset newCenter,
+  required Rect baseRect,
+  required double aspectRatio,
+  required double scaleFactor,
+}) {
+  final newWidth = baseRect.width * scaleFactor;
+  final newHeight = newWidth / aspectRatio;
+  return Rect.fromCenter(
+    center: newCenter,
+    width: newWidth,
+    height: newHeight,
+  );
 }
 
 /// Default focal-point-preserving anchor: the rect.center is positioned so
