@@ -144,8 +144,8 @@ extension RectExt on Rect {
     return target.shiftXToFitInside(displayRect).shiftYToFitInside(displayRect);
   }
 
-  /// [force] represents the fraction of which we want to force the rect towards the container
-  /// when force is equal to one, then the returned rect will be inside the container
+  /// [force] ∈ [0, 1]: how much to pull the rect back inside [container].
+  /// 0 = no movement, 1 = fully inside.
   Rect shiftXToFitInside(Rect container, {double force = 1}) {
     assert(0 <= force && force <= 1);
     return translate((getLimitedCenterXInside(container) - center.dx) * force, 0);
@@ -180,8 +180,8 @@ extension RectExt on Rect {
     }
   }
 
-  /// check if the rect is going outside of the container
-  /// in each axis and apply the (-)friction if true
+  /// Applies per-axis friction damping when the rect's edges cross the
+  /// container in the direction of [focalPointDelta].
   Rect getLimitedRect({
     required Rect container,
     required Offset focalPointDelta,
@@ -212,7 +212,7 @@ extension RectExt on Rect {
   }) {
     double l = left, t = top, r = right, b = bottom;
     switch (side) {
-      case Side.left:
+      case .left:
         l = left + delta;
         if (delta < 0) {
           l = [l, boundaries.left, if (longest != null) right - longest.width, if (largest != null) right - largest/height].reduce(max);
@@ -251,7 +251,7 @@ extension RectExt on Rect {
             }
           }
         }
-      case Side.top:
+      case .top:
         t = top + delta;
         if (delta < 0) {
           t = [t, boundaries.top, if (longest != null) bottom - longest.height, if (largest != null) bottom - largest/width].reduce(max);
@@ -290,7 +290,7 @@ extension RectExt on Rect {
             }
           }
         }
-      case Side.right:
+      case .right:
         r = right + delta;
         if (delta > 0) {
           r = [r, boundaries.right, if (longest != null) left + longest.width, if (largest != null) left + largest/height].reduce(min);
@@ -329,7 +329,7 @@ extension RectExt on Rect {
             }
           }
         }
-      case Side.bottom:
+      case .bottom:
         b = bottom + delta;
         if (delta > 0) {
           b = [b, boundaries.bottom, if (longest != null) top + longest.height, if (largest != null) top + largest/width].reduce(min);
@@ -404,7 +404,7 @@ extension RectExt on Rect {
       Function() boundByX, boundByY;
       final denom = aspectRatio + 1.0;
       switch (corner) {
-        case Corner.topLeft:
+        case .topLeft:
           final part = (delta.dx + delta.dy) / denom;
           l = left + part * aspectRatio;
           t = top + part;
@@ -427,7 +427,7 @@ extension RectExt on Rect {
             t = boundaryY;
             l = right - (bottom - t) * aspectRatio;
           };
-        case Corner.topRight:
+        case .topRight:
           final part = (-delta.dx + delta.dy) / denom;
           t = top + part;
           r = right - part * aspectRatio;
@@ -450,7 +450,7 @@ extension RectExt on Rect {
             t = boundaryY;
             r = left + (bottom - t) * aspectRatio;
           };
-        case Corner.bottomLeft:
+        case .bottomLeft:
           final part = (-delta.dx + delta.dy) / denom;
           l = left - part * aspectRatio;
           b = bottom + part;
@@ -473,7 +473,7 @@ extension RectExt on Rect {
             b = boundaryY;
             l = right - (b - top) * aspectRatio;
           };
-        case Corner.bottomRight:
+        case .bottomRight:
           final part = (delta.dx + delta.dy) / denom;
           b = bottom + part;
           r = right + part * aspectRatio;
@@ -530,7 +530,7 @@ extension RectExt on Rect {
       }
       /// first shorten then enlarge -> thus the enlarge can get more space
       switch (corner) {
-        case Corner.topLeft:
+        case .topLeft:
           if (delta.dx > 0) {
             lShorten();
             if (delta.dy > 0) {
@@ -549,7 +549,7 @@ extension RectExt on Rect {
               t = top + delta.dy;
             }
           }
-        case Corner.topRight:
+        case .topRight:
           if (delta.dx < 0) {
             rShorten();
             if (delta.dy > 0) {
@@ -568,7 +568,7 @@ extension RectExt on Rect {
               t = top + delta.dy;
             }
           }
-        case Corner.bottomLeft:
+        case .bottomLeft:
           if (delta.dx > 0) {
             lShorten();
             if (delta.dy < 0) {
@@ -587,7 +587,7 @@ extension RectExt on Rect {
               b = bottom + delta.dy;
             }
           }
-        case Corner.bottomRight:
+        case .bottomRight:
           if (delta.dx < 0) {
             rShorten();
             if (delta.dy < 0) {
@@ -613,10 +613,10 @@ extension RectExt on Rect {
       rr() => delta.dx > 0 ? rEnlarge() : rShorten();
       bb() => delta.dy > 0 ? bEnlarge() : bShorten();
       switch (corner) {
-        case Corner.topLeft: tt(); ll();
-        case Corner.topRight: tt(); rr();
-        case Corner.bottomLeft: bb(); ll();
-        case Corner.bottomRight: bb(); rr();
+        case .topLeft: tt(); ll();
+        case .topRight: tt(); rr();
+        case .bottomLeft: bb(); ll();
+        case .bottomRight: bb(); rr();
       }
     }
     return Rect.fromLTRB(l, t, r, b);

@@ -206,7 +206,7 @@ ScaleAxisState axisStateScale(
   ExpandBounds? expand,
 ) {
   final inExpand = currentWidth > baseWidth;
-  final activeSide = inExpand ? ScaleSide.expand : ScaleSide.shrink;
+  final ScaleSide activeSide = inExpand ? .expand : .shrink;
   final shrinkLow =
       shrink?.minScale != null ? shrink!.minScale! * baseWidth : double.negativeInfinity;
   final expandHigh =
@@ -242,8 +242,8 @@ double frictionFromScaleState({
 }) {
   if (delta == 0) return 0;
   final sideConfig = switch (state.activeSide) {
-    ScaleSide.shrink => shrink as Bounds?,
-    ScaleSide.expand => expand as Bounds?,
+    .shrink => shrink as Bounds?,
+    .expand => expand as Bounds?,
   };
   if (sideConfig == null) return 0;
   final fc = sideConfig.friction;
@@ -257,27 +257,11 @@ double frictionFromScaleState({
 
 // ─── Drag scale-response coupling ────────────────────────────────────────────
 
-/// Combined scale factor for drag-with-[ScaleResponse]. Per axis:
-/// - Active bound = side of [baseRect.center] where [rawCenter] sits.
-/// - ScaleResponse comes from `bounds[activeBound].scaleResponse` (no
-///   gesture-level fallback — bounds without scaleResponse contribute 1.0).
-/// - The in-display / past-display branch boundary is fixed at the *base*
-///   rect's edge — it doesn't move as the live rect shrinks during drag.
-///   This is deliberate: [displayRect] defines the static physics zone, and
-///   a moving boundary would cause the formula to flip branches as the
-///   rect updates, producing rect bistability.
-/// - When [displayRect] equals [baseRect] (no in-display slack), the whole
-///   drag folds into the `inDisplay` ramp over `displayDim`, so a single
-///   ramp like `Friction(1.0, end: 0.2)` covers the full shrink without
-///   discontinuity.
-/// - Per-axis factors multiplied.
-/// Per-axis scaleResponse: given the rect's *actual* center on the
-/// axis (whatever the friction-damped translation produced), returns
-/// the corresponding scale factor by reading the lerp between
-/// geometric endpoints. In-display zone end = "rect's near edge
-/// touches display edge, size = base*inDisplay.end"; past-display
-/// zone end = "rect's far edge touches display edge, size =
-/// base*pastDisplay.end".
+/// Per-axis scaleResponse: given the rect's center on the axis, returns
+/// the corresponding scale factor by reading the lerp between geometric
+/// endpoints. In-display zone end = "rect's near edge touches display
+/// edge, size = `base * inDisplay.end`"; past-display zone end =
+/// "rect's far edge touches display edge, size = `base * pastDisplay.end`".
 double scaleForCenter({
   required double center,
   required double basePos,
@@ -315,10 +299,9 @@ extension GestureBoundsPhysics on GestureBounds {
       frictionFromState(state: state, bounds: this, delta: delta);
 }
 
-/// Compute the new rect for a [DragGesture] update. Handles both branches:
-/// scaleResponse-driven (per-axis focal-preserving + width scaling, with
-/// non-scaleResponse axes still getting friction-scaled translation) and
-/// pure translation (friction-scaled deltas on both axes).
+/// New rect for a [DragGesture] update. Free pan (no scaleResponse) is
+/// pure friction-damped translation; scaleResponse routes through the
+/// anchor pipeline (focal-preserving size + position).
 Rect computeDragRect({
   required GestureBounds bounds,
   required Rect currentRect,
@@ -332,23 +315,6 @@ Rect computeDragRect({
   required Offset Function(AnchorContext) anchorFn,
 }) {
   final baseRect = displayRect.baseRect(aspectRatio);
-  // Pipeline:
-  //   1. Friction damps the per-axis focal motion.
-  //   2. effectiveFocal = prevEffectiveFocal + frictionedDelta. Prev
-  //      effective focal is back-derived from currentRect via the
-  //      anchor invariant `rect.center = focal − anchor*scale`.
-  //   3. scaleForCenter input: `effectiveFocal − anchor*prevScale`
-  //      (the rect's would-be center if scale hadn't changed yet).
-  //      This is "scale factor calculated with the anchor's offset".
-  //   4. newCenter = `effectiveFocal − anchor * factor` — anchor
-  //      offset implemented at the new scale. (focal − center) ∝
-  //      scale, so smaller rects ride closer to the pointer.
-  //   Without friction this reduces to the prior anchor-only model:
-  //   factor = scaleForCenter(focal − anchor); newCenter = focal −
-  //   anchor*factor.
-  final anchor = startFocalPoint - startRect.center;
-  final prevScale = startRect.width == 0 ? 1.0 : currentRect.width / startRect.width;
-  final prevEffectiveFocal = currentRect.center + anchor * prevScale;
   final stateX = axisStateX(focalPointDelta.dx, currentRect, originRect, displayRect);
   final stateY = axisStateY(focalPointDelta.dy, currentRect, originRect, displayRect);
   final effectiveDeltaX = bounds.hasHorizontalBound
@@ -357,10 +323,23 @@ Rect computeDragRect({
   final effectiveDeltaY = bounds.hasVerticalBound
       ? bounds.friction(stateY, focalPointDelta.dy)
       : focalPointDelta.dy;
-  final effectiveFocal = prevEffectiveFocal + Offset(effectiveDeltaX, effectiveDeltaY);
-  // Anchor-adjusted input for the scale calc (anchor's offset baked in).
-  final scaleInputX = effectiveFocal.dx - anchor.dx * prevScale;
-  final scaleInputY = effectiveFocal.dy - anchor.dy * prevScale;
+
+  // Fast path: no scaleResponse anywhere → pure friction-scaled
+  // translation. The unified anchor pipeline below reduces to this
+  // mathematically when `prevScale == combinedFactor == 1`, but a
+  // stale `startRect.width` from a prior gesture can flip `prevScale`
+  // off 1 and introduce an unwanted anchor offset on a free-pan
+  // gesture (e.g. browse-card swipe).
+  if (!bounds.hasScaleResponse) {
+    return currentRect.translate(effectiveDeltaX, effectiveDeltaY);
+  }
+
+  // Anchor pipeline. scaleInput collapses to `currentRect.center +
+  // effectiveDelta`; the anchor only survives in [newCenter] where
+  // it's multiplied by `(prevScale − combinedFactor)` — the focal-
+  // preserving adjustment for this frame's scale change.
+  final scaleInputX = currentRect.center.dx + effectiveDeltaX;
+  final scaleInputY = currentRect.center.dy + effectiveDeltaY;
   final factorX = bounds.hasHorizontalScaleResponse
       ? scaleForCenter(
           center: scaleInputX,
@@ -382,9 +361,11 @@ Rect computeDragRect({
         )
       : 1.0;
   final combinedFactor = factorX * factorY;
-  // New center: anchor offset implemented at the new scale.
-  final newCenterX = effectiveFocal.dx - anchor.dx * combinedFactor;
-  final newCenterY = effectiveFocal.dy - anchor.dy * combinedFactor;
+  final anchor = startFocalPoint - startRect.center;
+  final prevScale = startRect.width == 0 ? 1.0 : currentRect.width / startRect.width;
+  final scaleDelta = prevScale - combinedFactor;
+  final newCenterX = scaleInputX + anchor.dx * scaleDelta;
+  final newCenterY = scaleInputY + anchor.dy * scaleDelta;
   return applyDragTransform(
     newCenter: Offset(newCenterX, newCenterY),
     baseRect: baseRect,
@@ -529,7 +510,7 @@ ActiveGesture? resolveScaleArena({
 // detection) and the rubber-fling builder are shared via [_runPhase] and
 // [_rubberFling].
 
-const double _velocityFloor = 10;
+const double _velocityFloor = 50;
 const double _maxPhaseTime = 1.0;
 const int _maxPhases = 6;
 
@@ -621,7 +602,7 @@ AxisFling _rubberFling({
   final v0 = distance * math.log(drag).abs();
   final naturalTime =
       (math.log(_velocityFloor / v0) / math.log(drag / 100)).abs();
-  final duration = naturalTime.clamp(0.1, 1.0);
+  final duration = naturalTime.clamp(0.1, 0.7);
   return AxisFling(
     to: targetPos,
     duration: Duration(milliseconds: (duration * 1000).round()),
@@ -659,8 +640,8 @@ HorizontalRelease releaseFromStateX({
   final pastLeftBound = dispRight - halfWidth;
   final pastRightBound = dispLeft + halfWidth;
 
-  final leftDc = bounds[DragBound.left]?.decelerate;
-  final rightDc = bounds[DragBound.right]?.decelerate;
+  final leftDc = bounds[.left]?.decelerate;
+  final rightDc = bounds[.right]?.decelerate;
 
   final fitWidth = projectedRect?.width ?? currentRect.width;
   final fitHeight = projectedRect?.height ?? currentRect.height;
@@ -817,8 +798,8 @@ VerticalRelease releaseFromStateY({
   final pastTopBound = dispBottom - halfHeight;
   final pastBottomBound = dispTop + halfHeight;
 
-  final topDc = bounds[DragBound.top]?.decelerate;
-  final bottomDc = bounds[DragBound.bottom]?.decelerate;
+  final topDc = bounds[.top]?.decelerate;
+  final bottomDc = bounds[.bottom]?.decelerate;
 
   final fitWidth = projectedRect?.width ?? currentRect.width;
   final fitHeight = projectedRect?.height ?? currentRect.height;

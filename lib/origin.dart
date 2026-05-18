@@ -206,8 +206,6 @@ class _OriginState extends State<Origin> {
     return _OriginData(tag: widget.tag, child: widget.child);
   }
 
-  // --- Swap logic ---
-
   Object? _swapHover;
   Object? _swapDisplaced;
   bool _swapListening = false;
@@ -263,8 +261,6 @@ class _OriginState extends State<Origin> {
     }
     _swapHover = null;
   }
-
-  // --- Item gesture logic ---
 
   /// Single active-gesture slot. Null = uncommitted.
   ActiveGesture? _active;
@@ -411,9 +407,6 @@ class _OriginState extends State<Origin> {
       }
     }
   }
-
-  // Per-axis convenience wrappers used by call sites.
-  // Compose the state computer + resolution helper from physics.dart.
 
   double _frictionScaledX({
     required double delta,
@@ -621,8 +614,7 @@ class _OriginState extends State<Origin> {
     widget.onTap!(_buildTapEvent(details.localPosition, details.globalPosition));
   }
 
-  // Double-tap recognizer fires onDoubleTap without position info; we cache
-  // the position from onDoubleTapDown.
+  // Cached from onDoubleTapDown — onDoubleTap doesn't include position.
   Offset _doubleTapLocal = .zero;
   Offset _doubleTapGlobal = .zero;
 

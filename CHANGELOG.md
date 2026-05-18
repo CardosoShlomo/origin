@@ -1,3 +1,68 @@
+## 2.0.0
+
+Large refactor of the gesture, release, and physics layers and a
+built-in cropper tool. Spans 15 commits since 1.5.2; many public APIs
+changed shape.
+
+### Breaking
+
+* **`GestureBounds`** replaces `Map<DragBound, DragBounds>` everywhere
+  `bounds:` is used. Convenience constructors: `.vertical`, `.horizontal`,
+  `.symmetric`, `.all`, plus per-side `.top` / `.bottom` / `.left` /
+  `.right`.
+* **`ScaleResponse`** uses two `ScaleRamp` zones (`end` + `curve` only) —
+  consecutive ramps auto-stitch from `1.0` (or prior zone's end) so they
+  can't be made discontinuous.
+* **`FrictionConfig`** ships three named constructors: `.uniform`,
+  `.byDirection`, `.byZone`. Per-slot default constructor still works.
+* **`CropConfig`**: single `ratio: Ratio?` replaced with
+  `minAspectRatio: double?` + `maxAspectRatio: double?` (equal values =
+  locked aspect).
+* **`RectExt.cropBoundaries` / `moveSide` / `moveCorner`** take `double?
+  aspectRatio` (or named min/max on `cropBoundaries`) instead of `Ratio?`.
+* **`AxisState`** collapses `extending` + `pastDisplay` into a single
+  `DragDirectionState` enum mirroring `FrictionConfig`'s four slots.
+* Per-axis drag-update helpers reorganized — `dragScaleFactor` removed;
+  `computeDragRect` / `applyDragTransform` are the supported entry points.
+* `axisStateX` / `axisStateY` return shape changed to use
+  `DragDirectionState`.
+
+### Added
+
+* **Built-in `Cropper` widget** with `CropConfig` — dim/grid/handles,
+  aspect-range support, mid-mode crop-drag with pinned-edge image follow,
+  chrome cross-fade on entry/dismiss.
+* **Mode system** on `Origin` — `modes: {key: DisplayConfig}` switched via
+  `Stage.setMode(key)`. Per-mode merge over the Origin's default
+  `displayConfig` field-by-field. Mode transitions animate rect + crop
+  rect in parallel.
+* **Stage transition signals**: `transitionProgressMin` / `Mean` / `Max`
+  (`ValueListenable<double>`) — aggregated progress across the rect/crop
+  animation controllers, gated by `openingOrDismissing || changingMode`.
+  Plus `Stage.changingMode` flag.
+* **Hybrid pointer merger** — `Origin` and `Stage` cooperate during a
+  single gesture when pointers cross between their hit regions.
+* **Arena-based gesture cascade** — drag/scale resolution via priority
+  cascade (per-gesture → `DisplayConfig` → `Stage` → default).
+* **Decomposed per-axis release plan** with adaptive rubber settle —
+  velocity-driven decay phases per axis followed by a snap-back simulation.
+* **Drag → scale promotion cascade** — `DragGesture.promote` /
+  `DisplayConfig.dragPromote` / `Stage.dragPromote`.
+* **Scale-velocity translation cancel** — `scaleVelocityCancel` cascade
+  damps residual pan velocity proportional to pinch velocity at release.
+* **Skia-based `cropImageBytes`** + `displayRectToSourceRect` helpers for
+  consumers that want to apply the crop rect to source bytes.
+* **`Stage.animateWidth({to, height?})`** — optional `height` lets the
+  height tween target a value other than `to / aspectRatio` (smooth
+  aspect transitions during `animateRect`).
+* **`Origin.aspectRatio`** — explicit aspect override (falls back to
+  `context.size!.aspectRatio`).
+* **Per-axis primitives** `boundForX/Y`, `directionStateForX/Y` for
+  consumers building custom routing.
+* **Opt-in tap recognizers** — `onTap` / `onDoubleTap` register only when
+  a handler is supplied; without one, deeper `GestureDetector`s win
+  the arena without `kDoubleTapTimeout` latency.
+
 ## 1.5.2
 
 * Send overlays now clip against the origin container, matching the main overlay's clipping during reorder.

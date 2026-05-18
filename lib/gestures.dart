@@ -148,9 +148,8 @@ class FrictionConfig {
         retracting = friction,
         retractingPastDisplay = friction;
 
-  /// Group by *direction*: [extending] applies to in-display and
-  /// past-display extending states; [retracting] applies to both
-  /// retracting states.
+  /// Direction-grouped: in-display and past-display states share the
+  /// same ramp per direction.
   const FrictionConfig.byDirection({
     required this.extending,
     required this.retracting,

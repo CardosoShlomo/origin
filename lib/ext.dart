@@ -20,11 +20,9 @@ extension ScaleExt on ScaleUpdateDetails {
     );
   }
 
-  /// Computes the image rect after a crop-rect drag step. When the crop rect
-  /// is pinned against the image edge in the drag direction, the image is
-  /// pulled along with the finger by an asymmetric amount based on the
-  /// focal point's distance to each edge of the crop. [overdragMax] caps the
-  /// per-frame catch-up; configurable via [CropConfig.overdragMax].
+  /// When the crop rect is pinned against the image edge, drags the
+  /// image along the finger by an amount weighted by the focal's
+  /// distance to each crop edge. [overdragMax] caps per-frame catch-up.
   Rect imageRectOnDragCropRect({
     required Rect container,
     required Rect imageRect,

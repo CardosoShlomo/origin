@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'ext.dart';
@@ -208,11 +209,8 @@ class Stage extends StatefulWidget {
 
 class _StageState extends State<Stage> with TickerProviderStateMixin {
   final _rect = ValueNotifier(Rect.zero);
-  // True while Stage's recognizer holds &gt; 0 pointers — a coarse "is the user
-  // touching the displayed area right now?" signal. Consumers read it via
-  // [Stage.isInteractingOf] (tag-aware: returns true iff the queried tag is
-  // currently the active stage tag *and* there's at least one pointer down).
-  // Independent of which gesture (drag/scale) has committed in arena.
+  // Any pointer currently down on Stage. Tag-aware lookup via
+  // [Stage.isInteractingOf]. Independent of which gesture has committed.
   bool _interacting = false;
 
   /// The active crop rect, owned by Stage just like [_rect]. Initialized
@@ -269,11 +267,19 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _centerX = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateRect);
-    _centerY = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateRect);
-    _width = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateRect);
+    _centerX = AnimationController(vsync: this, duration: _defaultDuration)
+      ..addListener(_updateRect)
+      ..addListener(_updateTransitionProgress);
+    _centerY = AnimationController(vsync: this, duration: _defaultDuration)
+      ..addListener(_updateRect)
+      ..addListener(_updateTransitionProgress);
+    _width = AnimationController(vsync: this, duration: _defaultDuration)
+      ..addListener(_updateRect)
+      ..addListener(_updateTransitionProgress);
     _effect = AnimationController(vsync: this, duration: _defaultDuration);
-    _cropAnim = AnimationController(vsync: this, duration: _defaultDuration)..addListener(_updateCrop);
+    _cropAnim = AnimationController(vsync: this, duration: _defaultDuration)
+      ..addListener(_updateCrop)
+      ..addListener(_updateTransitionProgress);
     _rect.addListener(_updateProgress);
     _rect.addListener(_updateContainer);
   }
@@ -371,6 +377,58 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   bool _openingOrDismissing = false;
   void _setOpeningOrDismissing(bool v) {
     if (_openingOrDismissing != v) setState(() => _openingOrDismissing = v);
+    _syncTransitionFlags();
+  }
+
+  /// True while [_setMode] is running its rect/crop transition animation
+  /// (browse → crop and similar). Consumers can use this to fade chrome
+  /// in/out only on real mode transitions, not on mid-mode interaction.
+  bool _changingMode = false;
+  void _setChangingMode(bool v) {
+    if (_changingMode != v) setState(() => _changingMode = v);
+    _syncTransitionFlags();
+  }
+
+  /// Called when a transition flag flips. Snaps progress to 0 (active)
+  /// or 1 (inactive) so consumers see a clean 0→1 ramp on each
+  /// transition instead of stale values from the last animation.
+  /// Controller ticks (via [_updateTransitionProgress]) take over from
+  /// there for the duration of the animation.
+  void _syncTransitionFlags() {
+    final v = (_openingOrDismissing || _changingMode) ? 0.0 : 1.0;
+    _transitionProgressMin.value = v;
+    _transitionProgressMean.value = v;
+    _transitionProgressMax.value = v;
+  }
+
+  /// Progress 0..1 derived from the four rect/crop controller values
+  /// while a real transition is active (`openingOrDismissing ||
+  /// changingMode`). Three aggregations — pick whichever fits:
+  /// - [_transitionProgressMin]: slowest controller. Hits 1 only when
+  ///   *every* animation has finished.
+  /// - [_transitionProgressMean]: average across all four. Smooth
+  ///   middle-of-the-pack progress.
+  /// - [_transitionProgressMax]: fastest controller. Hits 1 as soon
+  ///   as *any* animation finishes.
+  /// All stay at 1 outside transitions (release/settle don't move them).
+  final _transitionProgressMin = ValueNotifier<double>(1.0);
+  final _transitionProgressMean = ValueNotifier<double>(1.0);
+  final _transitionProgressMax = ValueNotifier<double>(1.0);
+  /// Updates the progress notifiers from the four controllers' current
+  /// values. Called on every controller tick (via listener). No-op when
+  /// no transition is active — idle resets are owned by
+  /// [_syncTransitionFlags].
+  void _updateTransitionProgress() {
+    if (!_openingOrDismissing && !_changingMode) return;
+    final values = [
+      _centerX.value,
+      _centerY.value,
+      _width.value,
+      _cropAnim.value,
+    ];
+    _transitionProgressMin.value = values.reduce(math.min);
+    _transitionProgressMax.value = values.reduce(math.max);
+    _transitionProgressMean.value = values.reduce((a, b) => a + b) / values.length;
   }
 
   // Decomposed-release state. When true, [_updateRect] computes the rect's
@@ -472,11 +530,27 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     // Seed the crop rect when entering a new crop config (by identity) so
     // switching configs (e.g. free → square) re-anchors to the configured
     // initial rect, but in-flight edits within the same config aren't lost.
+    //
+    // When the display rect ALSO changes (browse → crop), animate the
+    // crop rect in parallel with the image rect: start at the initial
+    // rect evaluated against the *old* base, end at the initial rect
+    // evaluated against the *new* base. Same callback applied to both —
+    // so a "biggest square" initialRect grows from old-base shortestSide
+    // to new-base shortestSide in sync with the image rect.
     final crop = effective?.crop;
+    final newBase = newDisplay.rect.baseRect(_aspectRatio);
+    final displayChanged = newDisplay.rect != prevDisplay.rect && _rect.value != .zero;
     if (crop != null && !identical(crop, _lastCrop)) {
       _lastCrop = crop;
-      final base = newDisplay.rect.baseRect(_aspectRatio);
-      _crop.value = crop.initialRect?.call(base) ?? base;
+      final endRect = crop.initialRect?.call(newBase) ?? newBase;
+      if (displayChanged) {
+        final oldBase = prevDisplay.rect.baseRect(_aspectRatio);
+        final startRect = crop.initialRect?.call(oldBase) ?? oldBase;
+        _crop.value = startRect;
+        animateCrop(to: endRect, curve: Curves.easeOut);
+      } else {
+        _crop.value = endRect;
+      }
     } else if (crop == null) {
       _lastCrop = null;
     }
@@ -484,8 +558,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     // constrains the display to exclude an appbar), animate the live rect
     // to the new base — otherwise the image would jump or sit at a stale
     // position relative to the new container.
-    if (newDisplay.rect != prevDisplay.rect && _rect.value != .zero) {
-      animateRect(to: newDisplay.rect.baseRect(_aspectRatio), curve: Curves.easeOut);
+    if (displayChanged) {
+      _setChangingMode(true);
+      animateRect(to: newBase, curve: Curves.easeOut)
+          .whenComplete(() => _setChangingMode(false));
     }
   }
 
@@ -1241,6 +1317,29 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _crop.value = .zero;
     _lastCrop = null;
     _cropDrag = false;
+    // Decomposed-release state — must be cleared so the next gesture's
+    // tween-begin lookup falls back to [_rect.value.center.dx] instead
+    // of reading stale tween values left over from a release that was
+    // interrupted before its natural completion.
+    _clearReleaseDecomposed();
+    // Geometry — wipe back to defaults so the next Origin activation
+    // can't see leftover display/aspect from the previous session
+    // (causes the rect to settle at a stale position on the new
+    // Origin's first frame, before [_setMode] / [_setAspectRatio]
+    // overwrite them).
+    _display = _defaultOriginRect;
+    _origin = _defaultOriginRect;
+    _aspectRatio = 1.0;
+    // Transition flags — if a previous setMode / open / dismiss was
+    // interrupted before its `whenComplete`/`finally` cleared them,
+    // they stick at true and freeze [transitionProgress] at 0 so
+    // chrome stays invisible. Force back to inactive.
+    _setOpeningOrDismissing(false);
+    _setChangingMode(false);
+    // Tag-keyed bookkeeping. Stale entries can mis-route a future
+    // dismiss/swap/state lookup.
+    _sends.clear();
+    _tagStates.clear();
   }
 
   Future<void> runEffect({
@@ -1518,6 +1617,9 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _cropAnim.dispose();
     _container.dispose();
     _originToBaseProgress.dispose();
+    _transitionProgressMin.dispose();
+    _transitionProgressMean.dispose();
+    _transitionProgressMax.dispose();
     _centerX.dispose();
     _centerY.dispose();
     _width.dispose();
@@ -1561,6 +1663,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       tag: _tag,
       locked: _locked,
       dismissing: _dismissing,
+      changingMode: _changingMode,
+      transitionProgressMin: _transitionProgressMin,
+      transitionProgressMean: _transitionProgressMean,
+      transitionProgressMax: _transitionProgressMax,
       tagStates: {..._tagStates},
       container: _container,
       setOrigin: _setOrigin,
@@ -1727,6 +1833,10 @@ class StageData extends InheritedModel<Object> {
     required this.tag,
     required this.locked,
     required this.dismissing,
+    required this.changingMode,
+    required this.transitionProgressMin,
+    required this.transitionProgressMean,
+    required this.transitionProgressMax,
     required this.tagStates,
     required this.container,
     required this.setOrigin,
@@ -1852,6 +1962,19 @@ class StageData extends InheritedModel<Object> {
   final Object? tag;
   final bool locked;
   final bool dismissing;
+  /// True while [setMode] is animating its rect/crop transition. Use to
+  /// gate mode-transition fades without firing on user interaction.
+  final bool changingMode;
+  /// Progress 0..1 derived from the four rect/crop animation
+  /// controllers, gated by `openingOrDismissing || changingMode` so
+  /// release/settle don't move it. Three aggregations exposed —
+  /// consumer picks based on desired fade timing:
+  /// - [transitionProgressMin]: slowest controller.
+  /// - [transitionProgressMean]: average across all four.
+  /// - [transitionProgressMax]: fastest controller.
+  final ValueListenable<double> transitionProgressMin;
+  final ValueListenable<double> transitionProgressMean;
+  final ValueListenable<double> transitionProgressMax;
   final Map<Object, TagState> tagStates;
   final ValueNotifier<OriginRect?> container;
 

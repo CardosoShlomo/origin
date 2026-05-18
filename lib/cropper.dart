@@ -84,9 +84,8 @@ class _CropperState extends State<Cropper> {
     super.dispose();
   }
 
-  /// When the underlying image's rect changes (e.g., from a release fling,
-  /// programmatic animation, or a parallel scale), re-clamp the crop rect
-  /// so it stays inside the visible image.
+  /// Re-clamp the crop rect to the visible image after any image-rect
+  /// change (release fling, mode-change animation, scale).
   void _onImageRectChanged() {
     final stage = _stage;
     if (stage == null) return;
@@ -105,10 +104,8 @@ class _CropperState extends State<Cropper> {
   Rect _boundaries(StageData stage) =>
       stage.rect.value.intersect(stage.display.rect);
 
-  /// Hard package floor for crop rect dimensions (in logical pixels).
-  /// Combined with [CropConfig.shortest] via max-component, so consumers
-  /// can raise it but not lower it — a too-tiny crop rect is meaningless
-  /// and un-grabbable.
+  /// Package-level minimum crop side (px). Combined with
+  /// [CropConfig.shortest] via max — consumers can raise but not lower.
   static const _minCropSide = 80.0;
 
   Size _effectiveMinSize(CropConfig c) {
@@ -120,10 +117,9 @@ class _CropperState extends State<Cropper> {
   }
 
   void _moveCorner(Corner corner, Offset delta, CropConfig c, StageData stage) {
-    // Boundaries computed fresh each update — `stage.rect` can be mid-
-    // animation (e.g., setMode rect-rebase) and the captured outer-build
-    // boundaries would go stale, causing [_onImageRectChanged] to clamp
-    // the rect back the next frame.
+    // Recompute boundaries per frame — stage.rect may be mid-animation,
+    // and a cached value would let _onImageRectChanged clamp this
+    // frame's move away on the next tick.
     stage.crop.value = _withAspectRange(c, (lock) {
       return stage.crop.value.moveCorner(
         delta: delta,
@@ -182,9 +178,16 @@ class _CropperState extends State<Cropper> {
         // [originToBaseProgress] (which goes 1 → 0 as the rect heads back
         // to origin during dismiss).
         return ValueListenableBuilder<double>(
-          valueListenable: stage.originToBaseProgress,
+          valueListenable: stage.transitionProgressMin,
           builder: (context, p, _) {
-            final chromeAlpha = stage.dismissing ? p : 1.0;
+            // Directional fade based on the active tool:
+            // - Crop tool active (displayConfig has crop config) and
+            //   not dismissing → chrome target opaque, p drives 0→1.
+            // - Otherwise (leaving crop tool, or dismissing) → chrome
+            //   target transparent, p drives 1→0.
+            final hasCrop = stage.displayConfig()?.crop != null;
+            final fadingIn = hasCrop && !stage.dismissing;
+            final chromeAlpha = fadingIn ? p : (1 - p);
             final dimColor = widget.dimColor.withValues(
               alpha: widget.dimColor.a * chromeAlpha,
             );
@@ -267,7 +270,6 @@ class _DimOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // White "punch-out" shape — rounded if borderRadius is set.
     final punchOut = borderRadius == null
         ? const ColoredBox(color: Color(0xFFFFFFFF))
         : DecoratedBox(
@@ -278,14 +280,14 @@ class _DimOverlay extends StatelessWidget {
           );
     return IgnorePointer(
       child: ColorFiltered(
-        colorFilter: ColorFilter.mode(color, BlendMode.srcOut),
+        colorFilter: .mode(color, .srcOut),
         child: Stack(
           fit: .expand,
           children: [
             const DecoratedBox(
               decoration: BoxDecoration(
                 color: Color(0xFF000000),
-                backgroundBlendMode: BlendMode.dstOut,
+                backgroundBlendMode: .dstOut,
               ),
             ),
             Positioned.fromRect(rect: cropRect, child: punchOut),
