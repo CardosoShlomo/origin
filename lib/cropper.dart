@@ -191,64 +191,59 @@ class _CropperState extends State<Cropper> {
             final dimColor = widget.dimColor.withValues(
               alpha: widget.dimColor.a * chromeAlpha,
             );
-            return Stack(
-              fit: .expand,
-              children: [
-                // Dim overlay outside crop rect (visual only — no hit test).
-                _DimOverlay(
-                  cropRect: cropRect,
-                  color: dimColor,
-                  borderRadius: borderRadius,
-                ),
-                // Grid visual only (no gesture detector) — Stage's
-                // recognizer owns 1-finger drags inside the crop rect.
-                // During dismiss, the grid clips to the configured
-                // borderRadius (e.g. circular for an avatar preview) so
-                // its rectangular frame morphs in lockstep with the
-                // image's clip lerp instead of sticking out as a
-                // rectangle over the now-circular target.
-                Positioned.fromRect(
-                  rect: cropRect,
-                  child: IgnorePointer(
-                    child: Opacity(
-                      opacity: chromeAlpha,
-                      child: ClipRRect(
-                        borderRadius: stage.dismissing
-                            ? borderRadius ?? .zero
-                            : .zero,
-                        child: _CropGrid(
-                          color: widget.gridColor,
-                          lineWidth: widget.gridLineWidth,
-                          borderColor: widget.gridBorderColor ?? widget.gridColor,
-                          borderWidth: widget.gridBorderWidth,
-                          divisions: widget.gridDivisions,
-                          handleColor: widget.handleColor,
-                          handleThickness: widget.handleThickness,
+            return Directionality(
+              textDirection: .ltr,
+              child: Stack(
+                fit: .expand,
+                children: [
+                  _DimOverlay(
+                    cropRect: cropRect,
+                    color: dimColor,
+                    borderRadius: borderRadius,
+                  ),
+                  // Clip the grid during dismiss so a rectangular frame doesn't
+                  // poke out of a circular target as the rect lerps home.
+                  Positioned.fromRect(
+                    rect: cropRect,
+                    child: IgnorePointer(
+                      child: Opacity(
+                        opacity: chromeAlpha,
+                        child: ClipRRect(
+                          borderRadius: stage.dismissing
+                              ? borderRadius ?? .zero
+                              : .zero,
+                          child: _CropGrid(
+                            color: widget.gridColor,
+                            lineWidth: widget.gridLineWidth,
+                            borderColor: widget.gridBorderColor ?? widget.gridColor,
+                            borderWidth: widget.gridBorderWidth,
+                            divisions: widget.gridDivisions,
+                            handleColor: widget.handleColor,
+                            handleThickness: widget.handleThickness,
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-                // Corner / side handles — extend a bit beyond the crop
-                // rect. Fade with chrome during dismiss too.
-                Positioned.fromRect(
-                  rect: cropRect.resize(
-                    math.max(cropRect.width * 1.15, stage.display.rect.shortestSide / 3.5),
-                    math.max(cropRect.height * 1.15, stage.display.rect.shortestSide / 3.5),
-                  ),
-                  child: Opacity(
-                    opacity: chromeAlpha,
-                    child: _CropHandles(
-                      cropRect: cropRect,
-                      minDimension: widget.minHandleDimension,
-                      onMoveCorner: (corner, delta) =>
-                          _moveCorner(corner, delta, crop, stage),
-                      onMoveSide: (side, delta) =>
-                          _moveSide(side, delta, crop, stage),
+                  Positioned.fromRect(
+                    rect: cropRect.resize(
+                      math.max(cropRect.width * 1.15, stage.display.rect.shortestSide / 3.5),
+                      math.max(cropRect.height * 1.15, stage.display.rect.shortestSide / 3.5),
+                    ),
+                    child: Opacity(
+                      opacity: chromeAlpha,
+                      child: _CropHandles(
+                        cropRect: cropRect,
+                        minDimension: widget.minHandleDimension,
+                        onMoveCorner: (corner, delta) =>
+                            _moveCorner(corner, delta, crop, stage),
+                        onMoveSide: (side, delta) =>
+                            _moveSide(side, delta, crop, stage),
+                      ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             );
           },
         );

@@ -176,7 +176,7 @@ final class ScaleRelease extends AxisRelease {
 }
 
 /// Inputs the package used (and the consumer can use) to build a [Release].
-/// Pure data — `gesture` carries the bound configs (decelerate, friction)
+/// Pure data — `gesture` carries the bound configs (decay, friction)
 /// and the maxScale/minScale used by the default plan.
 class ReleaseContext {
   const ReleaseContext({

@@ -1373,7 +1373,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> dismiss({Object? tag, Object? except}) async {
+  Future<void> dismiss({Object? tag, Object? except, Settle? settle}) async {
     if (tag != null) {
       if (_sends.containsKey(tag)) _setTagState(tag, .returning);
       return;
@@ -1385,33 +1385,66 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _setDismissing(true);
     _setOpeningOrDismissing(true);
     try {
-      // Smart duration: time the dismiss to the actual trajectory length
-      // (current → origin), not to the off-base offset. An at-base dismiss
-      // is the reference (1× [_defaultDuration]); a rect already close to
-      // origin uses less time, and a rect panned/scaled far from origin
-      // uses more. Clamped to 0.3× / 2× so neither extreme feels jarring.
-      final base = _display.rect.baseRect(_aspectRatio);
       final origin = _origin.rect;
-      final ref = math.max(
-        (base.center - origin.center).distance,
-        (base.width - origin.width).abs(),
+      final current = _rect.value;
+      // Per-axis simulation driven by the consumer's [Settle] (or the
+      // package default). Each axis lands at its origin coordinate via
+      // a [Simulation], so dismiss visibly responds to stiffness changes.
+      final s = settle ?? const AttractSettle();
+      final simX = s.simulationAt(
+        position: current.center.dx,
+        velocity: 0,
+        target: origin.center.dx,
       );
-      final actual = math.max(
-        (_rect.value.center - origin.center).distance,
-        (_rect.value.width - origin.width).abs(),
+      final simY = s.simulationAt(
+        position: current.center.dy,
+        velocity: 0,
+        target: origin.center.dy,
       );
-      final ratio = ref > 0 ? (actual / ref).clamp(0.3, 2.0) : 1.0;
-      final ms = (_defaultDuration.inMilliseconds * ratio).round().clamp(200, 1000);
-      await animateRect(
-        to: _origin.rect,
-        duration: Duration(milliseconds: ms),
-        curve: Curves.easeOut,
+      final simW = s.simulationAt(
+        position: current.width,
+        velocity: 0,
+        target: origin.width,
       );
+      // Animation duration spans the longest natural-stop time across axes.
+      // SimulationCurve clamps progress to 1.0 past landing, so any axis
+      // that settles sooner just freezes at target for the remainder.
+      final dt = math.max(
+        math.max(_naturalStopTime(simX), _naturalStopTime(simY)),
+        _naturalStopTime(simW),
+      );
+      final duration = Duration(milliseconds: (dt * 1000).round().clamp(1, 1500));
+      await Future.wait([
+        animateCenterX(
+          to: origin.center.dx,
+          duration: duration,
+          curve: SimulationCurve(simX, dt),
+        ),
+        animateCenterY(
+          to: origin.center.dy,
+          duration: duration,
+          curve: SimulationCurve(simY, dt),
+        ),
+        animateWidth(
+          to: origin.width,
+          height: origin.height,
+          duration: duration,
+          curve: SimulationCurve(simW, dt),
+        ),
+      ]);
       await _onEnd?.call();
     } finally {
       _setOpeningOrDismissing(false);
       reset();
     }
+  }
+
+  double _naturalStopTime(Simulation sim) {
+    const dt = 1.0 / 240;
+    for (double t = 0.05; t <= 2.0; t += dt) {
+      if (sim.isDone(t)) return t;
+    }
+    return 2.0;
   }
 
   Future<void> animateToBase() async {
@@ -2041,7 +2074,7 @@ class StageData extends InheritedModel<Object> {
   final VoidCallback clearReleaseDecomposed;
   final VoidCallback reset;
   final Future<void> Function() animateToBase;
-  final Future<void> Function({Object? tag, Object? except}) dismiss;
+  final Future<void> Function({Object? tag, Object? except, Settle? settle}) dismiss;
   final void Function(Object tag, {required Object target, bool park}) displace;
   final void Function(Object tag) releaseSend;
   final Future<void> Function({
@@ -2133,7 +2166,14 @@ class StageData extends InheritedModel<Object> {
 
   Future<void> backToOrigin(ReleaseContext data, {Object? except}) async {
     await release(Release.toHalt(data));
-    await dismiss(except: except);
+    // Pull a Settle from the active gesture's bounds (any side — they
+    // typically all share it). Falls back to the package default when null.
+    final b = data.gesture.bounds;
+    final settle = b.left?.decay?.settle
+        ?? b.right?.decay?.settle
+        ?? b.top?.decay?.settle
+        ?? b.bottom?.decay?.settle;
+    await dismiss(except: except, settle: settle);
   }
 
   Future<void> _runAxis(

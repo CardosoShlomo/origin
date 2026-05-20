@@ -1,10 +1,11 @@
-import 'dart:math' as math;
 import 'package:flutter/widgets.dart';
 import 'package:flutter/physics.dart';
 
 import 'gestures.dart';
 import 'rect_ext.dart';
 import 'release.dart';
+
+const _defaultDecay = DecayConfig.uniform(.imageViewer());
 
 /// Per-axis classification used by friction / fling lookups.
 typedef AxisState = ({
@@ -59,9 +60,20 @@ DragDirectionState directionStateForX({
   required Rect displayRect,
 }) {
   final isRight = boundForX(delta: delta, currentRect: currentRect, baseRect: baseRect) == .right;
-  final pastDisplay = isRight
-      ? currentRect.right > displayRect.right
-      : currentRect.left < displayRect.left;
+  // Past-display semantic depends on rect size relative to display:
+  //   rect ≤ display → past = rect's far edge has gone off display
+  //                          (small rect drifted off-screen on one side).
+  //   rect > display → past = display's near edge is uncovered
+  //                          (zoomed rect panned far enough to expose display).
+  // Either way: "past" = the user has dragged so far that the rubber-band
+  // direction is well-defined.
+  final pastDisplay = currentRect.width <= displayRect.width
+      ? (isRight
+          ? currentRect.right > displayRect.right
+          : currentRect.left < displayRect.left)
+      : (isRight
+          ? currentRect.left > displayRect.left
+          : currentRect.right < displayRect.right);
   final extending = isRight ? delta > 0 : delta < 0;
   if (extending) return pastDisplay ? .extendingPast : .extending;
   return pastDisplay ? .retractingPast : .retracting;
@@ -75,21 +87,26 @@ DragDirectionState directionStateForY({
   required Rect displayRect,
 }) {
   final isBottom = boundForY(delta: delta, currentRect: currentRect, baseRect: baseRect) == .bottom;
-  final pastDisplay = isBottom
-      ? currentRect.bottom > displayRect.bottom
-      : currentRect.top < displayRect.top;
+  // Mirror of directionStateForX — past-display semantic depends on size.
+  final pastDisplay = currentRect.height <= displayRect.height
+      ? (isBottom
+          ? currentRect.bottom > displayRect.bottom
+          : currentRect.top < displayRect.top)
+      : (isBottom
+          ? currentRect.top > displayRect.top
+          : currentRect.bottom < displayRect.bottom);
   final extending = isBottom ? delta > 0 : delta < 0;
   if (extending) return pastDisplay ? .extendingPast : .extending;
   return pastDisplay ? .retractingPast : .retracting;
 }
 
-/// Curve that exactly tracks a [FrictionSimulation]'s position over its
-/// duration. Maps normalized animation time `t ∈ [0, 1]` to normalized
-/// position progress `∈ [0, 1]`.
-class FrictionCurve extends Curve {
-  FrictionCurve(this.simulation, this.realDuration);
+/// Curve that exactly tracks a [Simulation]'s position over its duration.
+/// Maps normalized animation time `t ∈ [0, 1]` to normalized position
+/// progress `∈ [0, 1]`.
+class SimulationCurve extends Curve {
+  SimulationCurve(this.simulation, this.realDuration);
 
-  final FrictionSimulation simulation;
+  final Simulation simulation;
   final double realDuration; // seconds
 
   late final double _start = simulation.x(0);
@@ -510,7 +527,11 @@ ActiveGesture? resolveScaleArena({
 // detection) and the rubber-fling builder are shared via [_runPhase] and
 // [_rubberFling].
 
-const double _velocityFloor = 50;
+// Global perceptual velocity floor — used by [_rubberFling] (settle duration
+// derivation) and for the "essentially not moving" idle checks at the start
+// of each release-axis computation. Decay phases use [Decay.endVelocity]
+// instead so each Decay can pick its own threshold.
+const double _velocityFloor = 60;
 const double _maxPhaseTime = 1.0;
 const int _maxPhases = 6;
 
@@ -523,27 +544,17 @@ typedef _Step = ({
 });
 
 /// Runs a single zone phase: a [FrictionSimulation] from [pos] with [vel]
-/// using [coefficient], terminating either at the natural decay (when no
-/// boundary is reached) or at [exitBoundary] (when the simulation crosses it
-/// before decaying). Returns the phase fling and exit state.
-///
-/// [coefficient] is passed directly as [FrictionSimulation]'s drag — Flutter
-/// convention: lower value = more aggressive deceleration / shorter reach.
-/// Typical values: ~0.135 (iOS scroll), 0.5 (medium flow), 0.9 (long flow).
-/// Clamped to (~0, 1) to avoid `log(0)` and `log(1)` math edge cases —
-/// the lower bound is near-zero so very small (or negative) coefficients
-/// still produce strong, visible deceleration. A coefficient of exactly 0
-/// is treated as "skip this zone" by the caller's bail check.
+/// using [decay]'s [Simulation], terminating either at the natural decay
+/// (when no boundary is reached) or at [exitBoundary] (when the simulation
+/// crosses it before decaying). Returns the phase fling and exit state.
 _Step _runPhase({
   required double pos,
   required double vel,
-  required double coefficient,
+  required Decay decay,
   required double? exitBoundary,
 }) {
-  final drag = coefficient.clamp(1e-15, 0.999);
-  final sim = FrictionSimulation(drag, pos, vel);
-  final naturalTime =
-      (math.log(_velocityFloor / vel.abs()) / math.log(drag / 100)).abs();
+  final sim = decay.simulationAt(position: pos, velocity: vel);
+  final naturalTime = _naturalStopTime(sim, decay.endVelocity);
 
   double duration;
   double endPos;
@@ -553,8 +564,8 @@ _Step _runPhase({
     endPos = sim.x(duration);
     stopped = true;
   } else {
-    final exitTime = sim.timeAtX(exitBoundary);
-    if (exitTime.isNaN || exitTime <= 0 || exitTime > naturalTime) {
+    final exitTime = _timeAtX(sim, exitBoundary, vel.sign);
+    if (exitTime == null || exitTime > naturalTime) {
       duration = naturalTime.clamp(0.1, _maxPhaseTime);
       endPos = sim.x(duration);
       stopped = true;
@@ -569,7 +580,7 @@ _Step _runPhase({
     fling: AxisFling(
       to: endPos,
       duration: Duration(milliseconds: (duration * 1000).round()),
-      curve: FrictionCurve(sim, duration),
+      curve: SimulationCurve(sim, duration),
     ),
     endPos: endPos,
     endVel: sim.dx(duration),
@@ -577,36 +588,57 @@ _Step _runPhase({
   );
 }
 
-/// Rubber settle from [startPos] to [targetPos]. Duration scales with
-/// distance via a synthesized friction simulation: pick a `v0` such that the
-/// natural decay travels exactly the rubber distance, then use its
-/// `naturalTime` (clamped to a UX-reasonable range) as the fling duration.
-///
-/// [settle] supplies both the drag coefficient ([Friction.start], default
-/// `0.135` ≈ iOS scroll feel) and the animation curve ([Friction.curve],
-/// default [Curves.easeOut]). For [DecelerateConfig.settle], `Friction.end`
-/// is unused.
+/// Smallest t at which the simulation is at rest or below the given
+/// perceptual velocity floor. Works for any [Simulation]. The velocity
+/// check only kicks in past a short warm-up window so simulations whose
+/// velocity grows from rest (e.g. spring attractor) aren't terminated
+/// immediately at t=0.
+double _naturalStopTime(Simulation sim, double floor) {
+  const dt = 1.0 / 240;
+  const warmup = 0.05;
+  for (double t = 0; t <= _maxPhaseTime; t += dt) {
+    if (sim.isDone(t)) return t;
+    if (t > warmup && sim.dx(t).abs() < floor) return t;
+  }
+  return _maxPhaseTime;
+}
+
+/// Smallest t at which the simulation's position crosses [targetX] in the
+/// direction of [velSign]. Returns null if not reached within [_maxPhaseTime].
+double? _timeAtX(Simulation sim, double targetX, double velSign) {
+  const dt = 1.0 / 240;
+  for (double t = dt; t <= _maxPhaseTime; t += dt) {
+    final x = sim.x(t);
+    if (velSign > 0 ? x >= targetX : x <= targetX) return t;
+  }
+  return null;
+}
+
+const Settle _defaultSettle = AttractSettle();
+
+/// Rubber settle from [startPos] (moving at [startVel]) to [targetPos], via
+/// the consumer's [Settle] (or the package default). Returns an [AxisFling]
+/// whose motion is the settle's Simulation — velocity is continuous with
+/// the decay phase's end velocity.
 AxisFling _rubberFling({
   required double startPos,
+  required double startVel,
   required double targetPos,
-  Friction? settle,
+  Settle? settle,
 }) {
-  final distance = (targetPos - startPos).abs();
-  final curve = settle?.curve ?? Curves.easeOut;
-  if (distance < 0.5) {
-    return AxisFling(to: targetPos, duration: Duration.zero, curve: curve);
+  if ((targetPos - startPos).abs() < 0.5) {
+    return AxisFling(to: targetPos, duration: Duration.zero, curve: Curves.linear);
   }
-  final drag = (settle?.start ?? 0.135).clamp(0.001, 0.999);
-  // v0 such that sim's natural-decay distance equals `distance`:
-  //   distance = -v0 / log(drag) ⇒ v0 = distance · |log(drag)|.
-  final v0 = distance * math.log(drag).abs();
-  final naturalTime =
-      (math.log(_velocityFloor / v0) / math.log(drag / 100)).abs();
-  final duration = naturalTime.clamp(0.1, 0.7);
+  final sim = (settle ?? _defaultSettle).simulationAt(
+    position: startPos,
+    velocity: startVel,
+    target: targetPos,
+  );
+  final duration = _naturalStopTime(sim, _velocityFloor).clamp(0.1, 0.7);
   return AxisFling(
     to: targetPos,
     duration: Duration(milliseconds: (duration * 1000).round()),
-    curve: curve,
+    curve: SimulationCurve(sim, duration),
   );
 }
 
@@ -640,8 +672,8 @@ HorizontalRelease releaseFromStateX({
   final pastLeftBound = dispRight - halfWidth;
   final pastRightBound = dispLeft + halfWidth;
 
-  final leftDc = bounds[.left]?.decelerate;
-  final rightDc = bounds[.right]?.decelerate;
+  final leftDc = bounds[.left]?.decay ?? _defaultDecay;
+  final rightDc = bounds[.right]?.decay ?? _defaultDecay;
 
   final fitWidth = projectedRect?.width ?? currentRect.width;
   final fitHeight = projectedRect?.height ?? currentRect.height;
@@ -683,16 +715,16 @@ HorizontalRelease releaseFromStateX({
         endZone: startZone,
       );
     }
-    final settleConfig = (pos > fit ? rightDc : leftDc)?.settle;
+    final settleConfig = (pos > fit ? rightDc : leftDc).settle;
     return HorizontalRelease(
       direction: .idle,
       startZone: startZone,
       endZone: startZone,
-      settle: _rubberFling(startPos: pos, targetPos: fit, settle: settleConfig),
+      settle: _rubberFling(startPos: pos, startVel: velocity, targetPos: fit, settle: settleConfig),
     );
   }
 
-  Friction? frictionAt(HorizontalZone zone, bool ltr) {
+  Decay? decayAt(HorizontalZone zone, bool ltr) {
     final (isLeft, isPast) = switch (zone) {
       .pastLeft => (true, true),
       .left => (true, false),
@@ -700,7 +732,6 @@ HorizontalRelease releaseFromStateX({
       .pastRight => (false, true),
     };
     final dc = isLeft ? leftDc : rightDc;
-    if (dc == null) return null;
     final extending = (isLeft && !ltr) || (!isLeft && ltr);
     if (isPast) {
       return extending ? dc.extendingPastDisplay : dc.retractingPastDisplay;
@@ -726,7 +757,7 @@ HorizontalRelease releaseFromStateX({
     }
   }
 
-  final decay = <AxisFling>[];
+  final phases = <AxisFling>[];
   var p = pos;
   var v = velocity;
   var endPos = pos;
@@ -734,20 +765,20 @@ HorizontalRelease releaseFromStateX({
     if (v.abs() <= _velocityFloor) break;
     final ltr = v > 0;
     final zone = zoneOf(p);
-    final friction = frictionAt(zone, ltr);
-    if (friction == null || friction.start <= 0) break;
+    final pick = decayAt(zone, ltr);
+    if (pick == null) break;
 
     final step = _runPhase(
       pos: p,
       vel: v,
-      coefficient: friction.start,
+      decay: pick,
       exitBoundary: exitBoundaryAt(zone, ltr),
     );
-    decay.add(step.fling);
+    phases.add(step.fling);
     endPos = step.endPos;
+    v = step.endVel;
     if (step.stopped) break;
     p = step.endPos + v.sign * 0.01;
-    v = step.endVel;
   }
 
   final endZone = zoneOf(endPos);
@@ -758,19 +789,19 @@ HorizontalRelease releaseFromStateX({
   final endFit = fitAt(endPos);
   AxisFling? settle;
   if (endZone case .pastLeft) {
-    settle = _rubberFling(startPos: endPos, targetPos: endFit, settle: leftDc?.settle);
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: endFit, settle: leftDc.settle);
   } else if (endZone case .pastRight) {
-    settle = _rubberFling(startPos: endPos, targetPos: endFit, settle: rightDc?.settle);
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: endFit, settle: rightDc.settle);
   } else if ((endPos - endFit).abs() >= 0.5) {
-    final settleConfig = (endPos > endFit ? rightDc : leftDc)?.settle;
-    settle = _rubberFling(startPos: endPos, targetPos: endFit, settle: settleConfig);
+    final settleConfig = (endPos > endFit ? rightDc : leftDc).settle;
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: endFit, settle: settleConfig);
   }
 
   return HorizontalRelease(
     direction: direction,
     startZone: startZone,
     endZone: endZone,
-    decay: decay,
+    decay: phases,
     settle: settle,
   );
 }
@@ -798,8 +829,8 @@ VerticalRelease releaseFromStateY({
   final pastTopBound = dispBottom - halfHeight;
   final pastBottomBound = dispTop + halfHeight;
 
-  final topDc = bounds[.top]?.decelerate;
-  final bottomDc = bounds[.bottom]?.decelerate;
+  final topDc = bounds[.top]?.decay ?? _defaultDecay;
+  final bottomDc = bounds[.bottom]?.decay ?? _defaultDecay;
 
   final fitWidth = projectedRect?.width ?? currentRect.width;
   final fitHeight = projectedRect?.height ?? currentRect.height;
@@ -835,16 +866,16 @@ VerticalRelease releaseFromStateY({
         endZone: startZone,
       );
     }
-    final settleConfig = (pos > fit ? bottomDc : topDc)?.settle;
+    final settleConfig = (pos > fit ? bottomDc : topDc).settle;
     return VerticalRelease(
       direction: .idle,
       startZone: startZone,
       endZone: startZone,
-      settle: _rubberFling(startPos: pos, targetPos: fit, settle: settleConfig),
+      settle: _rubberFling(startPos: pos, startVel: velocity, targetPos: fit, settle: settleConfig),
     );
   }
 
-  Friction? frictionAt(VerticalZone zone, bool ttb) {
+  Decay? decayAt(VerticalZone zone, bool ttb) {
     final (isTop, isPast) = switch (zone) {
       .pastTop => (true, true),
       .top => (true, false),
@@ -852,7 +883,6 @@ VerticalRelease releaseFromStateY({
       .pastBottom => (false, true),
     };
     final dc = isTop ? topDc : bottomDc;
-    if (dc == null) return null;
     final extending = (isTop && !ttb) || (!isTop && ttb);
     if (isPast) {
       return extending ? dc.extendingPastDisplay : dc.retractingPastDisplay;
@@ -878,7 +908,7 @@ VerticalRelease releaseFromStateY({
     }
   }
 
-  final decay = <AxisFling>[];
+  final phases = <AxisFling>[];
   var p = pos;
   var v = velocity;
   var endPos = pos;
@@ -886,20 +916,20 @@ VerticalRelease releaseFromStateY({
     if (v.abs() <= _velocityFloor) break;
     final ttb = v > 0;
     final zone = zoneOf(p);
-    final friction = frictionAt(zone, ttb);
-    if (friction == null || friction.start <= 0) break;
+    final pick = decayAt(zone, ttb);
+    if (pick == null) break;
 
     final step = _runPhase(
       pos: p,
       vel: v,
-      coefficient: friction.start,
+      decay: pick,
       exitBoundary: exitBoundaryAt(zone, ttb),
     );
-    decay.add(step.fling);
+    phases.add(step.fling);
     endPos = step.endPos;
+    v = step.endVel;
     if (step.stopped) break;
     p = step.endPos + v.sign * 0.01;
-    v = step.endVel;
   }
 
   final endZone = zoneOf(endPos);
@@ -908,19 +938,19 @@ VerticalRelease releaseFromStateY({
   final endFit = fitAt(endPos);
   AxisFling? settle;
   if (endZone case .pastTop) {
-    settle = _rubberFling(startPos: endPos, targetPos: endFit, settle: topDc?.settle);
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: endFit, settle: topDc.settle);
   } else if (endZone case .pastBottom) {
-    settle = _rubberFling(startPos: endPos, targetPos: endFit, settle: bottomDc?.settle);
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: endFit, settle: bottomDc.settle);
   } else if ((endPos - endFit).abs() >= 0.5) {
-    final settleConfig = (endPos > endFit ? bottomDc : topDc)?.settle;
-    settle = _rubberFling(startPos: endPos, targetPos: endFit, settle: settleConfig);
+    final settleConfig = (endPos > endFit ? bottomDc : topDc).settle;
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: endFit, settle: settleConfig);
   }
 
   return VerticalRelease(
     direction: direction,
     startZone: startZone,
     endZone: endZone,
-    decay: decay,
+    decay: phases,
     settle: settle,
   );
 }
@@ -931,7 +961,7 @@ VerticalRelease releaseFromStateY({
 ///
 /// [width] is the current rect width; [baseWidth] is the rest width
 /// (scale = 1.0). [shrink]/[expand] hold the configured minScale/maxScale plus
-/// their decelerate configs. [velocity] is in width-units per second.
+/// their decay configs. [velocity] is in width-units per second.
 ScaleRelease releaseFromStateScale({
   required double width,
   required double baseWidth,
@@ -953,8 +983,8 @@ ScaleRelease releaseFromStateScale({
   final expandHigh = expand?.maxScale != null ? expand!.maxScale! * baseWidth : baseWidth * 100;
   final dispCenter = baseWidth;
 
-  final shrinkDc = shrink?.decelerate;
-  final expandDc = expand?.decelerate;
+  final shrinkDc = shrink?.decay ?? _defaultDecay;
+  final expandDc = expand?.decay ?? _defaultDecay;
 
   ScaleZone zoneOf(double w) {
     if (w < shrinkLow) return .pastShrink;
@@ -971,7 +1001,7 @@ ScaleRelease releaseFromStateScale({
         direction: .idle,
         startZone: startZone,
         endZone: startZone,
-        settle: _rubberFling(startPos: width, targetPos: shrinkLow, settle: shrinkDc?.settle),
+        settle: _rubberFling(startPos: width, startVel: velocity, targetPos: shrinkLow, settle: shrinkDc.settle),
       );
     }
     if (width > expandHigh) {
@@ -979,7 +1009,7 @@ ScaleRelease releaseFromStateScale({
         direction: .idle,
         startZone: startZone,
         endZone: startZone,
-        settle: _rubberFling(startPos: width, targetPos: expandHigh, settle: expandDc?.settle),
+        settle: _rubberFling(startPos: width, startVel: velocity, targetPos: expandHigh, settle: expandDc.settle),
       );
     }
     // Expanded within max → stay zoomed (X/Y will shift-to-fit).
@@ -995,11 +1025,11 @@ ScaleRelease releaseFromStateScale({
       direction: .idle,
       startZone: startZone,
       endZone: startZone,
-      settle: _rubberFling(startPos: width, targetPos: dispCenter, settle: shrinkDc?.settle),
+      settle: _rubberFling(startPos: width, startVel: velocity, targetPos: dispCenter, settle: shrinkDc.settle),
     );
   }
 
-  Friction? frictionAt(ScaleZone zone, bool outward) {
+  Decay? decayAt(ScaleZone zone, bool outward) {
     final (isShrink, isPast) = switch (zone) {
       .pastShrink => (true, true),
       .shrink => (true, false),
@@ -1007,7 +1037,6 @@ ScaleRelease releaseFromStateScale({
       .pastExpand => (false, true),
     };
     final dc = isShrink ? shrinkDc : expandDc;
-    if (dc == null) return null;
     final extending = (isShrink && !outward) || (!isShrink && outward);
     if (isPast) {
       return extending ? dc.extendingPastDisplay : dc.retractingPastDisplay;
@@ -1033,7 +1062,7 @@ ScaleRelease releaseFromStateScale({
     }
   }
 
-  final decay = <AxisFling>[];
+  final phases = <AxisFling>[];
   var w = width;
   var v = velocity;
   var endPos = width;
@@ -1041,20 +1070,20 @@ ScaleRelease releaseFromStateScale({
     if (v.abs() <= _velocityFloor) break;
     final outward = v > 0;
     final zone = zoneOf(w);
-    final friction = frictionAt(zone, outward);
-    if (friction == null || friction.start <= 0) break;
+    final pick = decayAt(zone, outward);
+    if (pick == null) break;
 
     final step = _runPhase(
       pos: w,
       vel: v,
-      coefficient: friction.start,
+      decay: pick,
       exitBoundary: exitBoundaryAt(zone, outward),
     );
-    decay.add(step.fling);
+    phases.add(step.fling);
     endPos = step.endPos;
+    v = step.endVel;
     if (step.stopped) break;
     w = step.endPos + v.sign * 0.01;
-    v = step.endVel;
   }
 
   final endZone = zoneOf(endPos);
@@ -1067,18 +1096,18 @@ ScaleRelease releaseFromStateScale({
   // - expanded in display or at base → stay (X/Y shift-to-fit if needed).
   AxisFling? settle;
   if (endZone case .pastShrink) {
-    settle = _rubberFling(startPos: endPos, targetPos: shrinkLow, settle: shrinkDc?.settle);
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: shrinkLow, settle: shrinkDc.settle);
   } else if (endZone case .pastExpand) {
-    settle = _rubberFling(startPos: endPos, targetPos: expandHigh, settle: expandDc?.settle);
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: expandHigh, settle: expandDc.settle);
   } else if (endPos < dispCenter - 0.5) {
-    settle = _rubberFling(startPos: endPos, targetPos: dispCenter, settle: shrinkDc?.settle);
+    settle = _rubberFling(startPos: endPos, startVel: v, targetPos: dispCenter, settle: shrinkDc.settle);
   }
 
   return ScaleRelease(
     direction: direction,
     startZone: startZone,
     endZone: endZone,
-    decay: decay,
+    decay: phases,
     settle: settle,
   );
 }

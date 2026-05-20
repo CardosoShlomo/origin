@@ -1,3 +1,6 @@
+import 'dart:math' as math;
+
+import 'package:flutter/physics.dart';
 import 'package:flutter/widgets.dart';
 
 import 'origin_rect.dart';
@@ -110,11 +113,8 @@ enum ScaleStart implements GestureStart {
   shrink, expand, any,
 }
 
-/// Resistance to motion as a function of progress through a bound state.
-///
-/// Conventional range: [0, 1]. 0 = no resistance, 1 = block.
-/// Values outside this range are mathematically valid but produce
-/// non-standard physics (e.g., negative accelerates motion, > 1 reverses it).
+/// Resistance to motion during an active gesture, as a function of progress
+/// through a bound state. Range [0, 1]: 0 = no resistance, 1 = block.
 class Friction {
   const Friction(double value, {double? end, this.curve = Curves.linear})
       : start = value,
@@ -126,6 +126,135 @@ class Friction {
 
   double evaluate(double progress) =>
       start + (end - start) * curve.transform(progress.clamp(0.0, 1.0));
+}
+
+/// Release-time decay model. Produces a Flutter [Simulation] for the rect's
+/// post-gesture motion given a starting position and velocity. Origin reads
+/// `x(t)`, `dx(t)`, `isDone(t)` on the returned simulation — anything that
+/// conforms to [Simulation] plugs in (friction, spring, custom).
+abstract class Decay {
+  const Decay({this.endVelocity = 60});
+
+  /// Velocity (logical px/s) at which the decay phase is considered done.
+  /// Higher = ends with more residual velocity (snappier handoff to settle);
+  /// lower = waits for slower motion (more "complete" tail). Default 60 is
+  /// "1 logical px per frame at 60 Hz" — the threshold of inter-frame
+  /// visibility on the slowest common refresh rate.
+  final double endVelocity;
+
+  Simulation simulationAt({required double position, required double velocity});
+
+  // Const factory redirects to ExponentialDecay's named const constructors,
+  // so dot-shorthand on a `Decay?` field works and the result stays const.
+  const factory Decay.exponential(double drag, {double endVelocity}) = ExponentialDecay;
+  const factory Decay.iosScroll({double endVelocity}) = ExponentialDecay.iosScroll;
+  const factory Decay.iosFast({double endVelocity}) = ExponentialDecay.iosFast;
+  const factory Decay.imageViewer({double endVelocity}) = ExponentialDecay.imageViewer;
+  const factory Decay.none({double endVelocity}) = ExponentialDecay.none;
+
+  // Non-const factory redirects for parameterized presets.
+  factory Decay.halfLife(Duration t, {double endVelocity}) = ExponentialDecay.halfLife;
+  factory Decay.perFrame(double multiplier, {double fps, double endVelocity}) =
+      ExponentialDecay.perFrame;
+}
+
+/// Rubber-back settle model. Produces a Flutter [Simulation] that starts at
+/// the decay's end position and velocity, and lands at the target. Origin
+/// renders the motion via the returned simulation, giving velocity
+/// continuity with the decay phase.
+abstract class Settle {
+  const Settle();
+
+  Simulation simulationAt({
+    required double position,
+    required double velocity,
+    required double target,
+  });
+
+  const factory Settle.attract({double stiffness}) = AttractSettle;
+}
+
+/// Settle via critically-damped [SpringSimulation] — models the rect being
+/// pulled back to target by an attractor (force proportional to displacement).
+/// Motion shape: starts slow (low velocity, max force), accelerates as
+/// displacement shrinks, decelerates and lands smoothly at target with no
+/// overshoot.
+///
+/// [stiffness] controls snap speed. Higher = faster snap (force per unit
+/// displacement). Damping is auto-tuned to critical (no oscillation).
+class AttractSettle extends Settle {
+  const AttractSettle({this.stiffness = 200});
+
+  final double stiffness;
+
+  @override
+  Simulation simulationAt({
+    required double position,
+    required double velocity,
+    required double target,
+  }) {
+    final desc = SpringDescription(
+      mass: 1,
+      stiffness: stiffness,
+      damping: 2 * math.sqrt(stiffness), // critical damping
+    );
+    return SpringSimulation(
+      desc,
+      position,
+      target,
+      velocity,
+      // Loose tolerance trims the spring's slow asymptotic tail — animation
+      // ends a few px short of the exact target when motion is already
+      // imperceptible. Tighten if you need pixel-perfect landing.
+      tolerance: const Tolerance(distance: 3, velocity: 150),
+    );
+  }
+}
+
+/// Exponential velocity decay via [FrictionSimulation].
+///
+/// [decayPerSecond] ∈ [0, 1] is the fraction of velocity lost per second.
+/// 0 → never decays, 1 → instant stop.
+class ExponentialDecay extends Decay {
+  const ExponentialDecay(this.decayPerSecond, {super.endVelocity});
+
+  /// iOS scrollview feel — long fling (per-frame 0.998 @ 60fps).
+  const ExponentialDecay.iosScroll({super.endVelocity}) : decayPerSecond = 0.114;
+  /// iOS `.fast` / paging feel — snappier (per-frame 0.99 @ 60fps).
+  const ExponentialDecay.iosFast({super.endVelocity}) : decayPerSecond = 0.453;
+  /// Image-viewer feel — brief, image-sized fling with a visible tail.
+  const ExponentialDecay.imageViewer({super.endVelocity}) : decayPerSecond = 0.95;
+  /// Velocity is killed at release — no fling at all.
+  const ExponentialDecay.none({super.endVelocity}) : decayPerSecond = 1.0;
+
+  /// Velocity half-life — the time for velocity to halve.
+  factory ExponentialDecay.halfLife(Duration t, {double endVelocity = 60}) {
+    final s = t.inMicroseconds / 1e6;
+    if (s <= 0) return ExponentialDecay.none(endVelocity: endVelocity);
+    return ExponentialDecay(
+      1 - math.pow(0.5, 1 / s).toDouble(),
+      endVelocity: endVelocity,
+    );
+  }
+
+  /// Per-frame velocity multiplier (iOS / JS conventions). 60fps default.
+  factory ExponentialDecay.perFrame(double multiplier,
+          {double fps = 60, double endVelocity = 60}) =>
+      ExponentialDecay(
+        1 - math.pow(multiplier, fps).toDouble(),
+        endVelocity: endVelocity,
+      );
+
+  /// Fraction of velocity lost per second.
+  final double decayPerSecond;
+
+  @override
+  Simulation simulationAt({required double position, required double velocity}) =>
+      FrictionSimulation(
+        (1 - decayPerSecond).clamp(0.0, 0.999),
+        position,
+        velocity,
+      );
 }
 
 /// Per-state friction during an active gesture.
@@ -171,18 +300,29 @@ class FrictionConfig {
   final Friction? extendingPastDisplay;
   final Friction? retracting;
   final Friction? retractingPastDisplay;
+
+  FrictionConfig copyWith({
+    Friction? extending,
+    Friction? extendingPastDisplay,
+    Friction? retracting,
+    Friction? retractingPastDisplay,
+  }) =>
+      FrictionConfig(
+        extending: extending ?? this.extending,
+        extendingPastDisplay: extendingPastDisplay ?? this.extendingPastDisplay,
+        retracting: retracting ?? this.retracting,
+        retractingPastDisplay: retractingPastDisplay ?? this.retractingPastDisplay,
+      );
 }
 
-/// Per-state velocity decay during a fling animation.
+/// Per-state release-time decay model.
 ///
-/// Progress dimension: fraction of velocity decayed (0 = fling start, 1 = at rest).
-/// State semantics match [FrictionConfig] — applied based on rect position/direction
-/// during the fling.
-///
+/// State semantics match [FrictionConfig]: applied based on rect position
+/// (in-display vs past-display) and direction (extending vs retracting).
 /// The release trajectory consults this 4-state map per phase, picking the
-/// state-friction whose zone the segment occupies.
-class DecelerateConfig {
-  const DecelerateConfig({
+/// [Decay] whose zone the segment occupies.
+class DecayConfig {
+  const DecayConfig({
     this.extending,
     this.extendingPastDisplay,
     this.retracting,
@@ -190,17 +330,16 @@ class DecelerateConfig {
     this.settle,
   });
 
-  /// Same [Friction] for all four decay states. [settle] is independent.
-  const DecelerateConfig.uniform(Friction friction, {this.settle})
-      : extending = friction,
-        extendingPastDisplay = friction,
-        retracting = friction,
-        retractingPastDisplay = friction;
+  /// Same [Decay] for all four states. [settle] is independent.
+  const DecayConfig.uniform(Decay decay, {this.settle})
+      : extending = decay,
+        extendingPastDisplay = decay,
+        retracting = decay,
+        retractingPastDisplay = decay;
 
   /// Group by *direction*: [extending] covers both in-display and
-  /// past-display extending decay; [retracting] covers both retracting
-  /// states. [settle] is independent.
-  const DecelerateConfig.byDirection({
+  /// past-display extending; [retracting] covers both retracting states.
+  const DecayConfig.byDirection({
     required this.extending,
     required this.retracting,
     this.settle,
@@ -208,54 +347,62 @@ class DecelerateConfig {
         retractingPastDisplay = retracting;
 
   /// Group by *zone*: [inDisplay] covers both extending and retracting
-  /// while inside the display; [pastDisplay] covers both once the rect's
-  /// edge has crossed. [settle] is independent.
-  const DecelerateConfig.byZone({
-    required Friction inDisplay,
-    required Friction pastDisplay,
+  /// inside the display; [pastDisplay] covers both once the edge has crossed.
+  const DecayConfig.byZone({
+    required Decay inDisplay,
+    required Decay pastDisplay,
     this.settle,
   })  : extending = inDisplay,
         retracting = inDisplay,
         extendingPastDisplay = pastDisplay,
         retractingPastDisplay = pastDisplay;
 
-  final Friction? extending;
-  final Friction? extendingPastDisplay;
-  final Friction? retracting;
-  final Friction? retractingPastDisplay;
+  final Decay? extending;
+  final Decay? extendingPastDisplay;
+  final Decay? retracting;
+  final Decay? retractingPastDisplay;
 
-  /// Drives the rubber-back / settle animation that runs after a decay
-  /// phase ends. Both fields are used:
-  /// - [Friction.start] = drag coefficient for the synthesized friction
-  ///   simulation that determines the settle's duration based on the
-  ///   rubber-back distance (lower = more drag = shorter settle).
-  /// - [Friction.curve] = animation curve for the settle.
-  ///
-  /// [Friction.end] is unused (settle isn't a start→end interpolation).
-  /// Defaults when null: drag 0.135 (iOS-like), curve [Curves.easeOut].
-  final Friction? settle;
+  /// Rubber-back motion after decay ends. The simulation is driven by
+  /// [Settle.simulationAt] so velocity stays continuous from the decay's
+  /// end. Null = use package default ([FrictionSettle]).
+  final Settle? settle;
+
+  DecayConfig copyWith({
+    Decay? extending,
+    Decay? extendingPastDisplay,
+    Decay? retracting,
+    Decay? retractingPastDisplay,
+    Settle? settle,
+  }) =>
+      DecayConfig(
+        extending: extending ?? this.extending,
+        extendingPastDisplay: extendingPastDisplay ?? this.extendingPastDisplay,
+        retracting: retracting ?? this.retracting,
+        retractingPastDisplay: retractingPastDisplay ?? this.retractingPastDisplay,
+        settle: settle ?? this.settle,
+      );
 }
 
 /// Shared base for bound configurations.
 ///
-/// Carries the cross-cutting per-bound fields ([friction], [decelerate], [builder]).
+/// Carries the cross-cutting per-bound fields ([friction], [decay], [builder]).
 /// Subclasses add bound-type-specific fields (e.g., [ShrinkBounds.minScale]).
 sealed class Bounds {
   const Bounds({
     this.friction,
-    this.decelerate,
+    this.decay,
     this.builder,
   });
 
   final FrictionConfig? friction;
-  final DecelerateConfig? decelerate;
+  final DecayConfig? decay;
   final StageBuilder? builder;
 }
 
 class DragBounds extends Bounds {
   const DragBounds({
     super.friction,
-    super.decelerate,
+    super.decay,
     super.builder,
     this.scaleResponse,
   });
@@ -320,7 +467,7 @@ class ScaleResponse {
 class ShrinkBounds extends Bounds {
   const ShrinkBounds({
     super.friction,
-    super.decelerate,
+    super.decay,
     super.builder,
     this.minScale,
   });
@@ -333,7 +480,7 @@ class ShrinkBounds extends Bounds {
 class ExpandBounds extends Bounds {
   const ExpandBounds({
     super.friction,
-    super.decelerate,
+    super.decay,
     super.builder,
     this.maxScale,
   });
@@ -529,12 +676,12 @@ class ScaleGesture extends Gesture {
 class GestureConstraints {
   const GestureConstraints({
     this.friction,
-    this.decelerate,
+    this.decay,
     this.perspective,
   });
 
   final FrictionConfig? friction;
-  final DecelerateConfig? decelerate;
+  final DecayConfig? decay;
   final double? perspective;
 }
 

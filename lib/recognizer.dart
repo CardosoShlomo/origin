@@ -26,12 +26,22 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
   }
 
   void _trackingUpdate(ScaleUpdateDetails details) {
-    _prevScale = _lastScale;
-    _prevFocal = _lastFocal;
-    _prevTime = _lastTime;
+    final count = pointerPositions.length;
+    // Focal point and scale recompute against the new pointer set when one
+    // is added/removed, so velocity across that step is meaningless.
+    if (count != _lastCount) {
+      _prevScale = details.scale;
+      _prevFocal = details.focalPoint;
+      _prevTime = details.sourceTimeStamp;
+    } else {
+      _prevScale = _lastScale;
+      _prevFocal = _lastFocal;
+      _prevTime = _lastTime;
+    }
     _lastScale = details.scale;
     _lastFocal = details.focalPoint;
     _lastTime = details.sourceTimeStamp;
+    _lastCount = count;
     _onUpdate?.call(details);
   }
 
@@ -52,6 +62,7 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
   Offset _lastFocal = .zero;
   Duration? _prevTime;
   Duration? _lastTime;
+  int _lastCount = 0;
 
   bool get _hasSingle => drag?.isNotEmpty ?? false;
   bool get _hasMulti => scale?.isNotEmpty ?? false;
@@ -66,6 +77,7 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
       _prevScale = _lastScale = 1.0;
       _prevFocal = _lastFocal = .zero;
       _prevTime = _lastTime = null;
+      _lastCount = 0;
     }
     pointerPositions[event.pointer] = event.position;
     onPointersChanged?.call();
