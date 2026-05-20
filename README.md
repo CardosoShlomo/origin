@@ -1,3 +1,3 @@
 # Origin
 
-Interactive hero animations for Flutter.
+Interactive hero transitions framework for Flutter with composable gesture physics.
