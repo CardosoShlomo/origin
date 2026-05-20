@@ -1,6 +1,6 @@
 name: origin
-description: "Interactive hero animations for Flutter."
-version: 2.0.0
+description: "Interactive hero transitions framework for Flutter with composable gesture physics."
+version: 2.1.0
 repository: https://github.com/CardosoShlomo/origin
 
 environment:

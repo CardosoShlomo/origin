@@ -1387,9 +1387,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     try {
       final origin = _origin.rect;
       final current = _rect.value;
-      // Per-axis simulation driven by the consumer's [Settle] (or the
-      // package default). Each axis lands at its origin coordinate via
-      // a [Simulation], so dismiss visibly responds to stiffness changes.
+      // Per-axis simulation lands at origin's coordinate, so dismiss
+      // responds to the configured [Settle] (e.g., stiffness).
       final s = settle ?? const AttractSettle();
       final simX = s.simulationAt(
         position: current.center.dx,
@@ -1406,9 +1405,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         velocity: 0,
         target: origin.width,
       );
-      // Animation duration spans the longest natural-stop time across axes.
-      // SimulationCurve clamps progress to 1.0 past landing, so any axis
-      // that settles sooner just freezes at target for the remainder.
+      // Duration spans the longest natural-stop across axes; earlier-done
+      // axes freeze at target (SimulationCurve clamps progress at 1.0).
       final dt = math.max(
         math.max(_naturalStopTime(simX), _naturalStopTime(simY)),
         _naturalStopTime(simW),
@@ -2166,8 +2164,7 @@ class StageData extends InheritedModel<Object> {
 
   Future<void> backToOrigin(ReleaseContext data, {Object? except}) async {
     await release(Release.toHalt(data));
-    // Pull a Settle from the active gesture's bounds (any side — they
-    // typically all share it). Falls back to the package default when null.
+    // Use the gesture's configured [Settle] for the dismiss-to-origin motion.
     final b = data.gesture.bounds;
     final settle = b.left?.decay?.settle
         ?? b.right?.decay?.settle

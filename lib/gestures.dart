@@ -135,11 +135,9 @@ class Friction {
 abstract class Decay {
   const Decay({this.endVelocity = 60});
 
-  /// Velocity (logical px/s) at which the decay phase is considered done.
-  /// Higher = ends with more residual velocity (snappier handoff to settle);
-  /// lower = waits for slower motion (more "complete" tail). Default 60 is
-  /// "1 logical px per frame at 60 Hz" — the threshold of inter-frame
-  /// visibility on the slowest common refresh rate.
+  /// Velocity (logical px/s) at which the decay phase ends. Higher = snappier
+  /// handoff to settle; lower = more "complete" tail. Default 60 ≈ 1 px/frame
+  /// at 60 Hz, the inter-frame visibility threshold.
   final double endVelocity;
 
   Simulation simulationAt({required double position, required double velocity});
@@ -174,14 +172,10 @@ abstract class Settle {
   const factory Settle.attract({double stiffness}) = AttractSettle;
 }
 
-/// Settle via critically-damped [SpringSimulation] — models the rect being
-/// pulled back to target by an attractor (force proportional to displacement).
-/// Motion shape: starts slow (low velocity, max force), accelerates as
-/// displacement shrinks, decelerates and lands smoothly at target with no
-/// overshoot.
-///
-/// [stiffness] controls snap speed. Higher = faster snap (force per unit
-/// displacement). Damping is auto-tuned to critical (no oscillation).
+/// Settle via critically-damped [SpringSimulation] — attractor pulls rect to
+/// target (force ∝ displacement). Starts slow, accelerates, lands smoothly
+/// with no overshoot. [stiffness] controls snap speed; damping is auto-tuned
+/// to critical.
 class AttractSettle extends Settle {
   const AttractSettle({this.stiffness = 200});
 
@@ -203,9 +197,7 @@ class AttractSettle extends Settle {
       position,
       target,
       velocity,
-      // Loose tolerance trims the spring's slow asymptotic tail — animation
-      // ends a few px short of the exact target when motion is already
-      // imperceptible. Tighten if you need pixel-perfect landing.
+      // Loose tolerance trims the slow asymptotic tail — sub-perceptible.
       tolerance: const Tolerance(distance: 3, velocity: 150),
     );
   }

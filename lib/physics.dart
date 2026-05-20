@@ -5,7 +5,13 @@ import 'gestures.dart';
 import 'rect_ext.dart';
 import 'release.dart';
 
-const _defaultDecay = DecayConfig.uniform(.imageViewer());
+const _defaultDecay = DecayConfig(
+  extending: .imageViewer(),
+  extendingPastDisplay: .exponential(0.9999999),
+  retracting: .imageViewer(),
+  retractingPastDisplay: .imageViewer(),
+  settle: .attract(),
+);
 
 /// Per-axis classification used by friction / fling lookups.
 typedef AxisState = ({
@@ -60,13 +66,8 @@ DragDirectionState directionStateForX({
   required Rect displayRect,
 }) {
   final isRight = boundForX(delta: delta, currentRect: currentRect, baseRect: baseRect) == .right;
-  // Past-display semantic depends on rect size relative to display:
-  //   rect ≤ display → past = rect's far edge has gone off display
-  //                          (small rect drifted off-screen on one side).
-  //   rect > display → past = display's near edge is uncovered
-  //                          (zoomed rect panned far enough to expose display).
-  // Either way: "past" = the user has dragged so far that the rubber-band
-  // direction is well-defined.
+  // Past-display semantic depends on rect size: small rect ⇒ far edge off
+  // display; zoomed rect ⇒ near edge past display edge (uncovers display).
   final pastDisplay = currentRect.width <= displayRect.width
       ? (isRight
           ? currentRect.right > displayRect.right

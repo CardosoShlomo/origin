@@ -1,3 +1,34 @@
+## 2.1.0
+
+Release/settle physics is now pluggable. Decay and rubber-back motion are
+driven by [Simulation]s, with velocity continuity across the decay→settle
+boundary. `dismiss()` is spring-driven, so the configured settle visibly
+shapes return-to-origin motion.
+
+### Breaking
+
+* `DecelerateConfig` → **`DecayConfig`** (and `Bounds.decelerate` → `.decay`).
+* `DecayConfig` slots: `Friction?` → **`Decay?`**. Use `.imageViewer()`,
+  `.iosScroll()`, `.exponential(x)`, etc.
+* `DecayConfig.settle`: `Friction?` → **`Settle?`**. Use `.attract()`.
+* `FrictionCurve` → **`SimulationCurve`** (accepts any [Simulation]).
+
+### Added
+
+* **`Decay`** abstract class + `ExponentialDecay` with const presets
+  (`.iosScroll`, `.iosFast`, `.imageViewer`, `.none`) and parameterized
+  factories (`.halfLife`, `.perFrame`).
+* **`Settle`** abstract class + `AttractSettle({stiffness})` —
+  critically-damped spring back to target.
+* `copyWith` on `FrictionConfig` and `DecayConfig`.
+
+### Fixed
+
+* Cropper handles wired to the wrong corners under RTL locale.
+* Spurious huge fling velocity on simultaneous two-finger lift.
+* Active-drag friction triggered everywhere on zoomed-in rects (past-display
+  zone now picked correctly for rects larger than display).
+
 ## 2.0.0
 
 Large refactor of the gesture, release, and physics layers and a
