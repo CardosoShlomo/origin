@@ -664,14 +664,20 @@ HorizontalRelease releaseFromStateX({
   final dispLeft = displayRect.left;
   final dispRight = displayRect.right;
   final dispCenter = displayRect.center.dx;
-  // Past zones start when the rect's *near edge* crosses the display's
-  // corresponding edge — i.e., the moment the rect stops covering display
-  // on that side. For a rect bigger than display, this is the natural
-  // "leaving coverage" point; for a rect equal to display, it's exactly
-  // displayCenter; for a rect smaller than display, the inner range is
-  // empty so past friction always applies.
-  final pastLeftBound = dispRight - halfWidth;
-  final pastRightBound = dispLeft + halfWidth;
+  // Past zones — size-aware to mirror friction's [directionStateForX].
+  // Large rect (covers display): past zone starts when the *near edge*
+  // crosses display, i.e., we begin uncovering on that side.
+  // Small rect (fits within display): past zone starts when the *far edge*
+  // exits display, i.e., the rect itself starts going outside.
+  final double pastLeftBound;
+  final double pastRightBound;
+  if (currentRect.width > displayRect.width) {
+    pastLeftBound = dispRight - halfWidth;
+    pastRightBound = dispLeft + halfWidth;
+  } else {
+    pastLeftBound = dispLeft + halfWidth;
+    pastRightBound = dispRight - halfWidth;
+  }
 
   final leftDc = bounds[.left]?.decay ?? _defaultDecay;
   final rightDc = bounds[.right]?.decay ?? _defaultDecay;
@@ -827,8 +833,16 @@ VerticalRelease releaseFromStateY({
   final dispTop = displayRect.top;
   final dispBottom = displayRect.bottom;
   final dispCenter = displayRect.center.dy;
-  final pastTopBound = dispBottom - halfHeight;
-  final pastBottomBound = dispTop + halfHeight;
+  // Size-aware past bounds — see [releaseFromStateX] for the rationale.
+  final double pastTopBound;
+  final double pastBottomBound;
+  if (currentRect.height > displayRect.height) {
+    pastTopBound = dispBottom - halfHeight;
+    pastBottomBound = dispTop + halfHeight;
+  } else {
+    pastTopBound = dispTop + halfHeight;
+    pastBottomBound = dispBottom - halfHeight;
+  }
 
   final topDc = bounds[.top]?.decay ?? _defaultDecay;
   final bottomDc = bounds[.bottom]?.decay ?? _defaultDecay;

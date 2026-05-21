@@ -1,3 +1,10 @@
+## 2.1.1
+
+### Fixed
+
+* Release decay zones are now size-aware. Small rects no longer always pick
+  the past-display decay slot.
+
 ## 2.1.0
 
 Release/settle physics is now pluggable. Decay and rubber-back motion are
