@@ -264,6 +264,9 @@ class _OriginState extends State<Origin> {
 
   /// Single active-gesture slot. Null = uncommitted.
   ActiveGesture? _active;
+  /// Slot size at the moment Stage took over, so the placeholder stays
+  /// pinned instead of expanding to fill unbounded parents.
+  Size? _placeholderSize;
   /// Reference to the active recognizer (set by the factory builder).
   /// Used to push pointer positions to Stage at hybrid takeover.
   StageScaleRecognizer? _recognizer;
@@ -538,6 +541,8 @@ class _OriginState extends State<Origin> {
   }
 
   StageData _setup({Object? mode}) {
+    final box = context.findRenderObject() as RenderBox?;
+    if (box != null && box.hasSize) _placeholderSize = box.size;
     final data = _stage;
     final origin = _measureOrigin();
     final screen = OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context));
@@ -679,7 +684,7 @@ class _OriginState extends State<Origin> {
             ),
         },
         child: Stage.isTagOf(context, widget.tag)
-            ? const SizedBox.expand()
+            ? SizedBox(width: _placeholderSize?.width, height: _placeholderSize?.height)
             : ClipRRect(
                 borderRadius: widget.borderRadius,
                 child: KeyedSubtree(key: _childKey, child: widget.child),

@@ -1,3 +1,11 @@
+## 2.1.2
+
+### Fixed
+
+* Active placeholder is now pinned to the slot's pre-active size instead of
+  `SizedBox.expand`, so Origins inside unbounded parents (Column / SliverList)
+  no longer push siblings off-screen during a gesture.
+
 ## 2.1.1
 
 ### Fixed
