@@ -1,3 +1,9 @@
+## 2.1.3
+
+### Fixed
+
+* No crash when the origin is wider than the display's base width.
+
 ## 2.1.2
 
 ### Fixed

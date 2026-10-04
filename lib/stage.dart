@@ -1499,7 +1499,11 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     final w = _rect.value.width;
     final originW = _origin.rect.width;
     final baseW = _display.rect.baseWidth(_aspectRatio);
-    _originToBaseProgress.value = (w.clamp(originW, baseW) - originW) / (baseW - originW);
+    // The origin can be wider than the base (a tall image from a wide slot),
+    // so progress runs either way between the two widths.
+    _originToBaseProgress.value = baseW == originW
+        ? 1.0
+        : ((w - originW) / (baseW - originW)).clamp(0.0, 1.0);
   }
 
   void _safeReset(AnimationController controller) {
