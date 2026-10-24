@@ -89,7 +89,7 @@ class _CropperState extends State<Cropper> {
   void _onImageRectChanged() {
     final stage = _stage;
     if (stage == null) return;
-    final crop = stage.displayConfig()?.crop;
+    final crop = stage.displayConfig?.crop;
     if (crop == null) return;
     final clamped = stage.crop.value.cropBoundaries(
       _boundaries(stage),
@@ -166,7 +166,7 @@ class _CropperState extends State<Cropper> {
   @override
   Widget build(BuildContext context) {
     final stage = Stage.of(context);
-    final crop = stage.displayConfig()?.crop;
+    final crop = stage.displayConfig?.crop;
     if (crop == null) return const SizedBox.shrink();
 
     return ValueListenableBuilder<Rect>(
@@ -185,7 +185,7 @@ class _CropperState extends State<Cropper> {
             //   not dismissing → chrome target opaque, p drives 0→1.
             // - Otherwise (leaving crop tool, or dismissing) → chrome
             //   target transparent, p drives 1→0.
-            final hasCrop = stage.displayConfig()?.crop != null;
+            final hasCrop = stage.displayConfig?.crop != null;
             final fadingIn = hasCrop && !stage.dismissing;
             final chromeAlpha = fadingIn ? p : (1 - p);
             final dimColor = widget.dimColor.withValues(

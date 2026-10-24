@@ -13,9 +13,11 @@ export 'recognizer.dart';
 export 'release.dart';
 export 'resolution.dart';
 export 'side.dart';
-export 'stage.dart';
+export 'stage.dart' hide StageDoor;
 export 'stage_overlay.dart';
+export 'stage_rows.dart';
 import 'package:flutter/gestures.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
 import 'ext.dart';
 import 'gestures.dart';
@@ -25,6 +27,7 @@ import 'recognizer.dart';
 import 'rect_ext.dart';
 import 'release.dart';
 import 'stage.dart';
+import 'stage_rows.dart';
 
 class Origin extends StatefulWidget {
   const Origin({
@@ -158,6 +161,8 @@ class Origin extends StatefulWidget {
 }
 
 class _OriginState extends State<Origin> {
+  /// The enclosing stage. Its reads are live, so holding it from mount on
+  /// never sees a stale stage.
   late final StageData _stage;
   late OriginEntry _entry;
   final _childKey = GlobalKey();
@@ -170,6 +175,9 @@ class _OriginState extends State<Origin> {
     _stage.register(widget.tag, _entry);
   }
 
+  static bool _hasGestures(Origin origin) =>
+      (origin.drag?.isNotEmpty ?? false) || (origin.scale?.isNotEmpty ?? false);
+
   @override
   void didUpdateWidget(Origin oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -178,12 +186,23 @@ class _OriginState extends State<Origin> {
       _entry = _buildEntry();
       _stage.register(widget.tag, _entry);
     }
+    // Losing every gesture drops the recognizer mid-drag, and it never says
+    // the gesture ended: end it here as a release with no velocity.
+    if (_active != null && !_hasGestures(widget)) {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _active != null && !_hasGestures(widget)) {
+          _onScaleEnd(ScaleEndDetails());
+        }
+      });
+    }
   }
 
   @override
   void dispose() {
     _stopSwapListening();
     _stage.unregister(widget.tag, _entry);
+    // Gone mid-gesture: the stage lets the captured widget go with it.
+    if (_active != null) _stage.abandon(widget.tag);
     super.dispose();
   }
 
@@ -198,8 +217,10 @@ class _OriginState extends State<Origin> {
     return entry;
   }
 
-  OriginRect _measureOrigin() {
-    return OriginRect(rect: context.rect, borderRadius: widget.borderRadius);
+  OriginRect? _measureOrigin() {
+    final rect = context.rectOrNull;
+    if (rect == null) return null;
+    return OriginRect(rect: rect, borderRadius: widget.borderRadius);
   }
 
   Widget _captureWidget() {
@@ -299,7 +320,7 @@ class _OriginState extends State<Origin> {
     // `_startRect.width × details.scale` equals the current (merger-driven)
     // rect width — letting Origin's scale formula resume from here without
     // a snap-back.
-    final isHybrid = _stage.isHybridDriving();
+    final isHybrid = _stage.isHybridDriving;
     if (_wasHybridDriving && !isHybrid) {
       final currentRect = _stage.rect.value;
       final scale = details.scale == 0 ? 1.0 : details.scale;
@@ -346,8 +367,8 @@ class _OriginState extends State<Origin> {
         // Also push current pointer positions so Stage's merger has data
         // available the instant a Stage-area pointer triggers takeover.
         _stage.setOriginGesture(_toOriginGesture(active));
-        if (_recognizer != null) {
-          _stage.setOriginPointers(_recognizer!.pointerPositions);
+        if (_recognizer case final r?) {
+          _stage.setOriginPointers(r.pointerPositions, r.lastEventTime);
         }
 
         final builder = active.gesture.builder;
@@ -489,7 +510,7 @@ class _OriginState extends State<Origin> {
     details = details.cancelTranslation(
       active.gesture.scaleVelocityCancel
           ?? widget.scaleVelocityCancel
-          ?? _stage.scaleVelocityCancel()
+          ?? _stage.scaleVelocityCancel
           ?? 0.8,
     );
 
@@ -497,17 +518,17 @@ class _OriginState extends State<Origin> {
     _totalDelta = .zero;
     _stopSwapListening();
     // Origin's pointers are gone — push empty so Stage's merger sees it.
-    _stage.setOriginPointers(const {});
+    _stage.setOriginPointers(const {}, _recognizer?.lastEventTime);
 
     // If Stage still has pointers, the gesture continues there. Defer the
     // release — Stage's onScaleEnd will fire it when the last stage pointer
     // leaves. Leave _originGesture set so Stage can use it.
-    if (_stage.stagePointerCount() > 0) return;
+    if (_stage.stagePointerCount > 0) return;
 
     // Stage has no pointers either. If a previous release path already fired
     // (clearing _originGesture), skip — this happens on simultaneous lift
     // when Stage's onScaleEnd ran first.
-    final stageOg = _stage.originGesture();
+    final stageOg = _stage.originGesture;
     if (stageOg == null) return;
 
     // Use Stage's view of the active gesture rather than Origin's local
@@ -520,7 +541,7 @@ class _OriginState extends State<Origin> {
     // the case where Origin lifts last after a hybrid session, so the
     // release reflects the merger's actual focal/spread motion across
     // both recognizers rather than just Origin's own ScaleEndDetails.
-    final merged = _stage.hybridReleaseVelocity();
+    final merged = _stage.hybridReleaseVelocity;
     final data = ReleaseContext(
       currentRect: _stage.rect.value,
       displayRect: _stage.display.rect,
@@ -544,50 +565,58 @@ class _OriginState extends State<Origin> {
     final box = context.findRenderObject() as RenderBox?;
     if (box != null && box.hasSize) _placeholderSize = box.size;
     final data = _stage;
-    final origin = _measureOrigin();
-    final screen = OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context));
-
-    data.setOrigin(origin);
-    data.setOriginContainer(widget.originContainer ?? (widget.containerTag != null ? data.measureEntry(widget.containerTag!) : null));
-    data.setAspectRatio(widget.aspectRatio ?? context.size!.aspectRatio);
-    data.setWidget(_OriginData(tag: widget.tag, child: KeyedSubtree(key: _childKey, child: widget.child)));
-    // Register the origin's default config + modes map + display fallbacks
-    // so Stage can resolve [setMode] calls later (including re-applying
-    // display/displayContainer/builder per the active mode's overrides).
-    // [setMode] will seed the gesture builder from
-    // `effective.builder ?? widget.builder`, so we don't pre-set it here.
-    data.setOriginConfig(
-      defaults: widget.displayConfig,
-      modes: widget.modes,
-      overlay: widget.overlay,
-      display: widget.display,
-      displayContainer: widget.displayContainer,
-      screen: screen,
-      builder: widget.builder,
-    );
-    data.setMode(mode);
-    data.setPerspective(widget.constraints?.perspective);
-    data.setBackgroundColor(widget.backgroundColor);
+    final origin = _measureOrigin()!;
     final onEnd = widget.onEnd;
-    data.setOnEnd(widget.swapTags != null || onEnd != null ? () async {
-      _finishSwap();
-      await onEnd?.call(data);
-    } : null);
-    data.setTag(widget.tag);
-    data.setRect(origin.rect);
+    data.take(StageTaken(
+      tag: widget.tag,
+      widget: _OriginData(tag: widget.tag, child: KeyedSubtree(key: _childKey, child: widget.child)),
+      origin: origin,
+      originContainer: widget.originContainer ??
+          (widget.containerTag != null ? data.measureEntry(widget.containerTag!) : null),
+      aspectRatio: widget.aspectRatio ?? context.size!.aspectRatio,
+      // The origin's default config + modes map + display fallbacks, so
+      // Stage can resolve [StageData.setMode] calls later (including
+      // re-applying display/displayContainer/builder per the active mode).
+      config: OriginConfig(
+        defaults: widget.displayConfig,
+        modes: widget.modes,
+        overlay: widget.overlay,
+        display: widget.display,
+        displayContainer: widget.displayContainer,
+        screen: OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context)),
+        builder: widget.builder,
+      ),
+      mode: mode,
+      perspective: widget.constraints?.perspective,
+      backgroundColor: widget.backgroundColor,
+      onEnd: widget.swapTags != null || onEnd != null ? () async {
+        _finishSwap();
+        await onEnd?.call(data);
+      } : null,
+    ));
     return data;
   }
 
-  Future<void> _open([Object? mode]) {
-    return _setup(mode: mode).animateToBase();
+  /// Waits out a frame already on its way, so a slot the consumer just
+  /// changed is measured where it lays out, not where it stood.
+  Future<bool> _settled() async {
+    final binding = SchedulerBinding.instance;
+    if (binding.hasScheduledFrame) await binding.endOfFrame;
+    return mounted && !_stage.busy;
   }
 
-  Future<void> _send(Rect Function(Rect) send, {VoidCallback? onEnd}) {
+  Future<void> _open([Object? mode]) async {
+    if (!await _settled()) return;
+    await _setup(mode: mode).animateToBase();
+  }
+
+  Future<void> _send(Rect Function(Rect) send, {VoidCallback? onEnd}) async {
+    if (!await _settled()) return;
     final data = _setup();
     if (onEnd != null) data.setOnEnd(onEnd);
-    final origin = _measureOrigin();
+    final origin = data.origin;
     data.setOrigin(origin.copyWith(rect: send(origin.rect)));
-    return data.dismiss();
+    await data.dismiss();
   }
 
   TapEvent _buildTapEvent(Offset localPosition, Offset globalPosition) {
@@ -602,8 +631,9 @@ class _OriginState extends State<Origin> {
         double? perspective,
         Duration duration = const Duration(milliseconds: 100),
         Curve curve = Curves.easeOut,
-      }) {
-        return _setup().runEffect(
+      }) async {
+        if (_stage.busy) return;
+        await _setup().runEffect(
           rotateX: rotateX,
           rotateY: rotateY,
           rotateZ: rotateZ,
@@ -676,8 +706,8 @@ class _OriginState extends State<Origin> {
                 // driving the rect via the hybrid merger. Initial positions
                 // are pushed at commit time (see [_onScaleUpdate]).
                 r.onPointersChanged = () {
-                  if (_active != null && _stage.isHybridDriving()) {
-                    _stage.setOriginPointers(r.pointerPositions);
+                  if (_active != null && _stage.isHybridDriving) {
+                    _stage.setOriginPointers(r.pointerPositions, r.lastEventTime);
                   }
                 };
               },

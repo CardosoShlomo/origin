@@ -30,18 +30,15 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
     // Focal point and scale recompute against the new pointer set when one
     // is added/removed, so velocity across that step is meaningless.
     if (count != _lastCount) {
-      _prevScale = details.scale;
-      _prevFocal = details.focalPoint;
-      _prevTime = details.sourceTimeStamp;
-    } else {
-      _prevScale = _lastScale;
-      _prevFocal = _lastFocal;
-      _prevTime = _lastTime;
+      _focalTracker = VelocityTracker.withKind(_kind);
+      _scaleTracker = VelocityTracker.withKind(_kind);
     }
-    _lastScale = details.scale;
-    _lastFocal = details.focalPoint;
-    _lastTime = details.sourceTimeStamp;
     _lastCount = count;
+    final time = details.sourceTimeStamp;
+    if (time != null) {
+      _focalTracker?.addPosition(time, details.focalPoint);
+      _scaleTracker?.addPosition(time, Offset(details.scale, 0));
+    }
     _onUpdate?.call(details);
   }
 
@@ -49,19 +46,22 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
   /// down/move/up. Exposed for hybrid mergers that combine pointer sets
   /// across recognizers.
   final pointerPositions = <int, Offset>{};
+
+  /// The timestamp of the latest pointer event this recognizer handled. The
+  /// hybrid merger times its velocity samples by it.
+  Duration? lastEventTime;
+
   /// Fires whenever [pointerPositions] changes (pointer added, moved, or
   /// removed). Receivers can read [pointerPositions] from this recognizer
   /// to get the latest state.
   void Function()? onPointersChanged;
   Offset _totalDelta = .zero;
 
-  // Sample pairs for end-velocity computation (linear focal-point + scale rate).
-  double _prevScale = 1.0;
-  double _lastScale = 1.0;
-  Offset _prevFocal = .zero;
-  Offset _lastFocal = .zero;
-  Duration? _prevTime;
-  Duration? _lastTime;
+  // Release velocity: least-squares over the recent focal-point and scale
+  // samples, the same estimate Flutter's own drag and scale use.
+  VelocityTracker? _focalTracker;
+  VelocityTracker? _scaleTracker;
+  PointerDeviceKind _kind = .touch;
   int _lastCount = 0;
 
   bool get _hasSingle => drag?.isNotEmpty ?? false;
@@ -74,12 +74,13 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
       _totalDelta = .zero;
       _resolved = false;
       _accepted = false;
-      _prevScale = _lastScale = 1.0;
-      _prevFocal = _lastFocal = .zero;
-      _prevTime = _lastTime = null;
+      _focalTracker = null;
+      _scaleTracker = null;
+      _kind = event.kind;
       _lastCount = 0;
     }
     pointerPositions[event.pointer] = event.position;
+    lastEventTime = event.timeStamp;
     onPointersChanged?.call();
     super.addAllowedPointer(event);
     if (_hasAny && pointerPositions.length > 1 && !_hasMulti) {
@@ -109,6 +110,7 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
       pointerPositions.remove(event.pointer);
       pointersDirty = true;
     }
+    lastEventTime = event.timeStamp;
     if (pointersDirty) onPointersChanged?.call();
     super.handleEvent(event);
     if (!_resolved && (!_hasAny || pointerPositions.length > 1 || _totalDelta.distance > 4)) {
@@ -121,14 +123,20 @@ class StageScaleRecognizer extends ScaleGestureRecognizer {
   }
 
   ScaleEndDetails _buildEndDetails() {
-    final pt = _prevTime;
-    final lt = _lastTime;
-    if (pt == null || lt == null) return ScaleEndDetails();
-    final dt = (lt - pt).inMicroseconds / 1e6;
-    if (dt <= 0) return ScaleEndDetails();
+    final focal = _focalTracker;
+    if (focal == null) return ScaleEndDetails();
+    var velocity = focal.getVelocity();
+    final speed = velocity.pixelsPerSecond.distance;
+    // Below fling speed the release has no velocity; above the cap it is
+    // clamped, as Flutter's scale recognizer does.
+    if (speed <= kMinFlingVelocity) {
+      velocity = Velocity.zero;
+    } else if (speed > kMaxFlingVelocity) {
+      velocity = Velocity(pixelsPerSecond: velocity.pixelsPerSecond / speed * kMaxFlingVelocity);
+    }
     return ScaleEndDetails(
-      velocity: Velocity(pixelsPerSecond: (_lastFocal - _prevFocal) / dt),
-      scaleVelocity: (_lastScale - _prevScale) / dt,
+      velocity: velocity,
+      scaleVelocity: _scaleTracker?.getVelocity().pixelsPerSecond.dx ?? 0,
     );
   }
 

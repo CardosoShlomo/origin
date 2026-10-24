@@ -3,7 +3,10 @@ import 'dart:math' as math;
 import 'dart:ui';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
+import 'package:regent/regent.dart';
+import 'crop_image.dart';
 import 'ext.dart';
 import 'rect_ext.dart';
 import 'gestures.dart';
@@ -12,15 +15,14 @@ import 'physics.dart';
 import 'recognizer.dart';
 import 'release.dart';
 import 'stage_overlay.dart';
+import 'stage_rows.dart';
 
 class OriginEntry {
-  OriginRect Function()? measure;
+  OriginRect? Function()? measure;
   Widget Function()? capture;
   Future<void> Function()? open;
   Future<void> Function(Rect Function(Rect), {VoidCallback? onEnd})? send;
 }
-
-enum TagState { idle, sending, parked, returning }
 
 /// Internal sentinel for [Stage.zoomToggleOnDoubleTap]. Stage detects this
 /// function by identity in `_onDoubleTap` and dispatches to the internal
@@ -132,7 +134,7 @@ class Stage extends StatefulWidget {
   /// Builder for an optional consumer-provided overlay rendered *above*
   /// the displayed origin and Stage's own overlay/scrim. Use it to add
   /// mode-aware UI (e.g., a crop tool's appbar). Read [Stage.of] to
-  /// inspect `displayConfig()` and decide what to render. The builder
+  /// inspect `displayConfig` and decide what to render. The builder
   /// is invoked on every Stage rebuild — consumer owns any animations
   /// (e.g. `AnimatedSwitcher` / `AnimatedOpacity`) around its output.
   final WidgetBuilder? overlay;
@@ -186,17 +188,12 @@ class Stage extends StatefulWidget {
     return data.tag == tag && data.interacting;
   }
 
-
   static Widget? widgetOf(BuildContext context) {
     return InheritedModel.inheritFrom<StageData>(context, aspect: _widgetAspect)!.widget;
   }
 
   static bool hasWidgetOf(BuildContext context) {
     return InheritedModel.inheritFrom<StageData>(context, aspect: _hasWidgetAspect)!.widget != null;
-  }
-
-  static bool isLockedOf(BuildContext context) {
-    return context.getInheritedWidgetOfExactType<StageData>()!.locked;
   }
 
   static bool isDismissingOf(BuildContext context) {
@@ -208,10 +205,72 @@ class Stage extends StatefulWidget {
 }
 
 class _StageState extends State<Stage> with TickerProviderStateMixin {
+  /// The stage's state: facts fold here, and every read below comes from it.
+  final _ledger = Ledger.root(stageRows);
+
+  StageScene get _scene => _ledger.at(stageScene).state;
+  StageStance get _stance => _ledger.at(stageStance).state;
+  IdentifiableMap<Object, StageSend> get _sends => _ledger.at(stageSends).entities;
+  IdentifiableMap<Object, SendPhase> get _phases => _ledger.at(sendPhases).entities;
+  Map<Object, TagState> get _tagStates => {
+        for (final p in _phases.values) p.tag: p.state,
+      };
+
+  bool _disposed = false;
+
+  /// States [msg] and rebuilds when it changed anything. Facts stated while
+  /// the tree is locked (an Origin disposing mid-gesture) rebuild after the
+  /// frame.
+  void _fact(StageMsg msg) {
+    if (_disposed) return;
+    final scene = _scene;
+    final stance = _stance;
+    final sends = _sends;
+    final phases = _phases;
+    _ledger.dispatch(msg);
+    if (identical(scene, _scene) &&
+        identical(stance, _stance) &&
+        identical(sends, _sends) &&
+        identical(phases, _phases)) {
+      return;
+    }
+    if (SchedulerBinding.instance.schedulerPhase == .persistentCallbacks) {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() {});
+      });
+      return;
+    }
+    if (mounted) setState(() {});
+  }
+
+  int _epoch = 0;
+
+  /// The latest session flight taken. The ledger stops folding when the
+  /// stage leaves the tree; a flight still landing then asks this instead.
+  Flight? _sessionFlight;
+
+  Flight _takeFlight(FlightKind kind) {
+    final flight = Flight(kind, ++_epoch);
+    if (!flight.isMode) _sessionFlight = flight;
+    _fact(FlightTook(flight));
+    _syncTransitionFlags();
+    return flight;
+  }
+
+  bool _isCurrent(Flight flight) =>
+      _disposed ? _sessionFlight == flight : _stance.flight == flight;
+
+  /// Lands [flight]. A superseded flight's landing is dropped by the ledger;
+  /// a dismiss or effect that lands ends the session and clears the stage.
+  void _land(Flight flight) {
+    final before = _stance;
+    _fact(FlightLanded(flight));
+    if (identical(before, _stance)) return;
+    _syncTransitionFlags();
+    if (flight.kind case .dismissing || .effect) _clearGeometry();
+  }
+
   final _rect = ValueNotifier(Rect.zero);
-  // Any pointer currently down on Stage. Tag-aware lookup via
-  // [Stage.isInteractingOf]. Independent of which gesture has committed.
-  bool _interacting = false;
 
   /// The active crop rect, owned by Stage just like [_rect]. Initialized
   /// from [CropConfig.initialRect] when a crop mode activates; mutated by
@@ -220,39 +279,16 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   /// need the result. Reset to [Rect.zero] on dismiss.
   final _crop = ValueNotifier<Rect>(.zero);
 
-  /// Reference equality marker for the last [CropConfig] applied — used by
-  /// [_setMode] to decide whether to re-seed [_crop] from
-  /// [CropConfig.initialRect]. Switching from one crop config to another
-  /// (e.g. free → square) re-seeds; leaving the same config alone preserves
-  /// in-flight edits.
-  CropConfig? _lastCrop;
-
   /// True while the active gesture is a crop-rect drag (single pointer that
   /// landed inside the crop rect). Flipped in [_onScaleStart], read in
   /// [_onScaleUpdate], cleared in [_onScaleEnd] or when a second pointer
   /// arrives (so pinch always takes over to image scale).
   bool _cropDrag = false;
 
-  static const _defaultOriginRect = OriginRect(rect: .zero);
-
-  OriginRect _origin = _defaultOriginRect;
-  OriginRect? _originContainer;
-  OriginRect _display = _defaultOriginRect;
-  OriginRect? _displayContainer;
-  double _aspectRatio = 1.0;
-  Widget? _widget;
   final _originToBaseProgress = ValueNotifier(0.0);
   Offset? _lastRectCenter;
   Rect? _dismissStartContainer;
   final _registry = <Object, OriginEntry>{};
-  final _tagStates = <Object, TagState>{};
-  double? _perspective;
-  Color? _backgroundColor;
-  StageBuilder? _gestureBuilder;
-  FutureOr<void> Function()? _onEnd;
-  Object? _tag;
-  bool _locked = true;
-  bool _dismissing = false;
   final _container = ValueNotifier<OriginRect?>(null);
 
   static const _defaultDuration = Duration(milliseconds: 300);
@@ -357,6 +393,18 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _crop.value = _cropTween.evaluate(_cropAnim)!;
   }
 
+  /// Runs [controller] to 1. The future completes when the animation ends,
+  /// whether it got there or something stopped it (a newer animation, a
+  /// touch, the stage leaving), so code awaiting it always goes on.
+  Future<void> _drive(AnimationController controller, Duration? duration, Curve curve) {
+    if (_disposed) return Future.value();
+    _safeReset(controller);
+    return controller
+        .animateTo(1, duration: duration, curve: curve)
+        .orCancel
+        .catchError((_) {}, test: (e) => e is TickerCanceled);
+  }
+
   /// Animates [crop] from its current value to [to]. Mirrors the rect-animation
   /// path used for [_rect] but for the crop rect — used for the reset action
   /// (snap-back to [CropConfig.initialRect]) and any other place that wants
@@ -365,28 +413,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   Future<void> animateCrop({required Rect to, Duration? duration, Curve curve = Curves.easeOut}) {
     _cropTween.begin = _crop.value;
     _cropTween.end = to;
-    _safeReset(_cropAnim);
-    return _cropAnim.animateTo(1, duration: duration, curve: curve);
-  }
-
-  /// True during an open animation ([animateToBase]) or a dismiss animation
-  /// ([dismiss]). Cleared in the finally blocks of both. Release rubber-back
-  /// / settle paths don't touch this. Consumers (e.g. crop-mode scrim) use
-  /// it to fade only during real open/dismiss and stay solid through
-  /// interaction + settle.
-  bool _openingOrDismissing = false;
-  void _setOpeningOrDismissing(bool v) {
-    if (_openingOrDismissing != v) setState(() => _openingOrDismissing = v);
-    _syncTransitionFlags();
-  }
-
-  /// True while [_setMode] is running its rect/crop transition animation
-  /// (browse → crop and similar). Consumers can use this to fade chrome
-  /// in/out only on real mode transitions, not on mid-mode interaction.
-  bool _changingMode = false;
-  void _setChangingMode(bool v) {
-    if (_changingMode != v) setState(() => _changingMode = v);
-    _syncTransitionFlags();
+    return _drive(_cropAnim, duration, curve);
   }
 
   /// Called when a transition flag flips. Snaps progress to 0 (active)
@@ -395,7 +422,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   /// Controller ticks (via [_updateTransitionProgress]) take over from
   /// there for the duration of the animation.
   void _syncTransitionFlags() {
-    final v = (_openingOrDismissing || _changingMode) ? 0.0 : 1.0;
+    if (_disposed) return;
+    final v = (_stance.openingOrDismissing || _stance.changingMode) ? 0.0 : 1.0;
     _transitionProgressMin.value = v;
     _transitionProgressMean.value = v;
     _transitionProgressMax.value = v;
@@ -419,7 +447,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   /// no transition is active — idle resets are owned by
   /// [_syncTransitionFlags].
   void _updateTransitionProgress() {
-    if (!_openingOrDismissing && !_changingMode) return;
+    if (!_stance.openingOrDismissing && !_stance.changingMode) return;
     final values = [
       _centerX.value,
       _centerY.value,
@@ -455,7 +483,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   // Pointer count at the previous [_onScaleStart] firing, used to detect
   // adds vs removes (recognizer fires onStart on every pointer-count change).
   int _prevPointerCount = 0;
-  DisplayConfig? _displayConfig;
+
+  DisplayConfig? get _displayConfig => _scene.displayConfig;
 
   /// Effective drag map: Stage.drag overlaid by active Origin's displayConfig.drag.
   Map<DragStart, DragGesture> get _effectiveDrag => {
@@ -469,40 +498,6 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         ...?_displayConfig?.scale,
       };
 
-  void _setDisplayConfig(DisplayConfig? v) => setState(() => _displayConfig = v);
-
-  // Backing for [Stage.setMode]: at origin setup we store the origin's
-  // default config and modes map so [_setMode] can resolve a key later.
-  DisplayConfig? _originDefaultConfig;
-  Map<Object, DisplayConfig>? _originModes;
-
-  void _setOriginConfig({
-    DisplayConfig? defaults,
-    Map<Object, DisplayConfig>? modes,
-    WidgetBuilder? overlay,
-    OriginRect? display,
-    OriginRect? displayContainer,
-    OriginRect? screen,
-    StageBuilder? builder,
-  }) {
-    _originDefaultConfig = defaults;
-    _originModes = modes;
-    _originOverlay = overlay;
-    _originDisplay = display;
-    _originDisplayContainer = displayContainer;
-    _originScreen = screen;
-    _originBuilder = builder;
-  }
-
-  // The currently-displayed origin's overlay/display/displayContainer/screen
-  // /builder, used as fallbacks when the active [DisplayConfig] doesn't
-  // override them.
-  WidgetBuilder? _originOverlay;
-  OriginRect? _originDisplay;
-  OriginRect? _originDisplayContainer;
-  OriginRect? _originScreen;
-  StageBuilder? _originBuilder;
-
   /// Swaps the active [DisplayConfig] to the mode-resolved variant and
   /// re-applies any display/displayContainer overrides the new config
   /// carries. Null key = back to the origin's default (no-mode) config.
@@ -510,23 +505,15 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   /// Re-uses the same merge semantics as [Origin.modes]: non-null fields
   /// in the mode override the default; null fields inherit.
   void _setMode(Object? key) {
-    final modeConfig = key == null ? null : _originModes?[key];
-    final effective = _originDefaultConfig?.merge(modeConfig) ?? modeConfig;
-    final prevDisplay = _display;
-    final newDisplay = effective?.display
-        ?? _originDisplay
-        ?? (effective?.displayContainer ?? _originDisplayContainer)
-        ?? _originScreen
-        ?? _defaultOriginRect;
-    setState(() {
-      _displayConfig = effective;
-      _displayContainer = effective?.displayContainer ?? _originDisplayContainer;
-      _display = newDisplay;
-      // Per-mode wrap of the captured widget: displayConfig.builder takes
-      // precedence over Origin.builder. A gesture commit can still override
-      // this temporarily via [_active.gesture.builder].
-      _gestureBuilder = effective?.builder ?? _originBuilder;
-    });
+    final before = _scene;
+    _fact(ModeSet(key));
+    _modeMoved(before);
+  }
+
+  /// The geometry a mode change moves: the crop rect it seeds and the rect's
+  /// flight to a new display.
+  void _modeMoved(StageScene before) {
+    final after = _scene;
     // Seed the crop rect when entering a new crop config (by identity) so
     // switching configs (e.g. free → square) re-anchors to the configured
     // initial rect, but in-flight edits within the same config aren't lost.
@@ -537,37 +524,55 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     // evaluated against the *new* base. Same callback applied to both —
     // so a "biggest square" initialRect grows from old-base shortestSide
     // to new-base shortestSide in sync with the image rect.
-    final crop = effective?.crop;
-    final newBase = newDisplay.rect.baseRect(_aspectRatio);
-    final displayChanged = newDisplay.rect != prevDisplay.rect && _rect.value != .zero;
-    if (crop != null && !identical(crop, _lastCrop)) {
-      _lastCrop = crop;
+    final crop = after.displayConfig?.crop;
+    final newBase = after.display.rect.baseRect(after.aspectRatio);
+    final displayChanged = after.display.rect != before.display.rect && _rect.value != .zero;
+    if (crop != null && !identical(crop, before.displayConfig?.crop)) {
       final endRect = crop.initialRect?.call(newBase) ?? newBase;
       if (displayChanged) {
-        final oldBase = prevDisplay.rect.baseRect(_aspectRatio);
+        final oldBase = before.display.rect.baseRect(after.aspectRatio);
         final startRect = crop.initialRect?.call(oldBase) ?? oldBase;
         _crop.value = startRect;
         animateCrop(to: endRect, curve: Curves.easeOut);
       } else {
         _crop.value = endRect;
       }
-    } else if (crop == null) {
-      _lastCrop = null;
     }
     // When the active mode changes the display rect (e.g. crop mode
     // constrains the display to exclude an appbar), animate the live rect
     // to the new base — otherwise the image would jump or sit at a stale
     // position relative to the new container.
     if (displayChanged) {
-      _setChangingMode(true);
+      final flight = _takeFlight(.changingMode);
       animateRect(to: newBase, curve: Curves.easeOut)
-          .whenComplete(() => _setChangingMode(false));
+          .whenComplete(() => _land(flight));
     }
+  }
+
+  /// An Origin takes the stage: the fact, then the geometry it implies.
+  void _take(StageTaken taken) {
+    final before = _scene;
+    _fact(taken);
+    _modeMoved(before);
+    setRect(taken.origin.rect);
+  }
+
+  /// Stops the rect's own motion (a release settling, a mode change, a zoom
+  /// toggle) so a new touch drives it alone. Their futures complete.
+  void _stopRectMotion() {
+    _motion++;
+    _centerX.stop();
+    _centerY.stop();
+    _width.stop();
+    _cropAnim.stop();
+    _releaseDecomposed = false;
   }
 
   void _onScaleStart(ScaleStartDetails details) {
     // Hybrid: merger owns the rect; skip stage's local resolver.
-    if (_isHybridDriving) return;
+    if (_stance.hybridDriving) return;
+    // The touch takes the rect from whatever was still moving it.
+    if (_prevPointerCount == 0) _stopRectMotion();
     // onStart fires on every pointer-count change, not just first touch.
     _startRect = _rect.value;
     _startFocalPoint = details.focalPoint;
@@ -619,24 +624,26 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
     // First update of a gesture = user is actually manipulating (vs. just
-    // touching). Promote [_interacting] here, not on pointer-down, so a
+    // touching). Promote interacting here, not on pointer-down, so a
     // plain tap never briefly flips it true.
-    if (!_interacting) setState(() => _interacting = true);
+    if (!_stance.interacting) _fact(const InteractionBegan());
     // Hybrid: merger owns the rect; skip stage's local update logic.
-    if (_isHybridDriving) return;
+    if (_stance.hybridDriving) return;
 
     // Crop-drag path: hijacked gesture, no resolver, no totalDelta. Move
     // the crop rect by the focal delta (clamped to the image-intersect-
     // display boundary) and shift the image when the crop is pinned to an
     // edge in the drag direction (catch-up capped by overdragMax).
     final cropConfig = _displayConfig?.crop;
+    final display = _scene.display;
+    final aspectRatio = _scene.aspectRatio;
     if (_cropDrag) {
       if (details.pointerCount > 1) {
         // 2nd finger arrived mid-gesture — exit crop drag, fall into normal
         // scale flow so the pinch zooms the image.
         _cropDrag = false;
       } else if (cropConfig != null) {
-        final boundaries = _rect.value.intersect(_display.rect);
+        final boundaries = _rect.value.intersect(display.rect);
         final newCrop = _crop.value
             .shift(details.focalPointDelta)
             .cropBoundaries(
@@ -646,7 +653,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
             );
         _crop.value = newCrop;
         _rect.value = details.imageRectOnDragCropRect(
-          container: _display.rect,
+          container: display.rect,
           imageRect: _rect.value,
           cropRect: newCrop,
           overdragMax: cropConfig.overdragMax,
@@ -678,7 +685,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         // based on starting rect state.
         final committed = _active!;
         if (committed.gesture case DragGesture(:final override?)) {
-          final baseRect = _display.rect.baseRect(_aspectRatio);
+          final baseRect = display.rect.baseRect(aspectRatio);
           final replacement = override(_rect.value, baseRect);
           if (replacement != null) {
             _active = (start: committed.start, gesture: replacement);
@@ -687,7 +694,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
         _lastActive = _active;
         final builder = _active!.gesture.builder;
-        if (builder != null) _setGestureBuilder(builder);
+        if (builder != null) _fact(GestureBuilderSet(builder));
         _startRect = _rect.value;
         _startFocalPoint = details.focalPoint;
         return;
@@ -696,14 +703,14 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       case DragGesture drag: {
         // For displayed items, the natural rest is the base rect (centered
         // in display), not the thumbnail. axisState's `originRect` is
-        // really "the reference rest" — pass base, not [_origin.rect].
-        final displayRect = _display.rect;
+        // really "the reference rest" — pass base, not the origin's rect.
+        final displayRect = display.rect;
         _rect.value = computeDragRect(
           bounds: drag.bounds,
           currentRect: _rect.value,
-          originRect: displayRect.baseRect(_aspectRatio),
+          originRect: displayRect.baseRect(aspectRatio),
           displayRect: displayRect,
-          aspectRatio: _aspectRatio,
+          aspectRatio: aspectRatio,
           focalPoint: details.focalPoint,
           focalPointDelta: details.focalPointDelta,
           startRect: _startRect,
@@ -717,8 +724,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       case ScaleGesture scale: {
         final delta = details.focalPointDelta;
         final currentRect = _rect.value;
-        final originRect = _origin.rect;
-        final displayRect = _display.rect;
+        final originRect = _scene.origin.rect;
+        final displayRect = display.rect;
         if (currentRect.width == 0) return;
         final dx = frictionFromState(
           state: axisStateX(delta.dx, currentRect, originRect, displayRect),
@@ -732,7 +739,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         );
 
         // Scale-axis friction: apply to the width delta from intended scale.
-        final baseWidth = displayRect.baseWidth(_aspectRatio);
+        final baseWidth = displayRect.baseWidth(aspectRatio);
         final intendedWidth = _startRect.width * details.scale;
         final dw = intendedWidth - currentRect.width;
         final scaledDw = frictionFromScaleState(
@@ -742,7 +749,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
           delta: dw,
         );
         final newWidth = currentRect.width + scaledDw;
-        // Preserve startRect's aspect ratio (not _aspectRatio, which may
+        // Preserve startRect's aspect ratio (not the stage's, which may
         // differ if startRect was off-aspect).
         final scaleRatio = _startRect.width == 0 ? 1.0 : newWidth / _startRect.width;
         final newHeight = _startRect.height * scaleRatio;
@@ -761,7 +768,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     // All stage pointers up → end of any manipulation. Clear interacting
     // immediately so overlay chrome can fade back in while the release
     // physics still run.
-    if (_interacting) setState(() => _interacting = false);
+    if (_stance.interacting) _fact(const InteractionEnded());
     // Crop-drag end: no release physics — the crop rect was set live each
     // frame and the image is already positioned to match.
     if (_cropDrag) {
@@ -786,7 +793,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     // was hybrid-driven). Prefer the merger's combined velocity if it's
     // fresh (captures simultaneous-lift case across both recognizers);
     // otherwise fall back to stage's own ScaleEndDetails.
-    final og = _originGesture;
+    final og = _stance.originGesture;
     if (og != null) {
       // Zero translation if scale velocity exceeds cutoff. Cascade:
       // gesture > Origin (via OriginGesture) > Stage > 0.8.
@@ -799,8 +806,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       final merged = _hybridReleaseVelocity();
       final data = ReleaseContext(
         currentRect: _rect.value,
-        displayRect: _display.rect,
-        aspectRatio: _aspectRatio,
+        displayRect: _scene.display.rect,
+        aspectRatio: _scene.aspectRatio,
         velocity: merged?.velocity ?? details.velocity,
         scaleVelocity: merged?.scaleVelocity ?? details.scaleVelocity,
         gesture: og.active.gesture,
@@ -815,7 +822,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       // Cascade mirrors Origin's own release cascade (gesture → Origin →
       // Stage → package default) — not the displayed-state cascade
       // (which goes through displayConfig), since hybrid runs while origin
-      // is un-displayed. _displayConfig is null in this state anyway.
+      // is un-displayed. The display config is null in this state anyway.
       final handler = data.gesture.onRelease
           ?? og.onRelease
           ?? widget.onRelease;
@@ -823,7 +830,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         handler(context, data);
         return;
       }
-      await Stage.of(context).backToOrigin(data);
+      await backToOrigin(data);
       return;
     }
 
@@ -832,6 +839,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     // after a pointer change didn't commit a new gesture before all fingers
     // lifted).
     final active = _active ?? _lastActive;
+    _prevPointerCount = 0;
     if (active == null) return;
 
     // Zero translation if scale velocity exceeds cutoff. Cascade:
@@ -845,8 +853,8 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     final data = ReleaseContext(
       currentRect: _rect.value,
-      displayRect: _display.rect,
-      aspectRatio: _aspectRatio,
+      displayRect: _scene.display.rect,
+      aspectRatio: _scene.aspectRatio,
       velocity: details.velocity,
       scaleVelocity: details.scaleVelocity,
       gesture: active.gesture,
@@ -855,7 +863,6 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _active = null;
     _lastActive = null;
     _totalDelta = .zero;
-    _prevPointerCount = 0;
 
     // Cascade: gesture > displayConfig > stage > package default.
     final handler = data.gesture.onRelease ?? _displayConfig?.onRelease ?? widget.onRelease;
@@ -863,31 +870,20 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       handler(context, data);
       return;
     }
-    await Stage.of(context).release(.toDisplay(data));
+    await release(.toDisplay(data));
   }
 
-  void _setOrigin(OriginRect v) => _origin = v;
-  void _setOriginContainer(OriginRect? v) => _originContainer = v;
-  void _setDisplay(OriginRect v) => _display = v;
-  void _setDisplayContainer(OriginRect? v) => _displayContainer = v;
-  void _setAspectRatio(double v) => _aspectRatio = v;
-  void _setPerspective(double? v) => _perspective = v;
-  void _setBackgroundColor(Color? v) => _backgroundColor = v;
-  void _setGestureBuilder(StageBuilder? v) => setState(() => _gestureBuilder = v);
-  void _setOnEnd(FutureOr<void> Function()? v) => _onEnd = v;
-  void _setTag(Object? tag) => setState(() => _tag = tag);
-  void _setWidget(Widget? v) => setState(() => _widget = v);
-  void _setLocked(bool v) => setState(() => _locked = v);
-  OriginGesture? _originGesture;
   void _setOriginGesture(OriginGesture? v) {
-    setState(() => _originGesture = v);
+    _fact(OriginGestureSet(v));
     if (v == null) _originPointers = const {};
   }
   // Pointer positions forwarded from the active Origin's recognizer. Combined
   // with stage's own recognizer's positions to drive hybrid gesture math.
   Map<int, Offset> _originPointers = const {};
-  void _setOriginPointers(Map<int, Offset> v) {
+  Duration? _originPointersTime;
+  void _setOriginPointers(Map<int, Offset> v, Duration? time) {
     _originPointers = Map.of(v);
+    _originPointersTime = time;
     _onHybridPointersChanged();
   }
   // Reference to stage's own recognizer (set when [active] is true in build),
@@ -907,24 +903,25 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   // commit threshold. Null while not in a promotion-candidate state, or
   // after promotion has fired.
   double? _hybridPromotionBaselineSpread;
-  // Per-update merger samples (focal + spread + timestamp). Used to compute
-  // a finite-difference velocity across the last two same-count frames.
-  // `_hybridPrevSample` is cleared on re-baseline so velocity is never
-  // computed across a pointer-count change.
-  ({Offset focal, double spread, int timeMicros})? _hybridSample;
-  ({Offset focal, double spread, int timeMicros})? _hybridPrevSample;
-  // Last valid same-count velocity. Persists through re-baselines and the
-  // final reset, so release fired after a simultaneous lift (a 1-pointer
-  // gap between the two recognizers' onEnds) still sees the 2-pointer-era
+  // The merger's focal and spread trackers, fed with the pointer events' own
+  // timestamps. Replaced on re-baseline so velocity is never measured across
+  // a pointer-count change.
+  VelocityTracker? _hybridFocalTracker;
+  VelocityTracker? _hybridScaleTracker;
+  double _hybridBaselineSpread = 0;
+  // Last same-count velocity. Persists through re-baselines and the final
+  // reset, so release fired after a simultaneous lift (a 1-pointer gap
+  // between the two recognizers' onEnds) still sees the 2-pointer-era
   // velocity. Staleness checked at read time (100ms window).
-  ({Velocity velocity, double scaleVelocity, int timeMicros})? _lastMergerVelocity;
-  // True while Stage's hybrid merger is driving the rect — Origin reads this
-  // and silences its own rect manipulation when set.
-  bool _isHybridDriving = false;
+  ({Velocity velocity, double scaleVelocity, Duration time})? _lastMergerVelocity;
 
-  void _setIsHybridDriving(bool v) {
-    if (_isHybridDriving == v) return;
-    setState(() => _isHybridDriving = v);
+  /// The latest pointer event time either recognizer saw.
+  Duration? get _pointerTime {
+    final stage = _stageRecognizer?.lastEventTime;
+    final origin = _originPointersTime;
+    if (stage == null) return origin;
+    if (origin == null) return stage;
+    return stage > origin ? stage : origin;
   }
 
   // Cached down-position for the upcoming double-tap callback (the recognizer
@@ -951,17 +948,22 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     animateRect(to: target, curve: Curves.easeOut);
   }
 
+  StageTapEvent _tapEvent(Offset local, Offset global) {
+    final display = _scene.display;
+    return StageTapEvent(
+      localPosition: local,
+      globalPosition: global,
+      currentRect: _rect.value,
+      displayRect: display.rect,
+      baseRect: display.rect.baseRect(_scene.aspectRatio),
+      aspectRatio: _scene.aspectRatio,
+    );
+  }
+
   void _onDoubleTap() {
     final handler = _displayConfig?.onDoubleTap ?? widget.onDoubleTap;
     if (handler == null) return;
-    final event = StageTapEvent(
-      localPosition: _doubleTapLocal,
-      globalPosition: _doubleTapGlobal,
-      currentRect: _rect.value,
-      displayRect: _display.rect,
-      baseRect: _display.rect.baseRect(_aspectRatio),
-      aspectRatio: _aspectRatio,
-    );
+    final event = _tapEvent(_doubleTapLocal, _doubleTapGlobal);
     if (identical(handler, Stage.zoomToggleOnDoubleTap)) {
       _runZoomToggle(event);
     } else {
@@ -969,23 +971,10 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     }
   }
 
-  // Single-tap recognizer fires onTapUp with position info — capture here so
-  // we can build a [StageTapEvent] with the rect snapshot at tap time.
-  Offset _tapLocal = .zero;
-  Offset _tapGlobal = .zero;
-
-  void _onTap() {
+  void _onTap(TapUpDetails details) {
     final handler = _displayConfig?.onTap ?? widget.onTap;
     if (handler == null) return;
-    final event = StageTapEvent(
-      localPosition: _tapLocal,
-      globalPosition: _tapGlobal,
-      currentRect: _rect.value,
-      displayRect: _display.rect,
-      baseRect: _display.rect.baseRect(_aspectRatio),
-      aspectRatio: _aspectRatio,
-    );
-    handler(event);
+    handler(_tapEvent(details.localPosition, details.globalPosition));
   }
 
   void _resetHybridMerger() {
@@ -993,7 +982,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _hybridLastSpread = null;
     _hybridLastCount = 0;
     _hybridPromotionBaselineSpread = null;
-    _setIsHybridDriving(false);
+    if (_stance.hybridDriving) _fact(const HybridDrivingSet(false));
   }
 
   /// Resolves the active-gesture-type hybrid mode through Origin → Stage →
@@ -1019,7 +1008,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   /// normal `_onScaleUpdate` paths do. Re-baselines on pointer-count change
   /// so drop-to-1 / re-add transitions stay smooth.
   void _onHybridPointersChanged() {
-    final og = _originGesture;
+    final og = _stance.originGesture;
     if (og == null) {
       _resetHybridMerger();
       return;
@@ -1041,24 +1030,25 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     final focal = _meanOffset(all.values);
     final spread = _meanDistance(all.values, focal);
+    final time = _pointerTime;
 
     // First activation OR pointer count change ⇒ re-baseline last samples;
     // no rect update this frame (the focal/spread "shift" from the count
-    // change isn't real finger motion). Drop the prev sample so the next
-    // frame's velocity isn't computed across the pointer-count jump, but
-    // keep `_lastMergerVelocity` so a release fired before the next valid
-    // sample (e.g. simultaneous lift) still has access to the most recent
-    // same-count velocity.
+    // change isn't real finger motion). Start fresh trackers so velocity is
+    // never measured across the pointer-count jump, but keep
+    // `_lastMergerVelocity` so a release fired before the next valid sample
+    // (e.g. simultaneous lift) still has the most recent same-count velocity.
     if (_hybridLastFocal == null || all.length != _hybridLastCount) {
       _hybridLastFocal = focal;
       _hybridLastSpread = spread;
       _hybridLastCount = all.length;
-      _hybridPrevSample = null;
-      _hybridSample = (
-        focal: focal,
-        spread: spread,
-        timeMicros: DateTime.now().microsecondsSinceEpoch,
-      );
+      _hybridBaselineSpread = spread;
+      _hybridFocalTracker = VelocityTracker.withKind(.touch);
+      _hybridScaleTracker = VelocityTracker.withKind(.touch);
+      if (time != null) {
+        _hybridFocalTracker!.addPosition(time, focal);
+        _hybridScaleTracker!.addPosition(time, const Offset(1, 0));
+      }
       // Track promotion baseline only while we have 2 pointers AND origin
       // is still in drag AND mode is asScale; reset otherwise.
       if (all.length >= 2
@@ -1068,7 +1058,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       } else {
         _hybridPromotionBaselineSpread = null;
       }
-      _setIsHybridDriving(true);
+      if (!_stance.hybridDriving) _fact(const HybridDrivingSet(true));
       return;
     }
 
@@ -1128,9 +1118,9 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     }
 
     final currentRect = _rect.value;
-    final originRect = _origin.rect;
-    final displayRect = _display.rect;
-    final baseWidth = displayRect.baseWidth(_aspectRatio);
+    final originRect = _scene.origin.rect;
+    final displayRect = _scene.display.rect;
+    final baseWidth = displayRect.baseWidth(_scene.aspectRatio);
 
     // Translation: per-axis friction against bounds (same as Origin/Stage
     // normal scale-update paths).
@@ -1171,37 +1161,29 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     _hybridLastFocal = focal;
     _hybridLastSpread = spread;
-    // Capture velocity from prev → current (same pointer count). Update
-    // [_lastMergerVelocity] only when prev exists so we never measure
-    // across a re-baseline.
-    final nowMicros = DateTime.now().microsecondsSinceEpoch;
-    final prev = _hybridPrevSample;
-    if (prev != null) {
-      final dtSec = (nowMicros - prev.timeMicros) / 1e6;
-      if (dtSec > 0) {
-        final scaleVel = prev.spread > 0
-            ? (spread - prev.spread) / (prev.spread * dtSec)
-            : 0.0;
-        _lastMergerVelocity = (
-          velocity: Velocity(pixelsPerSecond: (focal - prev.focal) / dtSec),
-          scaleVelocity: scaleVel,
-          timeMicros: nowMicros,
-        );
-      }
-    }
-    _hybridPrevSample = _hybridSample;
-    _hybridSample = (focal: focal, spread: spread, timeMicros: nowMicros);
+    if (time == null) return;
+    final focalTracker = _hybridFocalTracker!..addPosition(time, focal);
+    final scaleTracker = _hybridScaleTracker!
+      ..addPosition(
+        time,
+        Offset(_hybridBaselineSpread > 0 ? spread / _hybridBaselineSpread : 1, 0),
+      );
+    _lastMergerVelocity = (
+      velocity: focalTracker.getVelocity(),
+      scaleVelocity: scaleTracker.getVelocity().pixelsPerSecond.dx,
+      time: time,
+    );
   }
 
-  /// Returns the merger's last valid same-count velocity if it's recent
-  /// (≤ 100ms old). Returns null when the merger didn't run or its last
-  /// sample is stale — callers should fall back to the firing recognizer's
-  /// own `ScaleEndDetails.velocity`.
+  /// Returns the merger's last same-count velocity if it was measured within
+  /// 100ms of the latest pointer event. Returns null when the merger didn't
+  /// run or its last sample is stale — callers should fall back to the
+  /// firing recognizer's own `ScaleEndDetails.velocity`.
   ({Velocity velocity, double scaleVelocity})? _hybridReleaseVelocity() {
     final last = _lastMergerVelocity;
     if (last == null) return null;
-    final nowMicros = DateTime.now().microsecondsSinceEpoch;
-    if (nowMicros - last.timeMicros > 100000) return null;
+    final now = _pointerTime;
+    if (now == null || now - last.time > const Duration(milliseconds: 100)) return null;
     return (velocity: last.velocity, scaleVelocity: last.scaleVelocity);
   }
 
@@ -1222,16 +1204,6 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     }
     return sum / positions.length;
   }
-  void _setDismissing(bool v) {
-    if (v && !_dismissing) {
-      _dismissStartContainer = _container.value?.rect;
-    } else if (!v) {
-      _dismissStartContainer = null;
-    }
-    setState(() => _dismissing = v);
-  }
-  void _setTagState(Object tag, TagState state) => setState(() => _tagStates[tag] = state);
-  void _clearTagState(Object tag) => setState(() => _tagStates.remove(tag));
 
   void _updateContainer() {
     if (_rect.value == .zero) {
@@ -1239,19 +1211,20 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
       _lastRectCenter = null;
       return;
     }
-    final originC = _originContainer;
+    final scene = _scene;
+    final originC = scene.originContainer;
     if (originC == null) {
-      _container.value = _displayContainer;
+      _container.value = scene.displayContainer;
       return;
     }
-    final displayC = _displayContainer ?? OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context));
+    final displayC = scene.displayContainer ?? OriginRect(rect: Offset.zero & MediaQuery.sizeOf(context));
 
     final p = _originToBaseProgress.value;
     final rect = _rect.value;
     final prev = _container.value?.rect ?? originC.rect;
 
     // Per-frame delta: each incremental movement extends the container in that direction.
-    final lastCenter = _lastRectCenter ?? _origin.rect.center;
+    final lastCenter = _lastRectCenter ?? scene.origin.rect.center;
     _lastRectCenter = rect.center;
     final d = rect.center - lastCenter;
     final grown = Rect.fromLTRB(
@@ -1263,13 +1236,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
     // Also include origin shifted by total delta — covers scale cases where the active item
     // extends beyond the grown rect even though frame-to-frame delta is small.
-    final totalDelta = rect.center - _origin.rect.center;
+    final totalDelta = rect.center - scene.origin.rect.center;
     final shifted = originC.rect.expandToInclude(originC.rect.shift(totalDelta));
 
     // On dismiss, animate from the captured start container back to the origin container using
     // the same controller as the rect dismiss, so container and item converge together.
     final Rect baseline;
-    if (_dismissing && _dismissStartContainer != null) {
+    if (_stance.dismissing && _dismissStartContainer != null) {
       baseline = Rect.lerp(_dismissStartContainer!, originC.rect, _width.value)!;
     } else {
       baseline = grown.expandToInclude(shifted);
@@ -1295,52 +1268,48 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _container.value = OriginRect(rect: computed, borderRadius: containerBr);
   }
 
-  void reset() {
+  /// The geometry a finished session leaves behind, wiped so the next Origin
+  /// starts from nothing. The facts already cleared the scene and stance.
+  void _clearGeometry() {
+    // A stage that lost its tree keeps its last rect for the onEnd work.
+    if (_disposed) return;
     setRect(.zero);
     _startRect = .zero;
     _totalDelta = .zero;
     _active = null;
     _container.value = null;
     _lastRectCenter = null;
-    _setWidget(null);
+    _dismissStartContainer = null;
     _rotation.value = null;
-    _setPerspective(null);
-    _setBackgroundColor(null);
-    _setGestureBuilder(null);
-    _setDisplayConfig(null);
-    _setOriginConfig();
-    _setOnEnd(null);
-    _setTag(null);
-    _setLocked(true);
-    _setDismissing(false);
-    if (_interacting) setState(() => _interacting = false);
     _crop.value = .zero;
-    _lastCrop = null;
     _cropDrag = false;
     // Decomposed-release state — must be cleared so the next gesture's
     // tween-begin lookup falls back to [_rect.value.center.dx] instead
     // of reading stale tween values left over from a release that was
     // interrupted before its natural completion.
-    _clearReleaseDecomposed();
-    // Geometry — wipe back to defaults so the next Origin activation
-    // can't see leftover display/aspect from the previous session
-    // (causes the rect to settle at a stale position on the new
-    // Origin's first frame, before [_setMode] / [_setAspectRatio]
-    // overwrite them).
-    _display = _defaultOriginRect;
-    _origin = _defaultOriginRect;
-    _aspectRatio = 1.0;
-    // Transition flags — if a previous setMode / open / dismiss was
-    // interrupted before its `whenComplete`/`finally` cleared them,
-    // they stick at true and freeze [transitionProgress] at 0 so
-    // chrome stays invisible. Force back to inactive.
-    _setOpeningOrDismissing(false);
-    _setChangingMode(false);
-    // Tag-keyed bookkeeping. Stale entries can mis-route a future
-    // dismiss/swap/state lookup.
-    _sends.clear();
-    _tagStates.clear();
+    _releaseDecomposed = false;
   }
+
+  /// The session's Origin is gone while its own gesture held the stage: the
+  /// stage lets it go at once, with no flight home and no landing work.
+  void _abandon(Object tag) {
+    // Called from the Origin's dispose, while the tree is locked: the
+    // stage's listeners may rebuild only once the frame is done.
+    final binding = SchedulerBinding.instance;
+    if (binding.schedulerPhase == .persistentCallbacks) {
+      binding.addPostFrameCallback((_) => _abandon(tag));
+      return;
+    }
+    if (_disposed) return;
+    if (_scene.tag != tag || _stance.open || _stance.flight != null) return;
+    _setOriginGesture(null);
+    _resetHybridMerger();
+    _land(_takeFlight(.effect));
+  }
+
+  /// Whether a session holds the stage: an Origin shown, opening or flying
+  /// home. A new open or send waits its turn by being refused.
+  bool get _busy => _scene.tag != null;
 
   Future<void> runEffect({
     double? rotateX,
@@ -1350,6 +1319,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     Duration duration = const Duration(milliseconds: 100),
     Curve curve = Curves.easeOut,
   }) async {
+    final flight = _takeFlight(.effect);
     _effect.duration = duration;
     final curved = CurvedAnimation(parent: _effect, curve: curve);
     void update() {
@@ -1358,83 +1328,124 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         x: (rotateX ?? 0) * t,
         y: (rotateY ?? 0) * t,
         z: (rotateZ ?? 0) * t,
-        perspective: perspective ?? _perspective,
+        perspective: perspective ?? _scene.perspective,
       );
     }
     curved.addListener(update);
     try {
-      await _effect.forward();
-      await _effect.reverse();
+      if (!_disposed) {
+        await _effect.forward().orCancel.catchError((_) {}, test: (e) => e is TickerCanceled);
+      }
+      if (!_disposed) {
+        await _effect.reverse().orCancel.catchError((_) {}, test: (e) => e is TickerCanceled);
+      }
     } finally {
       curved.removeListener(update);
       curved.dispose();
-      _rotation.value = null;
-      reset();
+      if (!_disposed) _rotation.value = null;
+      _land(flight);
     }
   }
 
+  /// Flights home still running their landing work after the stage left the
+  /// tree; the notifiers they read live until the last one lands.
+  int _landingsInAir = 0;
+
   Future<void> dismiss({Object? tag, Object? except, Settle? settle}) async {
     if (tag != null) {
-      if (_sends.containsKey(tag)) _setTagState(tag, .returning);
+      _fact(SendsRecalled(tag: tag));
       return;
     }
-    for (final tag in _sends.keys) {
-      if (tag == except) continue;
-      _setTagState(tag, .returning);
-    }
-    _setDismissing(true);
-    _setOpeningOrDismissing(true);
+    _fact(SendsRecalled(except: except));
+    if (!_stance.dismissing) _dismissStartContainer = _container.value?.rect;
+    _remeasureOrigin();
+    final flight = _takeFlight(.dismissing);
+    await _landing(() async {
+      try {
+        await _flyHome(settle);
+        // A newer flight superseded this one; its own landing does the work.
+        if (_isCurrent(flight)) await _scene.onEnd?.call();
+      } finally {
+        _land(flight);
+      }
+    });
+  }
+
+  /// Runs [work] that may end in a landing after the stage leaves the tree,
+  /// keeping the notifiers it reads alive until it is done.
+  Future<void> _landing(Future<void> Function() work) async {
+    _landingsInAir++;
     try {
-      final origin = _origin.rect;
-      final current = _rect.value;
-      // Per-axis simulation lands at origin's coordinate, so dismiss
-      // responds to the configured [Settle] (e.g., stiffness).
-      final s = settle ?? const AttractSettle();
-      final simX = s.simulationAt(
-        position: current.center.dx,
-        velocity: 0,
-        target: origin.center.dx,
-      );
-      final simY = s.simulationAt(
-        position: current.center.dy,
-        velocity: 0,
-        target: origin.center.dy,
-      );
-      final simW = s.simulationAt(
-        position: current.width,
-        velocity: 0,
-        target: origin.width,
-      );
-      // Duration spans the longest natural-stop across axes; earlier-done
-      // axes freeze at target (SimulationCurve clamps progress at 1.0).
-      final dt = math.max(
-        math.max(_naturalStopTime(simX), _naturalStopTime(simY)),
-        _naturalStopTime(simW),
-      );
-      final duration = Duration(milliseconds: (dt * 1000).round().clamp(1, 1500));
-      await Future.wait([
-        animateCenterX(
-          to: origin.center.dx,
-          duration: duration,
-          curve: SimulationCurve(simX, dt),
-        ),
-        animateCenterY(
-          to: origin.center.dy,
-          duration: duration,
-          curve: SimulationCurve(simY, dt),
-        ),
-        animateWidth(
-          to: origin.width,
-          height: origin.height,
-          duration: duration,
-          curve: SimulationCurve(simW, dt),
-        ),
-      ]);
-      await _onEnd?.call();
+      await work();
     } finally {
-      _setOpeningOrDismissing(false);
-      reset();
+      _landingsInAir--;
+      if (_disposed && _landingsInAir == 0) _disposeNotifiers();
     }
+  }
+
+  /// The home flown back to is where the Origin stands now, unless the
+  /// consumer pointed it elsewhere.
+  void _remeasureOrigin() {
+    final scene = _scene;
+    final tag = scene.tag;
+    if (tag == null || scene.originPointed) return;
+    final measured = _measureEntry(tag);
+    if (measured != null) _fact(OriginMeasured(measured));
+  }
+
+  Future<void> _flyHome(Settle? settle) async {
+    final origin = _scene.origin.rect;
+    if (_disposed) {
+      if (!_notifiersDisposed) _rect.value = origin;
+      return;
+    }
+    _motion++;
+    final current = _rect.value;
+    // Per-axis simulation lands at origin's coordinate, so dismiss
+    // responds to the configured [Settle] (e.g., stiffness).
+    final s = settle ?? const AttractSettle();
+    final simX = s.simulationAt(
+      position: current.center.dx,
+      velocity: 0,
+      target: origin.center.dx,
+    );
+    final simY = s.simulationAt(
+      position: current.center.dy,
+      velocity: 0,
+      target: origin.center.dy,
+    );
+    final simW = s.simulationAt(
+      position: current.width,
+      velocity: 0,
+      target: origin.width,
+    );
+    // Duration spans the longest natural-stop across axes; earlier-done
+    // axes freeze at target (SimulationCurve clamps progress at 1.0).
+    final dt = math.max(
+      math.max(_naturalStopTime(simX), _naturalStopTime(simY)),
+      _naturalStopTime(simW),
+    );
+    final duration = Duration(milliseconds: (dt * 1000).round().clamp(1, 1500));
+    await Future.wait([
+      animateCenterX(
+        to: origin.center.dx,
+        duration: duration,
+        curve: SimulationCurve(simX, dt),
+      ),
+      animateCenterY(
+        to: origin.center.dy,
+        duration: duration,
+        curve: SimulationCurve(simY, dt),
+      ),
+      animateWidth(
+        to: origin.width,
+        height: origin.height,
+        duration: duration,
+        curve: SimulationCurve(simW, dt),
+      ),
+    ]);
+    // The stage left the tree mid-flight: the flight lands where it was going.
+    if (_disposed && !_notifiersDisposed) _rect.value = origin;
   }
 
   double _naturalStopTime(Simulation sim) {
@@ -1446,13 +1457,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 
   Future<void> animateToBase() async {
-    _setOpeningOrDismissing(true);
+    final flight = _takeFlight(.opening);
     try {
-      await animateRect(to: _display.rect.baseRect(_aspectRatio), curve: Curves.easeOut);
+      final scene = _scene;
+      await animateRect(to: scene.display.rect.baseRect(scene.aspectRatio), curve: Curves.easeOut);
     } finally {
-      _setOpeningOrDismissing(false);
+      _land(flight);
     }
-    _setLocked(false);
   }
 
   void setRect(Rect rect) {
@@ -1497,8 +1508,9 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
 
   void _updateProgress() {
     final w = _rect.value.width;
-    final originW = _origin.rect.width;
-    final baseW = _display.rect.baseWidth(_aspectRatio);
+    final scene = _scene;
+    final originW = scene.origin.rect.width;
+    final baseW = scene.display.rect.baseWidth(scene.aspectRatio);
     // The origin can be wider than the base (a tall image from a wide slot),
     // so progress runs either way between the two widths.
     _originToBaseProgress.value = baseW == originW
@@ -1522,8 +1534,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         ? _centerXTween.evaluate(_centerX)
         : _rect.value.center.dx;
     _centerXTween.end = to;
-    _safeReset(_centerX);
-    return _centerX.animateTo(1, duration: duration, curve: curve);
+    return _drive(_centerX, duration, curve);
   }
 
   Future<void> animateCenterY({required double to, Duration? duration, Curve curve = Curves.easeIn}) {
@@ -1531,14 +1542,13 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
         ? _centerYTween.evaluate(_centerY)
         : _rect.value.center.dy;
     _centerYTween.end = to;
-    _safeReset(_centerY);
-    return _centerY.animateTo(1, duration: duration, curve: curve);
+    return _drive(_centerY, duration, curve);
   }
 
   /// Animates the rect's width to [to]. If [height] is provided, animates
   /// height in lockstep on the same controller (so duration / curve are
   /// shared by construction); otherwise the height tween targets
-  /// `to / _aspectRatio` to preserve the existing aspect-derived height
+  /// `to / aspectRatio` to preserve the existing aspect-derived height
   /// behavior.
   Future<void> animateWidth({
     required double to,
@@ -1549,12 +1559,12 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     _widthTween.begin = _rect.value.width;
     _widthTween.end = to;
     _heightTween.begin = _rect.value.height;
-    _heightTween.end = height ?? to / _aspectRatio;
-    _safeReset(_width);
-    return _width.animateTo(1, duration: duration, curve: curve);
+    _heightTween.end = height ?? to / _scene.aspectRatio;
+    return _drive(_width, duration, curve);
   }
 
   Future<void> animateRect({required Rect to, Duration? duration, Curve curve = Curves.easeIn}) {
+    _motion++;
     return Future.wait([
       animateCenterX(to: to.center.dx, duration: duration, curve: curve),
       animateCenterY(to: to.center.dy, duration: duration, curve: curve),
@@ -1562,33 +1572,176 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     ]);
   }
 
-  /// Enters decomposed-release mode (see [_releaseDecomposed]). Captures the
-  /// initial rect / display state and resets the X/Y tweens to zero offset,
-  /// the width tween to current width. Callers are responsible for pairing
-  /// this with [_clearReleaseDecomposed] after the release completes.
-  void _setReleaseDecomposed({
-    required double initialX,
-    required double initialY,
-    required double initialWidth,
-    required Offset displayCenter,
-  }) {
-    _releaseInitialX = initialX;
-    _releaseInitialY = initialY;
-    _releaseInitialWidth = initialWidth;
-    _releaseDisplayCenter = displayCenter;
+  Future<void> release(Release plan) async {
+    final motion = ++_motion;
+    final scaleHasMotion =
+        plan.scale.decay.isNotEmpty || plan.scale.settle != null;
+    if (!scaleHasMotion) {
+      // No scale animation → axes are independent.
+      setRect(_rect.value);
+      await Future.wait([
+        _runAxis(motion, plan.x, animateCenterX),
+        _runAxis(motion, plan.y, animateCenterY),
+        _runAxis(motion, plan.scale, animateWidth),
+      ]);
+      return;
+    }
+    // Decomposed-release: scale drives the proportional center; X/Y add a
+    // translation offset on top. Each axis keeps its own curve/duration and
+    // the displayed center stays consistent mid-frame.
+    final initialRect = _rect.value;
+    final display = _scene.display.rect;
+    final wFinal = plan.scale.settle?.to ?? plan.scale.decay.last.to;
+    final scaleRatio = initialRect.width == 0 ? 1.0 : wFinal / initialRect.width;
+    final xPropFinal = display.center.dx
+        + (initialRect.center.dx - display.center.dx) * scaleRatio;
+    final yPropFinal = display.center.dy
+        + (initialRect.center.dy - display.center.dy) * scaleRatio;
+    final xAbsTarget = plan.x.settle?.to
+        ?? (plan.x.decay.isNotEmpty ? plan.x.decay.last.to : initialRect.center.dx);
+    final yAbsTarget = plan.y.settle?.to
+        ?? (plan.y.decay.isNotEmpty ? plan.y.decay.last.to : initialRect.center.dy);
+    final xOffsetTarget = xAbsTarget - xPropFinal;
+    final yOffsetTarget = yAbsTarget - yPropFinal;
+
+    // Enter decomposed-release mode: capture the initial rect / display
+    // state and reset the X/Y tweens to zero offset, the width tween to
+    // current width.
+    _releaseInitialX = initialRect.center.dx;
+    _releaseInitialY = initialRect.center.dy;
+    _releaseInitialWidth = initialRect.width;
+    _releaseDisplayCenter = display.center;
     _centerXTween.begin = 0;
     _centerXTween.end = 0;
     _centerYTween.begin = 0;
     _centerYTween.end = 0;
-    _widthTween.begin = initialWidth;
-    _widthTween.end = initialWidth;
-    _heightTween.begin = _rect.value.height;
-    _heightTween.end = _rect.value.height;
+    _widthTween.begin = initialRect.width;
+    _widthTween.end = initialRect.width;
+    _heightTween.begin = initialRect.height;
+    _heightTween.end = initialRect.height;
     _releaseDecomposed = true;
+    try {
+      await Future.wait([
+        animateCenterX(
+          to: xOffsetTarget,
+          duration: plan.x.settle?.duration,
+          curve: plan.x.settle?.curve ?? Curves.easeOut,
+        ),
+        animateCenterY(
+          to: yOffsetTarget,
+          duration: plan.y.settle?.duration,
+          curve: plan.y.settle?.curve ?? Curves.easeOut,
+        ),
+        _runAxis(motion, plan.scale, animateWidth),
+      ]);
+    } finally {
+      if (motion == _motion) _releaseDecomposed = false;
+    }
   }
 
-  void _clearReleaseDecomposed() {
-    _releaseDecomposed = false;
+  Future<void> run({
+    List<AxisFling>? x,
+    List<AxisFling>? y,
+    List<AxisFling>? scale,
+  }) {
+    final motion = ++_motion;
+    setRect(_rect.value);
+    return Future.wait([
+      if (x != null) _runFlings(motion, x, animateCenterX),
+      if (y != null) _runFlings(motion, y, animateCenterY),
+      if (scale != null) _runFlings(motion, scale, animateWidth),
+    ]);
+  }
+
+  Future<void> backToOrigin(ReleaseContext data, {Object? except}) {
+    return _landing(() async {
+      await release(Release.toHalt(data));
+      // Use the gesture's configured [Settle] for the dismiss-to-origin motion.
+      final b = data.gesture.bounds;
+      final settle = b.left?.decay?.settle
+          ?? b.right?.decay?.settle
+          ?? b.top?.decay?.settle
+          ?? b.bottom?.decay?.settle;
+      await dismiss(except: except, settle: settle);
+    });
+  }
+
+  /// Bumped by every motion that takes the whole rect (a release, a run, a
+  /// flight, a touch), so a motion it supersedes stops between phases.
+  int _motion = 0;
+
+  Future<void> _runAxis(
+    int motion,
+    AxisRelease axis,
+    Future<void> Function({
+      required double to,
+      Duration? duration,
+      Curve curve,
+    }) animate,
+  ) async {
+    for (final f in axis.decay) {
+      if (motion != _motion) return;
+      await animate(to: f.to, duration: f.duration, curve: f.curve);
+    }
+    final s = axis.settle;
+    if (s != null && motion == _motion) {
+      await animate(to: s.to, duration: s.duration, curve: s.curve);
+    }
+  }
+
+  Future<void> _runFlings(
+    int motion,
+    List<AxisFling> flings,
+    Future<void> Function({
+      required double to,
+      Duration? duration,
+      Curve curve,
+    }) animate,
+  ) async {
+    for (final f in flings) {
+      if (motion != _motion) return;
+      await animate(to: f.to, duration: f.duration, curve: f.curve);
+    }
+  }
+
+  /// Animates the image rect back to base and the crop rect back to the
+  /// mode's initial crop.
+  Future<void> resetCrop() {
+    final scene = _scene;
+    final base = scene.display.rect.baseRect(scene.aspectRatio);
+    final crop = scene.displayConfig?.crop;
+    return Future.wait([
+      animateRect(to: base, curve: Curves.easeOut),
+      animateCrop(to: crop?.initialRect?.call(base) ?? base, curve: Curves.easeOut),
+    ]);
+  }
+
+  /// Shows [widget] where the crop rect stands and flies it home. With
+  /// [aspectRatio], home keeps the slot's width at that ratio — the slot
+  /// relays out to the cropped photo while it's away — and the crop rect
+  /// rides home beside it.
+  Future<void> landCrop(Widget widget, {double? aspectRatio}) async {
+    // A slot the consumer just changed is measured where it lays out.
+    await _settledFrame();
+    if (_disposed) return;
+    final cropRect = _crop.value;
+    final tag = _scene.tag;
+    final home = tag == null ? null : _measureEntry(tag);
+    final origin = home == null || aspectRatio == null
+        ? null
+        : home.copyWith(
+            rect: Rect.fromLTWH(
+              home.rect.left,
+              home.rect.top,
+              home.rect.width,
+              home.rect.width / aspectRatio,
+            ),
+          );
+    if (origin != null) _fact(OriginPointed(origin));
+    _fact(WidgetShown(widget));
+    setRect(cropRect);
+    if (origin != null) animateCrop(to: origin.rect, curve: Curves.easeOut);
+    await dismiss();
   }
 
   // --- Registry ---
@@ -1611,156 +1764,100 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
     return _registry[tag]?.capture?.call();
   }
 
-  Future<void> _openEntry(Object tag) {
-    return _registry[tag]?.open?.call() ?? Future.value();
+  /// Waits out a frame already on its way: the Origin a consumer just built
+  /// or changed is mounted and laid out once it has run.
+  Future<void> _settledFrame() async {
+    final binding = SchedulerBinding.instance;
+    if (binding.hasScheduledFrame) await binding.endOfFrame;
   }
 
-  Future<void> _sendEntry(Object tag, Rect Function(Rect) send, {VoidCallback? onEnd}) {
-    return _registry[tag]?.send?.call(send, onEnd: onEnd) ?? Future.value();
+  Future<void> _openEntry(Object tag) async {
+    await _settledFrame();
+    if (_disposed) return;
+    await _registry[tag]?.open?.call();
+  }
+
+  Future<void> _sendEntry(Object tag, Rect Function(Rect) send, {VoidCallback? onEnd}) async {
+    await _settledFrame();
+    if (_disposed) return;
+    await _registry[tag]?.send?.call(send, onEnd: onEnd);
   }
 
   // --- Sends ---
 
-  final _sends = <Object, ({Object target, bool park, Key key})>{};
-
   void _displace(Object tag, {required Object target, bool park = true}) {
-    for (final t in _sends.keys) {
-      if (t == tag) continue;
-      final state = _tagStates[t];
-      if (state case .sending || .parked) {
-        _setTagState(t, .returning);
-      }
-    }
-    _sends[tag] = (target: target, park: park, key: UniqueKey());
-    _setTagState(tag, .sending);
-  }
-
-  void _releaseSend(Object tag) {
-    _sends.remove(tag);
-    _clearTagState(tag);
-  }
-
-  void _removeSend(Object tag) {
-    _sends.remove(tag);
-    _clearTagState(tag);
+    _fact(SendDisplaced(StageSend(tag: tag, target: target, park: park, key: UniqueKey())));
   }
 
   @override
   void dispose() {
+    _disposed = true;
+    // The rect's listeners read the tree, which is gone; a flight still
+    // landing keeps only the rect itself.
+    _rect
+      ..removeListener(_updateProgress)
+      ..removeListener(_updateContainer);
+    // Stopping completes every animation's future: a flight home lands where
+    // it was going and still runs its landing work.
+    _centerX.dispose();
+    _centerY.dispose();
+    _width.dispose();
+    _effect.dispose();
+    _cropAnim.dispose();
+    _ledger.close();
+    if (_landingsInAir == 0) _disposeNotifiers();
+    super.dispose();
+  }
+
+  bool _notifiersDisposed = false;
+
+  void _disposeNotifiers() {
+    _notifiersDisposed = true;
     _rect.dispose();
     _crop.dispose();
-    _cropAnim.dispose();
     _container.dispose();
     _originToBaseProgress.dispose();
     _transitionProgressMin.dispose();
     _transitionProgressMean.dispose();
     _transitionProgressMax.dispose();
-    _centerX.dispose();
-    _centerY.dispose();
-    _width.dispose();
-    _effect.dispose();
     _rotation.dispose();
-    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return StageData(
-      origin: _origin,
-      originContainer: _originContainer,
-      display: _display,
-      displayContainer: _displayContainer,
-      aspectRatio: _aspectRatio,
-      rect: _rect,
-      crop: _crop,
-      interacting: _interacting,
-      openingOrDismissing: _openingOrDismissing,
-      rotation: _rotation,
-      originToBaseProgress: _originToBaseProgress,
-      widget: _widget,
-      setWidget: _setWidget,
-      perspective: _perspective,
-      backgroundColor: _backgroundColor,
-      gestureBuilder: _gestureBuilder,
-      onRelease: widget.onRelease,
-      overrides: widget.overrides,
-      dragHybridFromStage: widget.dragHybridFromStage,
-      scaleHybridFromStage: widget.scaleHybridFromStage,
-      originGesture: () => _originGesture,
-      setOriginGesture: _setOriginGesture,
-      setOriginPointers: _setOriginPointers,
-      displayConfig: () => _displayConfig,
-      isHybridDriving: () => _isHybridDriving,
-      stagePointerCount: () => _stageRecognizer?.pointerPositions.length ?? 0,
-      hybridReleaseVelocity: _hybridReleaseVelocity,
-      scaleVelocityCancel: () => widget.scaleVelocityCancel,
-      onEnd: _onEnd,
-      tag: _tag,
-      locked: _locked,
-      dismissing: _dismissing,
-      changingMode: _changingMode,
-      transitionProgressMin: _transitionProgressMin,
-      transitionProgressMean: _transitionProgressMean,
-      transitionProgressMax: _transitionProgressMax,
-      tagStates: {..._tagStates},
-      container: _container,
-      setOrigin: _setOrigin,
-      setOriginContainer: _setOriginContainer,
-      setDisplay: _setDisplay,
-      setDisplayContainer: _setDisplayContainer,
-      setAspectRatio: _setAspectRatio,
-      setPerspective: _setPerspective,
-      setBackgroundColor: _setBackgroundColor,
-      setGestureBuilder: _setGestureBuilder,
-      setDisplayConfig: _setDisplayConfig,
-      setOriginConfig: _setOriginConfig,
-      setMode: _setMode,
-      setOnEnd: _setOnEnd,
-      setTag: _setTag,
-      setLocked: _setLocked,
-      setRect: setRect,
-      animateRect: animateRect,
-      animateCrop: animateCrop,
-      animateCenterX: animateCenterX,
-      animateCenterY: animateCenterY,
-      animateWidth: animateWidth,
-      setReleaseDecomposed: _setReleaseDecomposed,
-      clearReleaseDecomposed: _clearReleaseDecomposed,
-      reset: reset,
-      animateToBase: animateToBase,
-      dismiss: dismiss,
-      displace: _displace,
-      releaseSend: _releaseSend,
-      runEffect: runEffect,
-      register: _register,
-      unregister: _unregister,
-      measureEntry: _measureEntry,
-      captureEntry: _captureEntry,
-      openEntry: _openEntry,
-      sendEntry: _sendEntry,
+    final scene = _scene;
+    final stance = _stance;
+    final tagStates = _tagStates;
+    return StageData._(
+      stage: this,
+      scene: scene,
+      stance: stance,
+      tagStates: tagStates,
       child: Stack(
         fit: .expand,
         children: [
           widget.child,
           const _AbsorbLayer(),
-          for (final MapEntry(key: tag, value: info) in _sends.entries)
+          for (final send in _sends.values)
             _SendLayer(
-              key: info.key,
-              tag: tag,
-              target: info.target,
-              returning: _tagStates[tag] == .returning,
-              onArrived: info.park ? () => _setTagState(tag, .parked) : () => _removeSend(tag),
-              onDone: () => _removeSend(tag),
+              key: send.key,
+              tag: send.tag,
+              target: send.target,
+              returning: tagStates[send.tag] == .returning,
+              onArrived: send.park
+                  ? () => _fact(SendArrived(send.tag))
+                  : () => _fact(SendGone(send.tag)),
+              onDone: () => _fact(SendGone(send.tag)),
             ),
           const StageOverlay(),
           Builder(builder: (context) {
             // Stage's gesture detector is active either:
-            //  - in displayed-state (existing condition), or
+            //  - in displayed-state (open, and not flying home), or
             //  - during a hybrid feed-state gesture so new pointers landing
             //    on stage join the Origin's gesture per its hybrid mode.
-            final og = _originGesture;
+            final og = stance.originGesture;
             final hybridActive = og != null && _resolveHybrid(og) != null;
-            final displayed = Stage.hasWidgetOf(context) && !_locked;
+            final displayed = Stage.hasWidgetOf(context) && stance.open && !stance.dismissing;
             final active = displayed || hybridActive;
             // Always translucent so [GestureDetector]s inside the captured
             // widget can win in the arena for taps on their own area
@@ -1795,11 +1892,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
                     && (_displayConfig?.onTap ?? widget.onTap) != null)
                   TapGestureRecognizer: GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
                     TapGestureRecognizer.new,
-                    (r) => r.onTapUp = (d) {
-                      _tapLocal = d.localPosition;
-                      _tapGlobal = d.globalPosition;
-                      _onTap();
-                    },
+                    (r) => r.onTapUp = _onTap,
                   ),
                 // DoubleTap is opt-in — only registered when a handler is
                 // explicitly wired in. Without it, the [TapGestureRecognizer]
@@ -1824,7 +1917,7 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
           // Tools that own gestures (e.g. Cropper) live here so their
           // detectors take priority over Stage's recognizer; 2-finger
           // gestures fall through to Stage via translucent hit-test.
-          if ((_displayConfig?.overlay ?? _originOverlay ?? widget.overlay)
+          if ((_displayConfig?.overlay ?? scene.config.overlay ?? widget.overlay)
               case final overlay?)
             Builder(builder: overlay),
         ],
@@ -1833,173 +1926,78 @@ class _StageState extends State<Stage> with TickerProviderStateMixin {
   }
 }
 
+/// The stage as its subtree reads it. Every getter reads the stage's ledger
+/// now, so a [StageData] held from an earlier build never goes stale; the
+/// snapshot it was built with only decides which dependents rebuild.
 class StageData extends InheritedModel<Object> {
-  const StageData({
-    super.key,
-    required this.origin,
-    required this.originContainer,
-    required this.display,
-    required this.displayContainer,
-    required this.aspectRatio,
-    required this.rect,
-    required this.crop,
-    required this.interacting,
-    required this.openingOrDismissing,
-    required this.rotation,
-    required this.originToBaseProgress,
-    required this.widget,
-    required this.setWidget,
-    required this.perspective,
-    required this.backgroundColor,
-    required this.gestureBuilder,
-    required this.onRelease,
-    required this.overrides,
-    required this.dragHybridFromStage,
-    required this.scaleHybridFromStage,
-    required this.originGesture,
-    required this.setOriginGesture,
-    required this.setOriginPointers,
-    required this.displayConfig,
-    required this.isHybridDriving,
-    required this.stagePointerCount,
-    required this.hybridReleaseVelocity,
-    required this.scaleVelocityCancel,
-    required this.onEnd,
-    required this.tag,
-    required this.locked,
-    required this.dismissing,
-    required this.changingMode,
-    required this.transitionProgressMin,
-    required this.transitionProgressMean,
-    required this.transitionProgressMax,
-    required this.tagStates,
-    required this.container,
-    required this.setOrigin,
-    required this.setOriginContainer,
-    required this.setDisplay,
-    required this.setDisplayContainer,
-    required this.setAspectRatio,
-    required this.setPerspective,
-    required this.setBackgroundColor,
-    required this.setGestureBuilder,
-    required this.setDisplayConfig,
-    required this.setOriginConfig,
-    required this.setMode,
-    required this.setOnEnd,
-    required this.setTag,
-    required this.setLocked,
-    required this.setRect,
-    required this.animateRect,
-    required this.animateCrop,
-    required this.animateCenterX,
-    required this.animateCenterY,
-    required this.animateWidth,
-    required this.setReleaseDecomposed,
-    required this.clearReleaseDecomposed,
-    required this.reset,
-    required this.animateToBase,
-    required this.dismiss,
-    required this.displace,
-    required this.releaseSend,
-    required this.runEffect,
-    required this.register,
-    required this.unregister,
-    required this.measureEntry,
-    required this.captureEntry,
-    required this.openEntry,
-    required this.sendEntry,
+  const StageData._({
+    required this._stage,
+    required StageScene scene,
+    required StageStance stance,
+    required Map<Object, TagState> tagStates,
     required super.child,
-  });
+  })  : _builtScene = scene,
+        _builtStance = stance,
+        _builtTagStates = tagStates;
 
-  final OriginRect origin;
-  final OriginRect? originContainer;
-  final OriginRect display;
-  final OriginRect? displayContainer;
+  final _StageState _stage;
+  final StageScene _builtScene;
+  final StageStance _builtStance;
+  final Map<Object, TagState> _builtTagStates;
 
-  final double aspectRatio;
-  final ValueNotifier<Rect> rect;
+  StageScene get _scene => _stage._scene;
+  StageStance get _stance => _stage._stance;
+
+  Object? get tag => _scene.tag;
+  Widget? get widget => _scene.widget;
+  OriginRect get origin => _scene.origin;
+  OriginRect? get originContainer => _scene.originContainer;
+  OriginRect get display => _scene.display;
+  OriginRect? get displayContainer => _scene.displayContainer;
+  double get aspectRatio => _scene.aspectRatio;
+  double? get perspective => _scene.perspective;
+  Color? get backgroundColor => _scene.backgroundColor;
+  StageBuilder? get gestureBuilder => _scene.gestureBuilder;
+
+  /// The currently-active [DisplayConfig] (the displayed origin's, merged
+  /// with any active mode override). Null when no origin is displayed.
+  /// Tools (e.g., [Cropper]) read this to check whether they should be
+  /// active in the current state.
+  DisplayConfig? get displayConfig => _scene.displayConfig;
+
+  /// The shown Origin finished opening; the Stage's gestures drive it.
+  bool get open => _stance.open;
+  bool get dismissing => _stance.dismissing;
+
+  /// True during an open ([animateToBase]) or dismiss ([dismiss])
+  /// animation. Release rubber-back / settle paths don't touch this. Used
+  /// by crop-mode chrome to fade only during real open/dismiss and stay
+  /// solid through interaction + settle.
+  bool get openingOrDismissing => _stance.openingOrDismissing;
+
+  /// True while [setMode] is animating its rect/crop transition. Use to
+  /// gate mode-transition fades without firing on user interaction.
+  bool get changingMode => _stance.changingMode;
+
+  /// True while a gesture on the Stage moves the shown Origin. Read via
+  /// [Stage.isInteractingOf] for tag-aware access (which folds in a check
+  /// that the queried tag is the active stage tag).
+  bool get interacting => _stance.interacting;
+
+  Map<Object, TagState> get tagStates => _stage._tagStates;
+
+  ValueNotifier<Rect> get rect => _stage._rect;
+
   /// Live crop rect, seeded from [CropConfig.initialRect] when a crop mode
   /// activates and mutated by Stage's recognizer (1-pointer drag inside the
   /// rect) or the [Cropper] widget's handles. Consumers read it (e.g. on
   /// apply) via `Stage.of(context).crop.value`. Reset to [Rect.zero] when
   /// no crop mode is active.
-  final ValueNotifier<Rect> crop;
-  /// True while Stage's recognizer holds &gt; 0 pointers. A coarse `x vs 0
-  /// pointers` signal — read via [Stage.isInteractingOf] for tag-aware access
-  /// (which folds in a check that the queried tag is the active stage tag).
-  /// Independent of which gesture committed in arena.
-  final bool interacting;
+  ValueNotifier<Rect> get crop => _stage._crop;
+  ValueNotifier<Rotation?> get rotation => _stage._rotation;
+  ValueListenable<double> get originToBaseProgress => _stage._originToBaseProgress;
+  ValueListenable<OriginRect?> get container => _stage._container;
 
-  /// True during an open ([Stage.animateToBase]) or dismiss ([Stage.dismiss])
-  /// animation. Release rubber-back / settle paths don't touch this. Used
-  /// by crop-mode chrome to fade only during real open/dismiss and stay
-  /// solid through interaction + settle.
-  final bool openingOrDismissing;
-  final ValueNotifier<Rotation?> rotation;
-  final ValueNotifier<double> originToBaseProgress;
-  final Widget? widget;
-
-  final double? perspective;
-  final Color? backgroundColor;
-  final StageBuilder? gestureBuilder;
-  final OnRelease? onRelease;
-  final Overrides? overrides;
-
-  /// Stage-level cascade fallback for hybrid pointer routing. Resolved last
-  /// before [DragHybrid.lock] / [ScaleHybrid.lock].
-  final DragHybrid? dragHybridFromStage;
-  final ScaleHybrid? scaleHybridFromStage;
-
-  /// Live reader: currently-in-flight Origin gesture (drag or scale on an
-  /// un-displayed item), with its hybrid mode partially resolved up to
-  /// Origin's level. Stage uses this to decide what to do with new pointers
-  /// landing in stage-area regions while the Origin is gesturing. Null when
-  /// no Origin is gesturing.
-  ///
-  /// Exposed as a function (not a value) so callers reading it from a cached
-  /// [StageData] reference still see the latest state.
-  final OriginGesture? Function() originGesture;
-  final ValueSetter<OriginGesture?> setOriginGesture;
-
-  /// Origin forwards its recognizer's [pointerPositions] here whenever they
-  /// change. Stage merges with its own recognizer's positions to drive the
-  /// hybrid gesture math.
-  final ValueSetter<Map<int, Offset>> setOriginPointers;
-
-  /// Live reader: the currently-active [DisplayConfig] (the displayed
-  /// origin's, merged with any active mode override). Null when no origin
-  /// is displayed. Tools (e.g., [Cropper]) read this to check whether they
-  /// should be active in the current state.
-  final DisplayConfig? Function() displayConfig;
-
-  /// Live reader: true while Stage's hybrid merger is driving the rect.
-  /// Origin reads this to silence its own rect manipulation while Stage is
-  /// in control.
-  final bool Function() isHybridDriving;
-
-  /// Live reader: count of stage's recognizer pointers. Origin reads this to
-  /// decide whether to defer release until stage's pointers also leave.
-  final int Function() stagePointerCount;
-
-  /// Live reader: the hybrid merger's combined release velocity computed
-  /// from its last two focal/spread samples. Returns null if the merger
-  /// didn't run recently — callers should fall back to the firing
-  /// recognizer's own `ScaleEndDetails.velocity`.
-  final ({Velocity velocity, double scaleVelocity})? Function()
-      hybridReleaseVelocity;
-
-  /// Live reader: Stage-level `scaleVelocityCancel` (raw nullable), the
-  /// bottom of the cascade before the package default of `0.5`. Callers
-  /// resolve `gesture > Origin/DisplayConfig > this > 0.5`.
-  final double? Function() scaleVelocityCancel;
-
-  final FutureOr<void> Function()? onEnd;
-  final Object? tag;
-  final bool locked;
-  final bool dismissing;
-  /// True while [setMode] is animating its rect/crop transition. Use to
-  /// gate mode-transition fades without firing on user interaction.
-  final bool changingMode;
   /// Progress 0..1 derived from the four rect/crop animation
   /// controllers, gated by `openingOrDismissing || changingMode` so
   /// release/settle don't move it. Three aggregations exposed —
@@ -2007,239 +2005,200 @@ class StageData extends InheritedModel<Object> {
   /// - [transitionProgressMin]: slowest controller.
   /// - [transitionProgressMean]: average across all four.
   /// - [transitionProgressMax]: fastest controller.
-  final ValueListenable<double> transitionProgressMin;
-  final ValueListenable<double> transitionProgressMean;
-  final ValueListenable<double> transitionProgressMax;
-  final Map<Object, TagState> tagStates;
-  final ValueNotifier<OriginRect?> container;
+  ValueListenable<double> get transitionProgressMin => _stage._transitionProgressMin;
+  ValueListenable<double> get transitionProgressMean => _stage._transitionProgressMean;
+  ValueListenable<double> get transitionProgressMax => _stage._transitionProgressMax;
 
-  final ValueSetter<Widget?> setWidget;
-  final ValueSetter<OriginRect> setOrigin;
-  final ValueSetter<OriginRect?> setOriginContainer;
-  final ValueSetter<OriginRect> setDisplay;
-  final ValueSetter<OriginRect?> setDisplayContainer;
-  final ValueSetter<double> setAspectRatio;
-  final ValueSetter<double?> setPerspective;
-  final ValueSetter<Color?> setBackgroundColor;
-  final ValueSetter<StageBuilder?> setGestureBuilder;
-  final ValueSetter<DisplayConfig?> setDisplayConfig;
+  OnRelease? get onRelease => _stage.widget.onRelease;
+  Overrides? get overrides => _stage.widget.overrides;
 
-  /// Registers the active origin's mode lookup so [setMode] can resolve a
-  /// key into a merged [DisplayConfig]. Origin calls this in its `_setup`.
-  /// Also carries Origin-level cascade fallbacks (e.g. `overlay`, display
-  /// rect overrides) that Stage merges with the active DisplayConfig.
-  final void Function({
-    DisplayConfig? defaults,
-    Map<Object, DisplayConfig>? modes,
-    WidgetBuilder? overlay,
-    OriginRect? display,
-    OriginRect? displayContainer,
-    OriginRect? screen,
-    StageBuilder? builder,
-  }) setOriginConfig;
+  /// Stage-level cascade fallback for hybrid pointer routing. Resolved last
+  /// before [DragHybrid.lock] / [ScaleHybrid.lock].
+  DragHybrid? get dragHybridFromStage => _stage.widget.dragHybridFromStage;
+  ScaleHybrid? get scaleHybridFromStage => _stage.widget.scaleHybridFromStage;
+
+  /// Stage-level `scaleVelocityCancel` (raw nullable), the bottom of the
+  /// cascade before the package default of `0.8`.
+  double? get scaleVelocityCancel => _stage.widget.scaleVelocityCancel;
+
+  /// The Origin gesture in flight (drag or scale on an un-displayed item),
+  /// with its hybrid mode resolved up to Origin's level. Null when no
+  /// Origin is gesturing.
+  OriginGesture? get originGesture => _stance.originGesture;
+
+  /// True while Stage's hybrid merger is driving the rect. Origin reads
+  /// this to silence its own rect manipulation while Stage is in control.
+  bool get isHybridDriving => _stance.hybridDriving;
+
+  /// Count of the Stage recognizer's pointers. Origin reads this to decide
+  /// whether to defer release until stage's pointers also leave.
+  int get stagePointerCount => _stage._stageRecognizer?.pointerPositions.length ?? 0;
+
+  /// The hybrid merger's release velocity, or null when the merger didn't
+  /// run recently — callers fall back to the firing recognizer's own.
+  ({Velocity velocity, double scaleVelocity})? get hybridReleaseVelocity =>
+      _stage._hybridReleaseVelocity();
+
+  void setWidget(Widget? widget) => _stage._fact(WidgetShown(widget));
+
+  /// Points the flight home at [origin]; a pointed home is not measured again.
+  void setOrigin(OriginRect origin) => _stage._fact(OriginPointed(origin));
+  void setAspectRatio(double aspectRatio) => _stage._fact(AspectRatioSet(aspectRatio));
+  void setBackgroundColor(Color? color) => _stage._fact(BackgroundSet(color));
 
   /// Switches the active mode for the currently-displayed origin. Looks
-  /// the key up in the origin's modes map (registered via
-  /// [setOriginConfig]), merges with the origin's default config, and
-  /// swaps [displayConfig]. Passing `null` returns to the default config.
+  /// the key up in the origin's modes map, merges with the origin's
+  /// default config, and swaps [displayConfig]. Passing `null` returns to
+  /// the default config.
   ///
   /// Useful for letting consumer-side UI (e.g., an appbar's Back button)
   /// exit a tool mode without dismissing the displayed origin.
-  final ValueSetter<Object?> setMode;
-  final ValueSetter<FutureOr<void> Function()?> setOnEnd;
-  final ValueSetter<Object?> setTag;
-  final ValueSetter<bool> setLocked;
-  final ValueSetter<Rect> setRect;
-  final AnimateRect animateRect;
+  void setMode(Object? mode) => _stage._setMode(mode);
+  void setRect(Rect rect) => _stage.setRect(rect);
+
+  Future<void> animateRect({required Rect to, Duration? duration, Curve curve = Curves.easeIn}) =>
+      _stage.animateRect(to: to, duration: duration, curve: curve);
+
   /// Animates [crop] from its current value to the given rect. Used for
   /// reset transitions and other places that want a smooth crop-rect change
   /// instead of an instant `stage.crop.value = newRect` assignment.
-  final AnimateRect animateCrop;
-  final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterX;
-  final Future<void> Function({required double to, Duration? duration, Curve curve}) animateCenterY;
-  final Future<void> Function({
-    required double to,
-    double? height,
-    Duration? duration,
-    Curve curve,
-  }) animateWidth;
-  /// Enters decomposed-release mode: while active, the X/Y tweens are
-  /// interpreted as *offsets* from the proportional scale-driven position.
-  /// Lets the three axes animate with independent curves/durations while
-  /// the displayed center stays consistent mid-frame.
-  final void Function({
-    required double initialX,
-    required double initialY,
-    required double initialWidth,
-    required Offset displayCenter,
-  }) setReleaseDecomposed;
-  final VoidCallback clearReleaseDecomposed;
-  final VoidCallback reset;
-  final Future<void> Function() animateToBase;
-  final Future<void> Function({Object? tag, Object? except, Settle? settle}) dismiss;
-  final void Function(Object tag, {required Object target, bool park}) displace;
-  final void Function(Object tag) releaseSend;
-  final Future<void> Function({
-    double? rotateX,
-    double? rotateY,
-    double? rotateZ,
-    double? perspective,
-    Duration duration,
-    Curve curve,
-  }) runEffect;
+  Future<void> animateCrop({required Rect to, Duration? duration, Curve curve = Curves.easeOut}) =>
+      _stage.animateCrop(to: to, duration: duration, curve: curve);
 
-  final void Function(Object tag, OriginEntry entry) register;
-  final void Function(Object tag, OriginEntry entry) unregister;
-  final OriginRect? Function(Object tag) measureEntry;
-  final Widget? Function(Object tag) captureEntry;
-  final Future<void> Function(Object tag) openEntry;
-  final Future<void> Function(Object tag, Rect Function(Rect), {VoidCallback? onEnd}) sendEntry;
+  Future<void> animateToBase() => _stage.animateToBase();
 
-  Future<void> release(Release plan) async {
-    final scaleHasMotion =
-        plan.scale.decay.isNotEmpty || plan.scale.settle != null;
-    if (!scaleHasMotion) {
-      // No scale animation → axes are independent.
-      setRect(rect.value);
-      await Future.wait([
-        _runAxis(plan.x, animateCenterX),
-        _runAxis(plan.y, animateCenterY),
-        _runAxis(plan.scale, animateWidth),
-      ]);
-      return;
-    }
-    // Decomposed-release: scale drives the proportional center; X/Y add a
-    // translation offset on top. Each axis keeps its own curve/duration and
-    // the displayed center stays consistent mid-frame.
-    final initialRect = rect.value;
-    final wFinal = plan.scale.settle?.to ?? plan.scale.decay.last.to;
-    final scaleRatio = initialRect.width == 0 ? 1.0 : wFinal / initialRect.width;
-    final xPropFinal = display.rect.center.dx
-        + (initialRect.center.dx - display.rect.center.dx) * scaleRatio;
-    final yPropFinal = display.rect.center.dy
-        + (initialRect.center.dy - display.rect.center.dy) * scaleRatio;
-    final xAbsTarget = plan.x.settle?.to
-        ?? (plan.x.decay.isNotEmpty ? plan.x.decay.last.to : initialRect.center.dx);
-    final yAbsTarget = plan.y.settle?.to
-        ?? (plan.y.decay.isNotEmpty ? plan.y.decay.last.to : initialRect.center.dy);
-    final xOffsetTarget = xAbsTarget - xPropFinal;
-    final yOffsetTarget = yAbsTarget - yPropFinal;
+  /// Flies the shown Origin home and ends the session. With [tag], only
+  /// that send flies home.
+  Future<void> dismiss({Object? tag, Object? except, Settle? settle}) =>
+      _stage.dismiss(tag: tag, except: except, settle: settle);
 
-    setReleaseDecomposed(
-      initialX: initialRect.center.dx,
-      initialY: initialRect.center.dy,
-      initialWidth: initialRect.width,
-      displayCenter: display.rect.center,
-    );
-    try {
-      await Future.wait([
-        animateCenterX(
-          to: xOffsetTarget,
-          duration: plan.x.settle?.duration,
-          curve: plan.x.settle?.curve ?? Curves.easeOut,
-        ),
-        animateCenterY(
-          to: yOffsetTarget,
-          duration: plan.y.settle?.duration,
-          curve: plan.y.settle?.curve ?? Curves.easeOut,
-        ),
-        _runAxis(plan.scale, animateWidth),
-      ]);
-    } finally {
-      clearReleaseDecomposed();
-    }
+  Future<void> release(Release plan) => _stage.release(plan);
+
+  Future<void> run({List<AxisFling>? x, List<AxisFling>? y, List<AxisFling>? scale}) =>
+      _stage.run(x: x, y: y, scale: scale);
+
+  Future<void> backToBase() {
+    final scene = _scene;
+    return _stage.animateRect(to: scene.display.rect.baseRect(scene.aspectRatio), curve: Curves.easeOut);
   }
 
-  Future<void> run({
-    List<AxisFling>? x,
-    List<AxisFling>? y,
-    List<AxisFling>? scale,
-  }) {
-    setRect(rect.value);
-    return Future.wait([
-      if (x != null) _runFlings(x, animateCenterX),
-      if (y != null) _runFlings(y, animateCenterY),
-      if (scale != null) _runFlings(scale, animateWidth),
-    ]);
-  }
+  Future<void> backToOrigin(ReleaseContext data, {Object? except}) =>
+      _stage.backToOrigin(data, except: except);
 
-  Future<void> backToBase() =>
-      animateRect(to: display.rect.baseRect(aspectRatio), curve: Curves.easeOut);
+  /// Animates the image rect back to base and the crop rect back to the
+  /// mode's initial crop.
+  Future<void> resetCrop() => _stage.resetCrop();
 
-  Future<void> backToOrigin(ReleaseContext data, {Object? except}) async {
-    await release(Release.toHalt(data));
-    // Use the gesture's configured [Settle] for the dismiss-to-origin motion.
-    final b = data.gesture.bounds;
-    final settle = b.left?.decay?.settle
-        ?? b.right?.decay?.settle
-        ?? b.top?.decay?.settle
-        ?? b.bottom?.decay?.settle;
-    await dismiss(except: except, settle: settle);
-  }
+  /// The crop rect in [sourceSize]'s pixels, for the image the stage shows.
+  Rect cropSourceRect(Size sourceSize) => displayRectToSourceRect(
+        cropRect: _stage._crop.value,
+        imageDisplayRect: _stage._rect.value,
+        sourceSize: sourceSize,
+      );
 
-  Future<void> _runAxis(
-    AxisRelease axis,
-    Future<void> Function({
-      required double to,
-      Duration? duration,
-      Curve curve,
-    }) animate,
-  ) async {
-    for (final f in axis.decay) {
-      await animate(to: f.to, duration: f.duration, curve: f.curve);
-    }
-    final s = axis.settle;
-    if (s != null) {
-      await animate(to: s.to, duration: s.duration, curve: s.curve);
-    }
-  }
+  /// Shows [widget] where the crop rect stands and flies it home. With
+  /// [aspectRatio], home keeps the slot's width at that ratio — the slot
+  /// relays out to the cropped photo while it's away — and the crop rect
+  /// rides home beside it.
+  Future<void> landCrop(Widget widget, {double? aspectRatio}) =>
+      _stage.landCrop(widget, aspectRatio: aspectRatio);
 
-  Future<void> _runFlings(
-    List<AxisFling> flings,
-    Future<void> Function({
-      required double to,
-      Duration? duration,
-      Curve curve,
-    }) animate,
-  ) async {
-    for (final f in flings) {
-      await animate(to: f.to, duration: f.duration, curve: f.curve);
-    }
-  }
+  OriginRect? measureEntry(Object tag) => _stage._measureEntry(tag);
+
+  /// Opens the Origin [tag]. Refused while another session holds the stage.
+  Future<void> openEntry(Object tag) => _stage._openEntry(tag);
+
+  /// Flies the Origin [tag] to `send(its rect)`. Refused while another
+  /// session holds the stage.
+  Future<void> sendEntry(Object tag, Rect Function(Rect) send, {VoidCallback? onEnd}) =>
+      _stage._sendEntry(tag, send, onEnd: onEnd);
 
   @override
   bool updateShouldNotify(StageData oldWidget) => true;
 
   @override
   bool updateShouldNotifyDependent(StageData oldWidget, Set<Object> dependencies) {
+    final tag = _builtScene.tag;
+    final oldTag = oldWidget._builtScene.tag;
+    final tagStates = _builtTagStates;
+    final oldTagStates = oldWidget._builtTagStates;
+    final interacting = _builtStance.interacting;
+    final oldInteracting = oldWidget._builtStance.interacting;
     for (final dep in dependencies) {
       switch (dep) {
         case _tagAspect:
-          if (tag != oldWidget.tag) return true;
+          if (tag != oldTag) return true;
         case _widgetAspect:
-          if (widget != oldWidget.widget) return true;
+          if (_builtScene.widget != oldWidget._builtScene.widget) return true;
         case _hasWidgetAspect:
-          if ((widget != null) != (oldWidget.widget != null)) return true;
+          if ((_builtScene.widget != null) != (oldWidget._builtScene.widget != null)) return true;
         case _dismissingAspect:
-          if (dismissing != oldWidget.dismissing) return true;
+          if (_builtStance.dismissing != oldWidget._builtStance.dismissing) return true;
         case _interactingAspect:
-          if (interacting != oldWidget.interacting) return true;
+          if (interacting != oldInteracting) return true;
         case (#tag, final Object t):
-          final was = oldWidget.tag == t || oldWidget.tagStates.containsKey(t);
+          final was = oldTag == t || oldTagStates.containsKey(t);
           final now = tag == t || tagStates.containsKey(t);
           if (was != now) return true;
         case (#active, final Object t):
-          if ((tag == t) != (oldWidget.tag == t)) return true;
+          if ((tag == t) != (oldTag == t)) return true;
         case (#state, final Object t):
-          if (tagStates[t] != oldWidget.tagStates[t]) return true;
+          if (tagStates[t] != oldTagStates[t]) return true;
         case (#interacting, final Object t):
-          final was = oldWidget.tag == t && oldWidget.interacting;
+          final was = oldTag == t && oldInteracting;
           final now = tag == t && interacting;
           if (was != now) return true;
       }
     }
     return false;
   }
+}
+
+/// Origin's door into its stage: the calls an [Origin] makes while it takes,
+/// drives and leaves the stage. The package barrel hides it from consumers.
+extension StageDoor on StageData {
+  bool get busy => _stage._busy;
+
+  void register(Object tag, OriginEntry entry) => _stage._register(tag, entry);
+
+  void unregister(Object tag, OriginEntry entry) => _stage._unregister(tag, entry);
+
+  Widget? captureEntry(Object tag) => _stage._captureEntry(tag);
+
+  void take(StageTaken taken) => _stage._take(taken);
+
+  void setGestureBuilder(StageBuilder? builder) => _stage._fact(GestureBuilderSet(builder));
+
+  void setOnEnd(FutureOr<void> Function()? onEnd) => _stage._fact(OnEndSet(onEnd));
+
+  void setOriginGesture(OriginGesture? gesture) => _stage._setOriginGesture(gesture);
+
+  void setOriginPointers(Map<int, Offset> pointers, Duration? time) =>
+      _stage._setOriginPointers(pointers, time);
+
+  void abandon(Object tag) => _stage._abandon(tag);
+
+  void displace(Object tag, {required Object target, bool park = true}) =>
+      _stage._displace(tag, target: target, park: park);
+
+  void releaseSend(Object tag) => _stage._fact(SendGone(tag));
+
+  Future<void> runEffect({
+    double? rotateX,
+    double? rotateY,
+    double? rotateZ,
+    double? perspective,
+    Duration duration = const Duration(milliseconds: 100),
+    Curve curve = Curves.easeOut,
+  }) =>
+      _stage.runEffect(
+        rotateX: rotateX,
+        rotateY: rotateY,
+        rotateZ: rotateZ,
+        perspective: perspective,
+        duration: duration,
+        curve: curve,
+      );
 }
 
 class _AbsorbLayer extends StatelessWidget {
@@ -2310,7 +2269,7 @@ class _SendLayerState extends State<_SendLayer> with SingleTickerProviderStateMi
   Future<void> _sendToTarget() async {
     final targetRect = _data.measureEntry(widget.target)!.rect;
     await _animateTo(targetRect);
-    if (!mounted) return;
+    if (!mounted || widget.returning) return;
     widget.onArrived();
   }
 
@@ -2332,7 +2291,10 @@ class _SendLayerState extends State<_SendLayer> with SingleTickerProviderStateMi
       ..begin = _rect.value.width
       ..end = to.width;
     _controller.reset();
-    return _controller.animateTo(1, curve: Curves.easeOut);
+    return _controller
+        .animateTo(1, curve: Curves.easeOut)
+        .orCancel
+        .catchError((_) {}, test: (e) => e is TickerCanceled);
   }
 
   void _updateRect() {

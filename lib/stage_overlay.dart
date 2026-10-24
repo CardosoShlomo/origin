@@ -58,7 +58,7 @@ class StageOverlay extends StatelessWidget {
           // chop corners with a curved clip. Open / dismiss animations
           // resume the lerp so the rect smoothly returns to the origin's
           // shape (e.g., a circular avatar).
-          final inCrop = data.displayConfig()?.crop != null;
+          final inCrop = data.displayConfig?.crop != null;
           final br = (inCrop && !data.openingOrDismissing)
               ? data.display.borderRadius
               : BorderRadius.lerp(data.origin.borderRadius, data.display.borderRadius, p)!;
@@ -100,7 +100,7 @@ class _Scrim extends StatelessWidget {
     // [animateToBase] / [dismiss] and cleared in their finally blocks;
     // release settle / rubber-back paths don't touch it, so the scrim
     // stays solid through pinch → release as the rect bounces back.
-    final inCrop = data.displayConfig()?.crop != null;
+    final inCrop = data.displayConfig?.crop != null;
     final Widget scrim;
     if (inCrop && !data.openingOrDismissing) {
       scrim = ColoredBox(color: color, child: const SizedBox.expand());
@@ -121,7 +121,7 @@ class _Scrim extends StatelessWidget {
     // Stack, and its inner Stack puts the captured widget on top. So the
     // scrim only receives taps that miss the captured rect, with no arena
     // competition from interactive children inside the captured widget.
-    final onTapOutside = data.displayConfig()?.onTapOutside;
+    final onTapOutside = data.displayConfig?.onTapOutside;
     if (onTapOutside == null) return scrim;
     return GestureDetector(onTap: onTapOutside, child: scrim);
   }

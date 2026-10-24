@@ -67,4 +67,11 @@ extension ContextExt on BuildContext {
     final box = findRenderObject() as RenderBox;
     return box.localToGlobal(Offset.zero) & box.size;
   }
+
+  /// [rect], or null while this context has no laid-out box to measure.
+  Rect? get rectOrNull {
+    final box = findRenderObject();
+    if (box is! RenderBox || !box.hasSize || !box.attached) return null;
+    return box.localToGlobal(Offset.zero) & box.size;
+  }
 }

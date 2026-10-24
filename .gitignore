@@ -36,3 +36,6 @@ migrate_working_dir/
 /build/
 /coverage/
 /ref/
+
+# Local dev overrides
+pubspec_overrides.yaml
