@@ -1,3 +1,15 @@
+## 3.0.0
+
+- Stage state lives on a regent Ledger: a scene unit, a stance unit, send and send-phase stores.
+- StageData reads live; a reference held from mount is never stale.
+- Interrupted animations complete; a superseded landing can't end a newer session; a touch stops a settling release.
+- An Origin that loses its gesture mid-drag lets the stage go.
+- Release velocity uses VelocityTracker, with Flutter's fling floor and cap.
+- A stage leaving mid-flight lands the flight and runs its onEnd.
+- A dismiss flies to where the Origin stands now unless home was pointed.
+- Open, send and landCrop wait out a scheduled frame; a second session is refused.
+- BREAKING: Stage.isLockedOf and the StageData setters are removed; new resetCrop, cropSourceRect and landCrop.
+
 ## 2.1.3
 
 ### Fixed
